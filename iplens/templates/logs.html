@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock %}
+{% block content %}
+<h1>Logs</h1>
+<form method="get" class="card row">
+  <div><label for="level">Min level</label>
+    <select id="level" name="level">
+      <option value="">all</option>
+      {% for l in levels %}<option value="{{ l }}" {{ 'selected' if l == level }}>{{ l }}</option>{% endfor %}
+    </select></div>
+  <div><label for="q">Contains</label><input id="q" name="q" value="{{ q }}" size="30"></div>
+  <div><label for="limit">Max entries</label><input id="limit" name="limit" type="number" value="{{ limit }}" min="1" max="5000"></div>
+  <div><button type="submit">Filter</button></div>
+</form>
+<p class="muted">Log file directory: <span class="mono">{{ log_dir }}</span> (change it in Settings). Newest first.</p>
+<table>
+  <thead><tr><th>Time</th><th>Level</th><th>Logger</th><th>Message</th></tr></thead>
+  <tbody>
+  {% for e in entries %}
+    <tr class="log-{{ e.level }}">
+      <td class="mono" style="white-space: nowrap">{{ e.ts }}</td>
+      <td>{{ e.level }}</td>
+      <td class="mono">{{ e.logger }}</td>
+      <td><pre class="logmsg mono">{{ e.msg }}</pre></td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4" class="muted">No log entries</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

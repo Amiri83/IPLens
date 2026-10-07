@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}IPs{% endblock %}
+{% block content %}
+<h1>Private IPs</h1>
+{% if not snap %}
+  <div class="card">No snapshot yet — refresh from the <a href="{{ url_for('overview') }}">Overview</a>.</div>
+{% else %}
+<form method="get" class="card row">
+  <div><label for="q">Search</label>
+    <input id="q" name="q" value="{{ q }}" placeholder="IP, ENI, owner, description, subnet…" size="40"></div>
+  <div><label for="owner">Owner</label>
+    <select id="owner" name="owner">
+      <option value="">all</option>
+      {% for o in owner_types %}<option value="{{ o }}" {{ 'selected' if o == owner }}>{{ owner_labels[o] }}</option>{% endfor %}
+    </select></div>
+  <div><label for="state">State</label>
+    <select id="state" name="state">
+      <option value="">all</option>
+      <option value="used" {{ 'selected' if state == 'used' }}>attached</option>
+      <option value="idle" {{ 'selected' if state == 'idle' }}>idle ENI</option>
+    </select></div>
+  <div><button type="submit">Search</button></div>
+</form>
+<p class="muted">{{ total }} match(es){% if pages > 1 %} · page {{ page + 1 }} / {{ pages }}{% endif %}</p>
+<table>
+  <thead><tr><th>IP</th><th>Owner</th><th>Ref</th><th>ENI</th><th>Status</th><th>Subnet</th><th>AZ</th><th>Description</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <td class="mono">{{ r.ip }}{% if r.is_primary %} <span class="badge">primary</span>{% endif %}</td>
+      <td>{{ owner_labels.get(r.owner_type, r.owner_type) }}</td>
+      <td class="mono">{{ r.owner_ref or '' }}</td>
+      <td class="mono"><a href="{{ url_for('eni', eni_id=r.eni_id) }}">{{ r.eni_id }}</a></td>
+      <td><span class="badge {{ 'warn' if r.status == 'available' else '' }}">{{ r.status }}</span></td>
+      <td class="mono"><a href="{{ url_for('subnet', subnet_id=r.subnet_id) }}">{{ r.subnet_id }}</a></td>
+      <td>{{ r.az }}</td>
+      <td class="muted">{{ r.description }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="8" class="muted">No matches</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if pages > 1 %}
+  <p>
+    {% if page > 0 %}<a href="{{ url_for('ips', q=q, owner=owner, state=state, page=page - 1) }}">← previous</a>{% endif %}
+    {% if page + 1 < pages %}<a href="{{ url_for('ips', q=q, owner=owner, state=state, page=page + 1) }}">next →</a>{% endif %}
+  </p>
+{% endif %}
+{% endif %}
+{% endblock %}

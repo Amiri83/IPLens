@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% from "_macros.html" import usage_bar, legend %}
+{% block title %}{{ s.subnet_id }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('overview') }}">← Overview</a></p>
+<h1><span class="mono">{{ s.subnet_id }}</span> {{ s.name }}</h1>
+<div class="card">
+  <span class="mono">{{ s.cidr }}</span> · {{ s.az }} · VPC <span class="mono">{{ s.vpc_id }}</span><br>
+  {{ s.size }} addresses: <b>{{ s.used }}</b> used, <b>{{ s.idle }}</b> on idle ENIs,
+  <b>{{ s.reserved }}</b> reserved by AWS, <b>{{ s.free }}</b> free ({{ s.free_pct | pct }} of usable)
+  {% if s.aws_available is not none and s.aws_available != s.free %}
+    <div class="muted">AWS reports {{ s.aws_available }} available (differences usually come from
+      CIDR reservations or prefix delegations not visible on ENIs).</div>
+  {% endif %}
+  <div style="margin-top: .5rem">{{ usage_bar(s) }}</div>
+</div>
+
+<h2>Address grid {% if grid.pages > 1 %}<span class="muted">({{ grid.start }} – {{ grid.end }}, page {{ grid.page + 1 }} / {{ grid.pages }})</span>{% endif %}</h2>
+{{ legend() }}
+<div class="card">
+  <div class="grid">
+    {% for c in grid.cells %}
+      {% if c.eni %}
+        <a class="cell-{{ c.state }}" href="{{ url_for('eni', eni_id=c.eni) }}" title="{{ c.title }}"></a>
+      {% else %}
+        <span class="cell-{{ c.state }}" title="{{ c.title }}"></span>
+      {% endif %}
+    {% endfor %}
+  </div>
+  {% if grid.pages > 1 %}
+    <p>
+      {% if grid.page > 0 %}<a href="{{ url_for('subnet', subnet_id=s.subnet_id, page=grid.page - 1) }}">← previous</a>{% endif %}
+      {% if grid.page + 1 < grid.pages %}<a href="{{ url_for('subnet', subnet_id=s.subnet_id, page=grid.page + 1) }}">next →</a>{% endif %}
+    </p>
+  {% endif %}
+</div>
+
+<h2>Network interfaces ({{ enis | length }})</h2>
+<table>
+  <thead><tr><th>ENI</th><th>Owner</th><th>Ref</th><th>Status</th><th>IPs</th><th>Description</th></tr></thead>
+  <tbody>
+  {% for e in enis %}
+    <tr>
+      <td class="mono"><a href="{{ url_for('eni', eni_id=e.eni_id) }}">{{ e.eni_id }}</a></td>
+      <td>{{ owner_labels.get(e.owner_type, e.owner_type) }}</td>
+      <td class="mono">{{ e.owner_ref or '' }}</td>
+      <td><span class="badge {{ 'warn' if e.status == 'available' else '' }}">{{ e.status }}</span></td>
+      <td>{{ e.ip_count }}</td>
+      <td class="muted">{{ e.description }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">No ENIs in this subnet</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

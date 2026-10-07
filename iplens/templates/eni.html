@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}{{ e.eni_id }}{% endblock %}
+{% block content %}
+<p>{% if e.subnet_id %}<a href="{{ url_for('subnet', subnet_id=e.subnet_id) }}">← {{ e.subnet_id }}</a>{% endif %}</p>
+<h1><span class="mono">{{ e.eni_id }}</span> {{ e.name or '' }}</h1>
+<div class="card">
+  <table>
+    <tr><th>Owner</th><td>{{ owner_labels.get(e.owner_type, e.owner_type) }} {% if e.owner_ref %}<span class="mono">{{ e.owner_ref }}</span>{% endif %}</td></tr>
+    <tr><th>Status</th><td><span class="badge {{ 'warn' if e.status == 'available' else '' }}">{{ e.status }}</span>{% if e.status == 'available' %} not attached (idle){% endif %}</td></tr>
+    <tr><th>Interface type</th><td class="mono">{{ e.interface_type or '' }}</td></tr>
+    <tr><th>Requester</th><td class="mono">{{ e.requester_id or '' }}{% if e.requester_managed %} <span class="badge">AWS-managed</span>{% endif %}</td></tr>
+    <tr><th>Instance</th><td class="mono">{{ e.instance_id or '' }}</td></tr>
+    <tr><th>Description</th><td>{{ e.description }}</td></tr>
+    <tr><th>VPC / subnet / AZ</th><td class="mono">{{ e.vpc_id }} / {{ e.subnet_id }} / {{ e.az }}</td></tr>
+    <tr><th>Security groups</th><td class="mono">{{ e.security_groups | join(', ') }}</td></tr>
+  </table>
+</div>
+<h2>Private IPs ({{ e.ips | length }})</h2>
+<table>
+  <thead><tr><th>IP</th><th>Primary</th><th>Public IP</th></tr></thead>
+  <tbody>
+  {% for ip in e.ips %}
+    <tr><td class="mono">{{ ip.ip }}</td><td>{{ 'yes' if ip.is_primary else '' }}</td><td class="mono">{{ ip.public_ip or '' }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

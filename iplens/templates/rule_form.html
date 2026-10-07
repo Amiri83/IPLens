@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit rule' if rule.id else 'New rule' }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('rules_list') }}">← Rules</a></p>
+<h1>{{ 'Edit rule' if rule.id else 'New rule' }}</h1>
+{% set p = rule.params or {} %}
+{% set ids = p.get('subnet_ids') %}
+<form class="card" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label for="name">Name</label>
+  <input id="name" name="name" value="{{ rule.name }}" required size="40">
+
+  <label for="kind">Kind</label>
+  <select id="kind" name="kind" onchange="showParams()">
+    {% for k, label in kinds.items() %}<option value="{{ k }}" {{ 'selected' if k == rule.kind }}>{{ label }}</option>{% endfor %}
+  </select>
+
+  <label for="description">Description</label>
+  <input id="description" name="description" value="{{ rule.description }}" size="80">
+
+  <label><input type="checkbox" name="enabled" {{ 'checked' if rule.enabled }}> Enabled</label>
+
+  <fieldset data-kinds="min_free_pct">
+    <label for="percent">Minimum free %</label>
+    <input id="percent" name="percent" type="number" min="0" max="100" step="0.1" value="{{ p.get('percent', '') }}">
+  </fieldset>
+  <fieldset data-kinds="min_free_pct subnet_reserved">
+    <label for="subnet_ids">Subnet IDs (comma or space separated; blank = all for min free %)</label>
+    <input id="subnet_ids" name="subnet_ids" class="mono" size="80"
+           value="{{ ids | join(', ') if ids is not string and ids else (ids or '') }}">
+  </fieldset>
+  <fieldset data-kinds="internal_only">
+    <label for="scope">Scope</label>
+    <select id="scope" name="scope">
+      {% for sc in scopes %}<option value="{{ sc }}" {{ 'selected' if sc == p.get('scope', 'both') }}>{{ sc }}</option>{% endfor %}
+    </select>
+  </fieldset>
+  <fieldset data-kinds="protected_eni">
+    <label for="pattern">Pattern (regex, matched against ENI id / description / name / owner)</label>
+    <input id="pattern" name="pattern" class="mono" size="60" value="{{ p.get('pattern', '') }}">
+  </fieldset>
+  <p><button type="submit">Save</button></p>
+</form>
+<script>
+function showParams() {
+  const kind = document.getElementById('kind').value;
+  document.querySelectorAll('fieldset[data-kinds]').forEach(fs => {
+    fs.style.display = fs.dataset.kinds.split(' ').includes(kind) ? '' : 'none';
+  });
+}
+showParams();
+</script>
+{% endblock %}

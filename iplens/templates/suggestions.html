@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Suggestions{% endblock %}
+{% block content %}
+<h1>Suggestions</h1>
+{% if not snap %}
+  <div class="card">No snapshot yet — refresh from the <a href="{{ url_for('overview') }}">Overview</a>.</div>
+{% else %}
+<div class="card">
+  <b>{{ totals.allowed }}</b> IPs could be freed by allowed suggestions ·
+  <span class="muted">{{ totals.blocked }} more are blocked by <a href="{{ url_for('rules_list') }}">rules</a></span>
+  <div class="muted">Estimates; alternative suggestions for the same resources can overlap. IPLens never changes AWS — apply changes through your normal process.</div>
+</div>
+<table>
+  <thead><tr><th>Type</th><th>Suggestion</th><th>IPs saved</th><th>Status</th></tr></thead>
+  <tbody>
+  {% for s in items %}
+    <tr class="{{ 'blocked' if s.blocked }}">
+      <td><span class="badge">{{ s.kind_label }}</span></td>
+      <td>
+        <b>{{ s.title }}</b>
+        <div>{{ s.detail }}</div>
+        {% if s.eni_ids %}
+          <div class="mono muted">
+            {% for e in s.eni_ids[:8] %}<a href="{{ url_for('eni', eni_id=e) }}">{{ e }}</a>{{ ', ' if not loop.last }}{% endfor %}
+            {% if s.eni_ids | length > 8 %} … {{ s.eni_ids | length - 8 }} more{% endif %}
+          </div>
+        {% endif %}
+      </td>
+      <td>{% if s.ips_saved %}<b>{{ s.ips_saved }}</b>{% else %}<span class="muted">{{ s.impact or '–' }}</span>{% endif %}</td>
+      <td>
+        {% if s.blocked %}
+          <span class="badge err">blocked</span>
+          {% for name, reason in s.blocked_by %}<div class="muted">{{ name }}: {{ reason }}</div>{% endfor %}
+        {% else %}
+          <span class="badge ok">allowed</span>
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="4" class="muted">Nothing to suggest — nice and tidy.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% from "_macros.html" import usage_bar, legend %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<div class="row" style="justify-content: space-between">
+  <h1>Overview</h1>
+  <form method="post" action="{{ url_for('refresh') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Refresh from AWS</button>
+  </form>
+</div>
+
+{% if not snap %}
+  <div class="card">
+    No snapshot yet. Configure credentials in <a href="{{ url_for('settings_page') }}">Settings</a>,
+    then press <b>Refresh from AWS</b>. All AWS calls are read-only.
+  </div>
+{% else %}
+  <div class="card">
+    Snapshot <b>#{{ snap.id }}</b> taken {{ snap.taken_at }} UTC ·
+    account <span class="mono">{{ snap.account_id or 'unknown' }}</span> ·
+    region <span class="mono">{{ snap.region }}</span>
+    {% if owners %}
+      <div style="margin-top: .5rem">
+        {% for o, n in owners.items() %}
+          <a class="badge" href="{{ url_for('ips', owner=o) }}">{{ owner_labels.get(o, o) }}: {{ n }}</a>
+        {% endfor %}
+      </div>
+    {% endif %}
+  </div>
+
+  {{ legend() }}
+  {% for v in tree %}
+    <details class="vpc card" open>
+      <summary>
+        <span class="mono">{{ v.vpc_id }}</span> {{ v.name }}
+        {% if v.is_default %}<span class="badge">default</span>{% endif %}
+        <span class="muted">· {{ v.cidrs | join(', ') }} · {{ v.subnets | length }} subnets ·
+          {{ v.allocated_pct | pct }} of range in subnets · {{ v.used_pct | pct }} consumed</span>
+      </summary>
+      <table>
+        <thead><tr><th>Subnet</th><th>Name</th><th>CIDR</th><th>AZ</th><th>Usage</th>
+          <th>Used</th><th>Idle</th><th>Free</th><th>Free %</th><th>AWS avail.</th></tr></thead>
+        <tbody>
+        {% for s in v.subnets %}
+          <tr>
+            <td class="mono"><a href="{{ url_for('subnet', subnet_id=s.subnet_id) }}">{{ s.subnet_id }}</a></td>
+            <td>{{ s.name }}</td>
+            <td class="mono">{{ s.cidr }}</td>
+            <td>{{ s.az }}</td>
+            <td>{{ usage_bar(s) }}</td>
+            <td>{{ s.used }}</td><td>{{ s.idle }}</td><td>{{ s.free }}</td>
+            <td>{{ s.free_pct | pct }}</td>
+            <td class="muted">{{ s.aws_available if s.aws_available is not none else '–' }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="10" class="muted">No subnets</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </details>
+  {% else %}
+    <div class="card muted">No VPCs found in this region.</div>
+  {% endfor %}
+{% endif %}
+
+{% if history %}
+  <h2>Recent snapshots</h2>
+  <table>
+    <thead><tr><th>#</th><th>Taken (UTC)</th><th>Region</th><th>Status</th><th>Notes</th></tr></thead>
+    <tbody>
+    {% for h in history %}
+      <tr><td>{{ h.id }}</td><td>{{ h.taken_at }}</td><td>{{ h.region }}</td>
+        <td><span class="badge {{ 'ok' if h.status == 'ok' else 'err' if h.status == 'failed' else '' }}">{{ h.status }}</span></td>
+        <td class="muted">{{ h.error or '' }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

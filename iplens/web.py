@@ -1,0 +1,403 @@
+"""Flask application: settings, collection, views, rules, suggestions, logs."""
+
+from __future__ import annotations
+
+import logging
+import os
+import secrets
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from botocore.exceptions import BotoCoreError, ClientError
+from flask import (
+    Flask,
+    Response,
+    abort,
+    current_app,
+    flash,
+    g,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+
+from . import queries
+from . import rules as rules_mod
+from . import suggestions as sugg_mod
+from .attribution import OWNER_LABELS, OWNER_TYPES
+from .aws import AwsGateway, ReadOnlyViolation, check_connection
+from .collector import Collector
+from .config import AppPaths, default_paths
+from .crypto import SecretBox
+from .db import closing, connect, init_db
+from .logging_setup import LEVELS, configure_logging, read_log
+from .settings import AUTH_MODES, REGIONS, Settings, SettingsStore
+
+log = logging.getLogger(__name__)
+
+GatewayFactory = Callable[[Settings], AwsGateway]
+IP_PAGE_SIZE = 200
+
+
+def _flask_secret(paths: AppPaths) -> bytes:
+    p = paths.flask_secret_path
+    if p.exists():
+        return p.read_bytes()
+    key = secrets.token_bytes(32)
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(key)
+    return key
+
+
+def create_app(
+    home: str | os.PathLike[str] | None = None,
+    *,
+    gateway_factory: GatewayFactory | None = None,
+    testing: bool = False,
+) -> Flask:
+    paths = default_paths(home).ensure()
+    init_db(paths.db_path)
+    box = SecretBox.from_path(paths.key_path)
+    store = SettingsStore(paths.db_path, box)
+
+    app = Flask(__name__)
+    app.config.update(
+        SECRET_KEY=_flask_secret(paths),
+        TESTING=testing,
+        SESSION_COOKIE_SAMESITE="Strict",
+        SESSION_COOKIE_HTTPONLY=True,
+        MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+    )
+    app.extensions["iplens"] = {
+        "paths": paths,
+        "store": store,
+        "gateway_factory": gateway_factory or AwsGateway.from_settings,
+    }
+    apply_log_dir(app, store.load())
+    log.info("IPLens started (data dir %s)", paths.home)
+
+    _register(app)
+    return app
+
+
+def _ext() -> dict[str, Any]:
+    return current_app.extensions["iplens"]
+
+
+def _paths() -> AppPaths:
+    return _ext()["paths"]
+
+
+def _store() -> SettingsStore:
+    return _ext()["store"]
+
+
+def log_dir_for(paths: AppPaths, settings: Settings) -> Path:
+    return Path(settings.log_dir).expanduser() if settings.log_dir else paths.default_log_dir
+
+
+def apply_log_dir(app: Flask, settings: Settings) -> Path:
+    paths: AppPaths = app.extensions["iplens"]["paths"]
+    log_dir = log_dir_for(paths, settings)
+    configure_logging(log_dir)
+    app.extensions["iplens"]["log_dir"] = log_dir
+    return log_dir
+
+
+def _db():
+    if "db" not in g:
+        g.db = connect(_paths().db_path)
+    return g.db
+
+
+def _snapshot_or_none():
+    return queries.latest_snapshot(_db())
+
+
+def _register(app: Flask) -> None:
+    @app.teardown_appcontext
+    def _close_db(_exc: BaseException | None) -> None:
+        db = g.pop("db", None)
+        if db is not None:
+            db.close()
+
+    @app.before_request
+    def _csrf() -> None:
+        if "csrf" not in session:
+            session["csrf"] = secrets.token_urlsafe(32)
+        if request.method == "POST":
+            sent = request.form.get("csrf_token", "")
+            if not secrets.compare_digest(sent, session["csrf"]):
+                log.warning("rejected POST %s with bad CSRF token", request.path)
+                abort(400, "invalid CSRF token")
+
+    @app.context_processor
+    def _globals() -> dict[str, Any]:
+        return {
+            "csrf_token": session.get("csrf", ""),
+            "owner_labels": OWNER_LABELS,
+            "current_settings": _store().load().public_dict(),
+        }
+
+    @app.template_filter("pct")
+    def _pct(v: float) -> str:
+        return f"{v:.1f}%"
+
+    # -- overview / collection ---------------------------------------------
+
+    @app.get("/")
+    def overview():
+        snap = _snapshot_or_none()
+        tree, owners = [], {}
+        if snap:
+            tree = queries.vpc_tree(_db(), snap["id"])
+            owners = queries.owner_breakdown(_db(), snap["id"])
+        return render_template(
+            "overview.html", snap=snap, tree=tree, owners=owners,
+            history=queries.recent_snapshots(_db(), 5),
+        )
+
+    @app.post("/refresh")
+    def refresh():
+        settings = _store().load(with_secret=True)
+        try:
+            gw = _ext()["gateway_factory"](settings)
+            result = Collector(gw, _paths().db_path).run()
+        except (BotoCoreError, ClientError, ValueError, ReadOnlyViolation) as exc:
+            flash(f"Refresh failed: {type(exc).__name__}: {exc}", "error")
+            return redirect(url_for("overview"))
+        with closing(_paths().db_path) as conn:
+            queries.prune_snapshots(conn)
+        msg = (f"Snapshot #{result.snapshot_id}: {result.vpcs} VPCs, {result.subnets} subnets, "
+               f"{result.enis} ENIs, {result.ips} IPs")
+        flash(msg, "ok")
+        for w in result.warnings:
+            flash(w, "warn")
+        return redirect(url_for("overview"))
+
+    # -- subnet grid / ENI / IP table ----------------------------------------
+
+    @app.get("/subnets/<subnet_id>")
+    def subnet(subnet_id: str):
+        snap = _snapshot_or_none()
+        if not snap:
+            return redirect(url_for("overview"))
+        st = queries.get_subnet(_db(), snap["id"], subnet_id)
+        if st is None:
+            abort(404)
+        page = request.args.get("page", 0, type=int)
+        grid = queries.subnet_grid(_db(), snap["id"], st, page)
+        enis = queries.subnet_enis(_db(), snap["id"], subnet_id)
+        return render_template("subnet.html", snap=snap, s=st, grid=grid, enis=enis)
+
+    @app.get("/enis/<eni_id>")
+    def eni(eni_id: str):
+        snap = _snapshot_or_none()
+        if not snap:
+            return redirect(url_for("overview"))
+        detail = queries.eni_detail(_db(), snap["id"], eni_id)
+        if detail is None:
+            abort(404)
+        return render_template("eni.html", snap=snap, e=detail)
+
+    @app.get("/ips")
+    def ips():
+        snap = _snapshot_or_none()
+        q = request.args.get("q", "").strip()
+        owner = request.args.get("owner", "")
+        state = request.args.get("state", "")
+        page = max(request.args.get("page", 0, type=int), 0)
+        rows, total = [], 0
+        if snap:
+            rows, total = queries.search_ips(
+                _db(), snap["id"], q=q, owner=owner if owner in OWNER_TYPES else "",
+                state=state, limit=IP_PAGE_SIZE, offset=page * IP_PAGE_SIZE,
+            )
+        pages = max((total + IP_PAGE_SIZE - 1) // IP_PAGE_SIZE, 1)
+        return render_template(
+            "ips.html", snap=snap, rows=rows, total=total, q=q, owner=owner, state=state,
+            page=page, pages=pages, owner_types=OWNER_TYPES,
+        )
+
+    # -- rules -----------------------------------------------------------------
+
+    def _context():
+        snap = _snapshot_or_none()
+        return (sugg_mod.build_context(_db(), snap["id"]) if snap else None), snap
+
+    @app.get("/rules")
+    def rules_list():
+        rules = rules_mod.list_rules(_db())
+        ctx, _snap = _context()
+        violations = {r.id: r.violations(ctx) for r in rules} if ctx else {}
+        return render_template("rules.html", rules=rules, violations=violations,
+                               kinds=rules_mod.RULE_KINDS)
+
+    def _rule_from_form(rule_id: int | None) -> rules_mod.Rule:
+        f = request.form
+        return rules_mod.Rule(
+            id=rule_id,
+            name=f.get("name", ""),
+            kind=f.get("kind", ""),
+            enabled=f.get("enabled") == "on",
+            description=f.get("description", ""),
+            params={
+                "percent": f.get("percent", ""),
+                "subnet_ids": f.get("subnet_ids", ""),
+                "scope": f.get("scope", ""),
+                "pattern": f.get("pattern", ""),
+            },
+        )
+
+    def _rule_form(rule: rules_mod.Rule, status: int = 200):
+        return render_template(
+            "rule_form.html", rule=rule, kinds=rules_mod.RULE_KINDS,
+            scopes=rules_mod.INTERNAL_SCOPES,
+        ), status
+
+    @app.route("/rules/new", methods=["GET", "POST"])
+    def rule_new():
+        if request.method == "GET":
+            return _rule_form(rules_mod.Rule(name="", kind="min_free_pct",
+                                             params={"percent": 20}))
+        rule = _rule_from_form(None)
+        try:
+            with closing(_paths().db_path) as conn:
+                rules_mod.save_rule(conn, rule)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return _rule_form(rule, 400)
+        log.info("rule created: %s (%s)", rule.name, rule.kind)
+        flash(f"Rule '{rule.name}' created", "ok")
+        return redirect(url_for("rules_list"))
+
+    @app.route("/rules/<int:rule_id>/edit", methods=["GET", "POST"])
+    def rule_edit(rule_id: int):
+        existing = rules_mod.get_rule(_db(), rule_id)
+        if existing is None:
+            abort(404)
+        if request.method == "GET":
+            return _rule_form(existing)
+        rule = _rule_from_form(rule_id)
+        try:
+            with closing(_paths().db_path) as conn:
+                rules_mod.save_rule(conn, rule)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return _rule_form(rule, 400)
+        log.info("rule updated: %s (%s)", rule.name, rule.kind)
+        flash(f"Rule '{rule.name}' updated", "ok")
+        return redirect(url_for("rules_list"))
+
+    @app.post("/rules/<int:rule_id>/delete")
+    def rule_delete(rule_id: int):
+        rule = rules_mod.get_rule(_db(), rule_id)
+        if rule is None:
+            abort(404)
+        with closing(_paths().db_path) as conn:
+            rules_mod.delete_rule(conn, rule_id)
+        log.info("rule deleted: %s", rule.name)
+        flash(f"Rule '{rule.name}' deleted", "ok")
+        return redirect(url_for("rules_list"))
+
+    @app.get("/rules/export.yaml")
+    def rules_export():
+        body = rules_mod.export_yaml(rules_mod.list_rules(_db()))
+        return Response(body, mimetype="application/x-yaml",
+                        headers={"Content-Disposition": "attachment; filename=iplens-rules.yaml"})
+
+    @app.post("/rules/import")
+    def rules_import():
+        upload = request.files.get("file")
+        text = upload.read().decode("utf-8", "replace") if upload and upload.filename else ""
+        text = text or request.form.get("yaml", "")
+        replace = request.form.get("replace") == "on"
+        try:
+            parsed = rules_mod.parse_yaml(text)
+            with closing(_paths().db_path) as conn:
+                n = rules_mod.import_rules(conn, parsed, replace=replace)
+        except ValueError as exc:
+            flash(f"Import failed: {exc}", "error")
+            return redirect(url_for("rules_list"))
+        log.info("imported %d rule(s) (replace=%s)", n, replace)
+        flash(f"Imported {n} rule(s)", "ok")
+        return redirect(url_for("rules_list"))
+
+    # -- suggestions -------------------------------------------------------------
+
+    @app.get("/suggestions")
+    def suggestions():
+        ctx, snap = _context()
+        items: list[sugg_mod.Suggestion] = []
+        if ctx:
+            items = sugg_mod.generate(ctx, rules_mod.list_rules(_db()))
+        return render_template("suggestions.html", snap=snap, items=items,
+                               totals=sugg_mod.totals(items))
+
+    # -- logs --------------------------------------------------------------------
+
+    @app.get("/logs")
+    def logs():
+        level = request.args.get("level", "")
+        q = request.args.get("q", "")
+        limit = min(max(request.args.get("limit", 500, type=int), 1), 5000)
+        log_dir = _ext()["log_dir"]
+        entries = read_log(log_dir, min_level=level, q=q, limit=limit)
+        return render_template("logs.html", entries=entries, level=level, q=q, limit=limit,
+                               levels=LEVELS, log_dir=log_dir)
+
+    # -- settings ----------------------------------------------------------------
+
+    @app.get("/settings")
+    def settings_page():
+        return render_template(
+            "settings.html", s=_store().load().public_dict(), modes=AUTH_MODES,
+            regions=REGIONS, default_log_dir=_paths().default_log_dir,
+        )
+
+    @app.post("/settings")
+    def settings_save():
+        f = request.form
+        clear = f.get("clear_secret") == "on"
+        # The form shows a masked key id; blank means "keep the stored one".
+        key_id = f.get("access_key_id", "").strip()
+        if not key_id and not clear:
+            key_id = _store().load().access_key_id
+        try:
+            _store().save(
+                auth_mode=f.get("auth_mode", "env"),
+                region=f.get("region_custom", "").strip() or f.get("region", ""),
+                profile=f.get("profile", ""),
+                access_key_id=key_id,
+                secret_access_key=f.get("secret_access_key") or None,
+                clear_secret=clear,
+                log_dir=f.get("log_dir", ""),
+            )
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("settings_page"))
+        settings = _store().load()
+        new_dir = apply_log_dir(current_app, settings)
+        log.info("settings saved: auth_mode=%s region=%s log_dir=%s",
+                 settings.auth_mode, settings.region, new_dir)
+        flash("Settings saved", "ok")
+        return redirect(url_for("settings_page"))
+
+    @app.post("/settings/test")
+    def settings_test():
+        settings = _store().load(with_secret=True)
+        ok, msg = check_connection(settings, _ext()["gateway_factory"])
+        flash(msg, "ok" if ok else "error")
+        return redirect(url_for("settings_page"))
+
+    @app.errorhandler(404)
+    def _not_found(_e):
+        return render_template("error.html", message="Not found"), 404
+
+    @app.errorhandler(400)
+    def _bad_request(e):
+        return render_template("error.html", message=getattr(e, "description", "Bad request")), 400
