@@ -8,14 +8,15 @@
 <body>
 <header>
   <span class="brand">IPLens</span>
-  <nav>
+  <nav class="tabs">
     {% set ep = request.endpoint or '' %}
-    <a href="{{ url_for('overview') }}" class="{{ 'active' if ep in ('overview', 'subnet', 'eni') }}">Overview</a>
-    <a href="{{ url_for('ips') }}" class="{{ 'active' if ep == 'ips' }}">IPs</a>
-    <a href="{{ url_for('suggestions') }}" class="{{ 'active' if ep == 'suggestions' }}">Suggestions</a>
+    <a href="{{ url_for('overview') }}" class="{{ 'active' if ep in ('overview', 'subnet', 'eni') }}">Discovery</a>
+    <a href="{{ url_for('ips') }}" class="{{ 'active' if ep.startswith('ips') }}">IP List</a>
+    <a href="{{ url_for('visual') }}" class="{{ 'active' if ep.startswith('visual') }}">Visual</a>
     <a href="{{ url_for('rules_list') }}" class="{{ 'active' if ep.startswith('rule') }}">Rules</a>
-    <a href="{{ url_for('logs') }}" class="{{ 'active' if ep == 'logs' }}">Logs</a>
+    <a href="{{ url_for('suggestions') }}" class="{{ 'active' if ep == 'suggestions' }}">Suggestions</a>
     <a href="{{ url_for('settings_page') }}" class="{{ 'active' if ep.startswith('settings') }}">Settings</a>
+    <a href="{{ url_for('logs') }}" class="{{ 'active' if ep == 'logs' }}">Logs</a>
   </nav>
   <span class="ctx">{{ current_settings.region }} · auth: {{ current_settings.auth_mode }}</span>
 </header>

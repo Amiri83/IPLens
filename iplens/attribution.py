@@ -35,12 +35,12 @@ OWNER_LABELS = {
     "lambda": "Lambda",
     "ecs": "ECS task",
     "vpc_endpoint": "VPC endpoint",
-    "elb": "Load balancer",
+    "elb": "ALB/NLB",
     "nat": "NAT gateway",
     "rds": "RDS",
     "elasticache": "ElastiCache",
     "opensearch": "OpenSearch",
-    "other": "Other",
+    "other": "ENI/other",
 }
 
 # Keys are lower-cased InterfaceType values. AWS has used both NAT spellings

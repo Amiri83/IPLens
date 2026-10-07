@@ -13,6 +13,7 @@ dependencies = [
     "boto3>=1.34",
     "pyyaml>=6.0",
     "cryptography>=42",
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +30,13 @@ iplens = "iplens.cli:main"
 include = ["iplens*"]
 
 [tool.setuptools.package-data]
-iplens = ["templates/*.html", "static/*"]
+iplens = [
+    "templates/*.html",
+    "static/*.css",
+    "static/*.js",
+    "static/vendor/*",
+    "static/icons/aws/*.svg",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -4,7 +4,9 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
+from openpyxl import load_workbook
 
+from iplens import queries
 from iplens.db import closing
 from iplens.rules import list_rules
 from iplens.web import create_app, host_allowed
@@ -356,3 +358,80 @@ def test_rules_import_file_upload(app, client):
         client, "/rules/import", data, content_type="multipart/form-data", follow_redirects=True
     )
     assert b"Imported 1 rule(s)" in resp.data
+
+
+def test_navigation_tabs_and_settings_back_link(client):
+    page = client.get("/").data.decode()
+    tabs = ["Discovery", "IP List", "Visual", "Rules", "Suggestions", "Settings", "Logs"]
+    positions = [page.index(f">{t}</a>") for t in tabs]
+    assert positions == sorted(positions)
+    settings = client.get("/settings").data.decode()
+    assert '<a href="/" class="back-link">← Back</a>' in settings
+    assert client.get("/visual").status_code == 200
+
+
+def test_ip_list_page_filters(client, seeded):
+    page = client.get("/ips").data.decode()
+    for col in ("Subnet", "VPC", "Resource type", "Resource name / ref", "ENI", "Status"):
+        assert f"<th>{col}</th>" in page
+    assert "example-private-a" in page and "Export to Excel" in page
+    assert page.index("10.0.1.10") < page.index("10.0.1.12") < page.index("10.0.1.50")
+    page = client.get(f"/ips?vpc={VPC}&subnet={SA}&owner=other").data.decode()
+    assert "10.0.1.50" in page and "10.0.1.10" not in page
+    page = client.get("/ips?vpc=vpc-0missing").data.decode()
+    assert "No matches" in page
+
+
+def test_ip_list_export_applies_filter(client, seeded):
+    resp = client.get("/ips/export.xlsx?owner=ec2&q=10.0.1.1")
+    assert resp.status_code == 200
+    assert resp.mimetype == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    assert f"iplens-ips-snapshot-{seeded.id}.xlsx" in resp.headers["Content-Disposition"]
+    ws = load_workbook(io.BytesIO(resp.data))["IPs"]
+    header = [c.value for c in ws[1]]
+    assert header[:2] == ["IP", "Subnet ID"] and "Resource type" in header
+    assert [r[0].value for r in ws.iter_rows(min_row=2)] == ["10.0.1.10", "10.0.1.11", "10.0.1.12"]
+    everything = load_workbook(io.BytesIO(client.get("/ips/export.xlsx").data))["IPs"]
+    assert everything.max_row == 1 + 4
+
+
+def test_visual_data_endpoint(client, seeded):
+    assert client.get("/visual/data.json").get_json()["vpc"]["vpc_id"] == VPC
+    page = client.get("/visual").data.decode()
+    assert "vendor/cytoscape.min.js" in page and "/visual/data.json?vpc=" in page
+    assert "cdn" not in page.lower()
+
+    data = client.get(f"/visual/data.json?vpc={VPC}").get_json()
+    assert set(data) == {"snapshot_id", "vpcs", "vpc", "icons"}
+    assert data["vpcs"] == [{"vpc_id": VPC, "name": "example-vpc"}]
+    vpc = data["vpc"]
+    assert set(vpc) == {"vpc_id", "name", "cidrs", "subnets"}
+    (subnet,) = vpc["subnets"]
+    assert subnet["subnet_id"] == SA and subnet["cidr"] == "10.0.1.0/24"
+    assert (subnet["used"], subnet["idle"], subnet["free"]) == (3, 1, 256 - 5 - 4)
+    nodes = {n["eni_id"]: n for n in subnet["items"]}
+    assert set(nodes) == {"eni-0000000001", "eni-0000000002"}
+    web = nodes["eni-0000000001"]
+    assert web["kind"] == "resource" and web["type"] == "ec2"
+    assert web["ips"] == ["10.0.1.10", "10.0.1.11", "10.0.1.12"]
+    assert nodes["eni-0000000002"]["type_label"] == "ENI/other"
+    assert client.get("/visual/data.json?vpc=vpc-0missing").status_code == 404
+
+
+def test_visual_data_without_snapshot(client):
+    assert client.get("/visual/data.json").get_json() == {
+        "snapshot_id": None,
+        "vpcs": [],
+        "vpc": None,
+    }
+
+
+def test_visual_assets_are_vendored(client):
+    names = {*queries.TYPE_ICONS.values(), *queries.LB_ICONS.values(), queries.VPC_ICON}
+    for name in sorted(names):
+        resp = client.get(f"/static/icons/aws/{name}")
+        assert resp.status_code == 200 and b"<svg" in resp.data, name
+        resp.close()
+    resp = client.get("/static/vendor/cytoscape.min.js")
+    assert resp.status_code == 200 and b"Cytoscape" in resp.data
+    resp.close()
