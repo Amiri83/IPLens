@@ -30,9 +30,14 @@ def test_read_only_guard_allows_paginators():
 
 
 def test_build_session_keys_and_env():
-    s = build_session(Settings(auth_mode="keys", region="eu-west-1",
-                               access_key_id="AKIAEXAMPLE000000000",
-                               secret_access_key=FAKE_SECRET))
+    s = build_session(
+        Settings(
+            auth_mode="keys",
+            region="eu-west-1",
+            access_key_id="AKIAEXAMPLE000000000",
+            secret_access_key=FAKE_SECRET,
+        )
+    )
     creds = s.get_credentials()
     assert creds.access_key == "AKIAEXAMPLE000000000"
     assert s.region_name == "eu-west-1"
@@ -67,8 +72,9 @@ def test_check_connection_failure_does_not_leak_secret():
         raise ValueError("bad")
 
     ok, msg = check_connection(
-        Settings(auth_mode="keys", access_key_id="AKIAEXAMPLE000000000",
-                 secret_access_key=FAKE_SECRET),
+        Settings(
+            auth_mode="keys", access_key_id="AKIAEXAMPLE000000000", secret_access_key=FAKE_SECRET
+        ),
         boom,
     )
     assert not ok

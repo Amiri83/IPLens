@@ -21,15 +21,12 @@ def latest_snapshot(conn: sqlite3.Connection) -> sqlite3.Row | None:
 
 
 def recent_snapshots(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM snapshots ORDER BY id DESC LIMIT ?", (limit,)
-    ).fetchall()
+    return conn.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 
 def prune_snapshots(conn: sqlite3.Connection, keep: int = 10) -> int:
     cur = conn.execute(
-        "DELETE FROM snapshots WHERE id NOT IN "
-        "(SELECT id FROM snapshots ORDER BY id DESC LIMIT ?)",
+        "DELETE FROM snapshots WHERE id NOT IN (SELECT id FROM snapshots ORDER BY id DESC LIMIT ?)",
         (keep,),
     )
     return cur.rowcount
@@ -139,12 +136,12 @@ def subnet_stats(conn: sqlite3.Connection, snap_id: int) -> list[SubnetStats]:
 def vpc_tree(conn: sqlite3.Connection, snap_id: int) -> list[VpcNode]:
     nodes = {
         r["vpc_id"]: VpcNode(
-            vpc_id=r["vpc_id"], name=r["name"] or "", cidrs=json.loads(r["cidrs"]),
+            vpc_id=r["vpc_id"],
+            name=r["name"] or "",
+            cidrs=json.loads(r["cidrs"]),
             is_default=bool(r["is_default"]),
         )
-        for r in conn.execute(
-            "SELECT * FROM vpcs WHERE snapshot_id=? ORDER BY vpc_id", (snap_id,)
-        )
+        for r in conn.execute("SELECT * FROM vpcs WHERE snapshot_id=? ORDER BY vpc_id", (snap_id,))
     }
     for s in subnet_stats(conn, snap_id):
         if s.vpc_id in nodes:
@@ -204,14 +201,24 @@ def subnet_grid(
             o = occupied[n]
             state = "idle" if o["status"] == "available" else "used"
             ref = f" {o['owner_ref']}" if o["owner_ref"] else ""
-            cells.append({
-                "ip": ip, "state": state, "owner": o["owner_type"], "eni": o["eni_id"],
-                "title": f"{ip} {o['owner_type']}{ref} ({o['eni_id']}, {o['status']})",
-            })
+            cells.append(
+                {
+                    "ip": ip,
+                    "state": state,
+                    "owner": o["owner_type"],
+                    "eni": o["eni_id"],
+                    "title": f"{ip} {o['owner_type']}{ref} ({o['eni_id']}, {o['status']})",
+                }
+            )
         else:
             cells.append({"ip": ip, "state": "free", "title": f"{ip} free"})
-    return {"cells": cells, "page": page, "pages": pages,
-            "start": str(ipaddress.IPv4Address(start)), "end": str(ipaddress.IPv4Address(end))}
+    return {
+        "cells": cells,
+        "page": page,
+        "pages": pages,
+        "start": str(ipaddress.IPv4Address(start)),
+        "end": str(ipaddress.IPv4Address(end)),
+    }
 
 
 def subnet_enis(conn: sqlite3.Connection, snap_id: int, subnet_id: str) -> list[dict[str, Any]]:
@@ -241,7 +248,8 @@ def eni_detail(conn: sqlite3.Connection, snap_id: int, eni_id: str) -> dict[str,
         return None
     d = _eni_dict(row)
     d["ips"] = [
-        dict(r) for r in conn.execute(
+        dict(r)
+        for r in conn.execute(
             "SELECT ip, is_primary, public_ip FROM ips WHERE snapshot_id=? AND eni_id=? "
             "ORDER BY ip_int",
             (snap_id, eni_id),

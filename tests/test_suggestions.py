@@ -1,8 +1,10 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from iplens import suggestions as sg
 from iplens.db import closing
-from iplens.rules import Rule
+from iplens.rules import Rule, normalize_params
 
 VPC = "vpc-0example0000001"
 SA, SA2, SB, SC = "subnet-0000000a", "subnet-000000a2", "subnet-0000000b", "subnet-0000000c"
@@ -19,10 +21,22 @@ def ctx(db_path, snapshot_builder, ips):
     b.subnet(SB, VPC, "10.0.2.0/24", az="us-east-1b")
     b.subnet(SC, VPC, "10.0.3.0/24", az="us-east-1b")
     b.eni("eni-0000000ec2", SA, ips("10.0.0.0", 10, 200), owner_ref="i-0example0001")
-    b.eni("eni-00000000d1", SA, ["10.0.0.220", "10.0.0.221"], status="available",
-          owner_type="other", description="example keep detached")
-    b.eni("eni-00000000d2", SA, ["10.0.0.222"], status="available", owner_type="other",
-          requester_managed=True)
+    b.eni(
+        "eni-00000000d1",
+        SA,
+        ["10.0.0.220", "10.0.0.221"],
+        status="available",
+        owner_type="other",
+        description="example keep detached",
+    )
+    b.eni(
+        "eni-00000000d2",
+        SA,
+        ["10.0.0.222"],
+        status="available",
+        owner_type="other",
+        requester_managed=True,
+    )
     b.eni("eni-00000000l1", SA, ["10.0.0.230"], owner_type="lambda", sgs=("sg-000a",))
     b.eni("eni-00000000l2", SA, ["10.0.0.231"], owner_type="lambda", sgs=("sg-000b",))
     b.eni("eni-00000000l3", SA2, ["10.0.1.10"], owner_type="lambda", sgs=("sg-000a",))
@@ -34,8 +48,9 @@ def ctx(db_path, snapshot_builder, ips):
     b.endpoint("vpce-000000001", VPC, SQS, [SA, SB], ["eni-00000000e1", "eni-00000000e2"])
     b.endpoint("vpce-000000002", VPC, SQS, [SB], ["eni-00000000e3"])
     b.endpoint("vpce-000000003", VPC, S3, [SB], ["eni-00000000e4"])
-    b.endpoint("vpce-000000004", VPC, "com.amazonaws.us-east-1.dynamodb", [], [],
-               endpoint_type="Gateway")
+    b.endpoint(
+        "vpce-000000004", VPC, "com.amazonaws.us-east-1.dynamodb", [], [], endpoint_type="Gateway"
+    )
     with closing(db_path) as conn:
         return sg.build_context(conn, b.id)
 
@@ -90,8 +105,7 @@ def test_rules_block_and_sort(ctx):
         Rule(name="reserved-c", kind="subnet_reserved", params={"subnet_ids": [SC]}),
         Rule(name="keep", kind="protected_eni", params={"pattern": "keep"}),
         Rule(name="free-99", kind="min_free_pct", params={"percent": 99.7, "subnet_ids": [SA2]}),
-        Rule(name="disabled", kind="subnet_reserved", params={"subnet_ids": [SA]},
-             enabled=False),
+        Rule(name="disabled", kind="subnet_reserved", params={"subnet_ids": [SA]}, enabled=False),
     ]
     items = sg.generate(ctx, rules)
     by_key = _by_key(items)
@@ -123,6 +137,78 @@ def test_secondary_cidr(db_path, snapshot_builder, ips):
     s = items["cidr:vpc-0example0000002"]
     assert s.ips_saved == 0 and s.impact == "adds capacity"
     assert "100.64.0.0/10" in s.detail
+
+
+@pytest.fixture
+def ecs_ctx(db_path, snapshot_builder, ips):
+    now = datetime.now(UTC)
+    b = snapshot_builder(db_path)
+    b.vpc(VPC, "10.0.0.0/16")
+    b.subnet(SA, VPC, "10.0.0.0/24", az="us-east-1a")
+    b.subnet(SB, VPC, "10.0.2.0/24", az="us-east-1b")
+    # single-IP task ENIs, alternating between the two AZs
+    free = {SA: iter(ips("10.0.0.0", 10, 20)), SB: iter(ips("10.0.2.0", 10, 20))}
+    eni_ids: dict[str, list[str]] = {}
+    for svc, n in (("idle-env", 10), ("busy-env", 10), ("small-env", 2)):
+        eni_ids[svc] = [f"eni-{svc}-{i:02d}" for i in range(n)]
+        for i, eni_id in enumerate(eni_ids[svc]):
+            subnet = SA if i % 2 == 0 else SB
+            b.eni(
+                eni_id,
+                subnet,
+                [next(free[subnet])],
+                owner_type="ecs",
+                owner_ref=f"example-cluster/{svc}",
+            )
+    b.ecs_service("example-cluster", "idle-env", now - timedelta(days=90), eni_ids["idle-env"])
+    b.ecs_service("example-cluster", "busy-env", now - timedelta(days=2), eni_ids["busy-env"])
+    b.ecs_service("example-cluster", "small-env", now - timedelta(days=90), eni_ids["small-env"])
+    b.ecs_service("example-cluster", "never-deployed", None)
+    with closing(db_path) as conn:
+        return sg.build_context(conn, b.id)
+
+
+def test_ecs_idle_environment_suggestion(ecs_ctx):
+    items = _by_key(sg.generate(ecs_ctx, []))
+    ecs_items = {k: v for k, v in items.items() if v.kind == "ecs_idle_service"}
+    # busy-env was deployed recently, small-env holds too few IPs
+    assert list(ecs_items) == ["ecs-idle:example-cluster/idle-env"]
+    s = ecs_items["ecs-idle:example-cluster/idle-env"]
+    assert s.ips_saved == 10 and len(s.eni_ids) == 10
+    assert s.subnet_ids == [SA, SB] and s.vpc_id == VPC
+    assert "Scale down / delete idle environment" in s.title and "90 days" in s.detail
+    assert s.flags == {"ecs_scale_down:example-cluster/idle-env"}
+    assert s.kind_label == "Idle ECS environment"
+
+
+@pytest.mark.parametrize(
+    "params, blocked",
+    [
+        ({"mode": "deny", "pattern": ""}, True),  # deny all scale-downs
+        ({"mode": "deny", "pattern": "/idle-"}, True),  # deny matching service
+        ({"mode": "deny", "pattern": "^prod-"}, False),  # deny others only
+        ({"mode": "allow", "pattern": "/idle-env$"}, False),  # on the allow-list
+        ({"mode": "allow", "pattern": "^sandbox/"}, True),  # not on the allow-list
+    ],
+)
+def test_ecs_scale_down_rule_allow_deny(ecs_ctx, params, blocked):
+    rule = Rule(
+        name="ecs-policy", kind="ecs_scale_down", params=normalize_params("ecs_scale_down", params)
+    )
+    items = _by_key(sg.generate(ecs_ctx, [rule]))
+    s = items["ecs-idle:example-cluster/idle-env"]
+    assert s.blocked is blocked
+    assert ([n for n, _ in s.blocked_by] == ["ecs-policy"]) is blocked
+    # the rule never touches non-ECS suggestions
+    assert not any(v.blocked for v in items.values() if v.kind != "ecs_idle_service")
+
+
+def test_ecs_scale_down_rule_validation():
+    assert normalize_params("ecs_scale_down", {}) == {"mode": "deny", "pattern": ""}
+    with pytest.raises(ValueError, match="allow mode needs a pattern"):
+        normalize_params("ecs_scale_down", {"mode": "allow"})
+    with pytest.raises(ValueError, match="mode must be one of"):
+        normalize_params("ecs_scale_down", {"mode": "maybe"})
 
 
 def test_no_az_suggestion_when_balanced(db_path, snapshot_builder, ips):

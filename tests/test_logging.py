@@ -34,7 +34,8 @@ def test_file_logging_redacts_and_reads_back(tmp_path):
     assert [e["level"] for e in entries] == ["ERROR", "WARNING", "INFO"]
     assert "Traceback" in entries[0]["msg"] and "RuntimeError" in entries[0]["msg"]
     assert [e["msg"] for e in read_log(tmp_path / "logs", min_level="WARNING")][1].startswith(
-        "credentials")
+        "credentials"
+    )
     assert len(read_log(tmp_path / "logs", min_level="ERROR")) == 1
     assert [e["msg"] for e in read_log(tmp_path / "logs", q="WORLD")] == ["hello world"]
     assert len(read_log(tmp_path / "logs", limit=1)) == 1

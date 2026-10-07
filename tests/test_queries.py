@@ -11,10 +11,22 @@ def _seed(db_path, builder):
     b.vpc(VPC, "10.0.0.0/16")
     b.subnet(SA, VPC, "10.0.1.0/28", az="us-east-1a", name="example-a")
     b.subnet(SB, VPC, "10.0.4.0/22", az="us-east-1b")
-    b.eni("eni-0000000001", SA, ["10.0.1.4", "10.0.1.5"], owner_type="ec2",
-          owner_ref="i-0example0001", description="example web")
-    b.eni("eni-0000000002", SA, ["10.0.1.9"], status="available", owner_type="other",
-          description="example detached")
+    b.eni(
+        "eni-0000000001",
+        SA,
+        ["10.0.1.4", "10.0.1.5"],
+        owner_type="ec2",
+        owner_ref="i-0example0001",
+        description="example web",
+    )
+    b.eni(
+        "eni-0000000002",
+        SA,
+        ["10.0.1.9"],
+        status="available",
+        owner_type="other",
+        description="example detached",
+    )
     b.eni("eni-0000000003", SB, ["10.0.6.10"], owner_type="lambda", owner_ref="example-fn")
     return b
 

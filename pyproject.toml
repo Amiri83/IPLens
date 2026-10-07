@@ -18,7 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "moto[ec2,lambda,elbv2,sts,iam]>=5.0",
+    "moto[ec2,ecs,lambda,elbv2,sts,iam]>=5.0",
     "ruff>=0.5",
 ]
 

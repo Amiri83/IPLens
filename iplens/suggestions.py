@@ -6,6 +6,7 @@ import json
 import sqlite3
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 from .queries import SubnetStats, VpcNode, subnet_stats, vpc_tree
@@ -18,6 +19,10 @@ AZ_IMBALANCE_RATIO = 2.0
 AZ_IMBALANCE_MIN_DELTA = 16
 VPC_SPACE_ALLOCATED_PCT = 90.0
 VPC_CONSUMED_PCT = 70.0
+# An ECS service is an "idle environment" candidate when its tasks hold at least
+# this many IPs and it has not been deployed for this many days.
+ECS_IDLE_MIN_IPS = 8
+ECS_IDLE_DAYS = 30
 
 KIND_LABELS = {
     "detached_eni": "Detached ENI",
@@ -29,6 +34,7 @@ KIND_LABELS = {
     "endpoint_via_nat": "Endpoints via NAT",
     "az_imbalance": "AZ imbalance",
     "secondary_cidr": "Secondary CIDR",
+    "ecs_idle_service": "Idle ECS environment",
 }
 
 
@@ -41,6 +47,9 @@ class Context:
     lambdas: list[dict[str, Any]]
     endpoints: list[dict[str, Any]]
     load_balancers: list[dict[str, Any]]
+    ecs_services: list[dict[str, Any]] = field(default_factory=list)
+    ecs_task_enis: list[dict[str, Any]] = field(default_factory=list)
+    taken_at: datetime | None = None
 
 
 @dataclass
@@ -84,7 +93,8 @@ def build_context(conn: sqlite3.Connection, snap_id: int) -> Context:
     def rows(table: str, *json_cols: str) -> list[dict[str, Any]]:
         out = []
         for r in conn.execute(
-            f"SELECT * FROM {table} WHERE snapshot_id=?", (snap_id,)  # noqa: S608 - fixed names
+            f"SELECT * FROM {table} WHERE snapshot_id=?",  # noqa: S608 - fixed names
+            (snap_id,),
         ):
             d = dict(r)
             for c in json_cols:
@@ -92,6 +102,7 @@ def build_context(conn: sqlite3.Connection, snap_id: int) -> Context:
             out.append(d)
         return out
 
+    snap = conn.execute("SELECT taken_at FROM snapshots WHERE id=?", (snap_id,)).fetchone()
     return Context(
         subnets={s.subnet_id: s for s in subnet_stats(conn, snap_id)},
         enis=enis,
@@ -100,10 +111,24 @@ def build_context(conn: sqlite3.Connection, snap_id: int) -> Context:
         lambdas=rows("lambdas", "subnet_ids", "security_groups"),
         endpoints=rows("endpoints", "subnet_ids", "eni_ids"),
         load_balancers=rows("load_balancers"),
+        ecs_services=rows("ecs_services"),
+        ecs_task_enis=rows("ecs_task_enis"),
+        taken_at=_parse_ts(snap["taken_at"] if snap else None),
     )
 
 
+def _parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        ts = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
+
+
 # -- generators ---------------------------------------------------------------
+
 
 def _detached_enis(ctx: Context) -> list[Suggestion]:
     out = []
@@ -112,17 +137,19 @@ def _detached_enis(ctx: Context) -> list[Suggestion]:
             continue
         n = ctx.eni_ip_count.get(eni["eni_id"], 0)
         label = eni.get("name") or eni.get("description") or "no description"
-        out.append(Suggestion(
-            key=f"detached:{eni['eni_id']}",
-            kind="detached_eni",
-            title=f"Delete detached ENI {eni['eni_id']}",
-            detail=f"ENI '{label}' in {eni['subnet_id']} is not attached to anything "
-                   f"but holds {n} private IP(s).",
-            vpc_id=eni["vpc_id"] or "",
-            ips_saved=n,
-            subnet_ids=[eni["subnet_id"]] if eni["subnet_id"] else [],
-            eni_ids=[eni["eni_id"]],
-        ))
+        out.append(
+            Suggestion(
+                key=f"detached:{eni['eni_id']}",
+                kind="detached_eni",
+                title=f"Delete detached ENI {eni['eni_id']}",
+                detail=f"ENI '{label}' in {eni['subnet_id']} is not attached to anything "
+                f"but holds {n} private IP(s).",
+                vpc_id=eni["vpc_id"] or "",
+                ips_saved=n,
+                subnet_ids=[eni["subnet_id"]] if eni["subnet_id"] else [],
+                eni_ids=[eni["eni_id"]],
+            )
+        )
     return out
 
 
@@ -152,15 +179,20 @@ def _lambda(ctx: Context) -> list[Suggestion]:
                 touched.append(subnet_id)
                 eni_ids += [e["eni_id"] for e in sub_enis if _sg_key(e) != dominant]
         if saved:
-            out.append(Suggestion(
-                key=f"lambda-sg:{vpc_id}",
-                kind="lambda_sg_combo",
-                title=f"Standardise Lambda security groups in {vpc_id}",
-                detail="Lambda creates one ENI per unique subnet + security-group combination. "
-                       f"{len(touched)} subnet(s) host several SG combinations; sharing one SG "
-                       "set per subnet removes the extra ENIs.",
-                vpc_id=vpc_id, ips_saved=saved, subnet_ids=touched, eni_ids=eni_ids,
-            ))
+            out.append(
+                Suggestion(
+                    key=f"lambda-sg:{vpc_id}",
+                    kind="lambda_sg_combo",
+                    title=f"Standardise Lambda security groups in {vpc_id}",
+                    detail="Lambda creates one ENI per unique subnet + security-group combination. "
+                    f"{len(touched)} subnet(s) host several SG combinations; sharing one SG "
+                    "set per subnet removes the extra ENIs.",
+                    vpc_id=vpc_id,
+                    ips_saved=saved,
+                    subnet_ids=touched,
+                    eni_ids=eni_ids,
+                )
+            )
 
         # 2) Lambda spread across several subnets in the same AZ
         by_az: dict[str, list[str]] = defaultdict(list)
@@ -183,29 +215,37 @@ def _lambda(ctx: Context) -> list[Suggestion]:
                         target_sets.add(_sg_key(e))
                         moved += 1
             if saved_here:
-                out.append(Suggestion(
-                    key=f"lambda-spread:{vpc_id}:{az}",
-                    kind="lambda_subnet_spread",
-                    title=f"Use a single Lambda subnet in {az} ({vpc_id})",
-                    detail=f"Lambda ENIs are spread over {len(subnet_ids)} subnets in {az}. "
-                           f"Pointing functions at {target} only removes duplicate ENIs.",
-                    vpc_id=vpc_id, ips_saved=saved_here,
-                    subnet_ids=sorted(set(subnet_ids) - {target}),
-                    target_subnets={target: moved} if moved else {target: 0},
-                    eni_ids=src_enis,
-                ))
+                out.append(
+                    Suggestion(
+                        key=f"lambda-spread:{vpc_id}:{az}",
+                        kind="lambda_subnet_spread",
+                        title=f"Use a single Lambda subnet in {az} ({vpc_id})",
+                        detail=f"Lambda ENIs are spread over {len(subnet_ids)} subnets in {az}. "
+                        f"Pointing functions at {target} only removes duplicate ENIs.",
+                        vpc_id=vpc_id,
+                        ips_saved=saved_here,
+                        subnet_ids=sorted(set(subnet_ids) - {target}),
+                        target_subnets={target: moved} if moved else {target: 0},
+                        eni_ids=src_enis,
+                    )
+                )
 
         # 3) the radical option: run functions outside the VPC
         total = sum(ctx.eni_ip_count.get(e["eni_id"], 1) for e in enis)
-        out.append(Suggestion(
-            key=f"lambda-novpc:{vpc_id}",
-            kind="lambda_detach_vpc",
-            title=f"Run Lambdas that need no private access outside {vpc_id}",
-            detail="Functions that only call public AWS APIs do not need a VPC attachment; "
-                   "detaching them frees their Hyperplane ENIs.",
-            vpc_id=vpc_id, ips_saved=total, subnet_ids=sorted(by_subnet),
-            eni_ids=[e["eni_id"] for e in enis], flags={"lambda_detach_vpc"},
-        ))
+        out.append(
+            Suggestion(
+                key=f"lambda-novpc:{vpc_id}",
+                kind="lambda_detach_vpc",
+                title=f"Run Lambdas that need no private access outside {vpc_id}",
+                detail="Functions that only call public AWS APIs do not need a VPC attachment; "
+                "detaching them frees their Hyperplane ENIs.",
+                vpc_id=vpc_id,
+                ips_saved=total,
+                subnet_ids=sorted(by_subnet),
+                eni_ids=[e["eni_id"] for e in enis],
+                flags={"lambda_detach_vpc"},
+            )
+        )
     return out
 
 
@@ -224,30 +264,34 @@ def _endpoints(ctx: Context) -> list[Suggestion]:
         if len(eps) > 1:
             keep = max(eps, key=lambda e: (len(e["subnet_ids"]), e["endpoint_id"]))
             extra = [e for e in eps if e is not keep]
-            out.append(Suggestion(
-                key=f"dup-endpoint:{vpc_id}:{service}",
-                kind="duplicate_endpoint",
-                title=f"Remove duplicate {service} endpoints in {vpc_id}",
-                detail=f"{len(eps)} interface endpoints serve {service}; keep "
-                       f"{keep['endpoint_id']} and remove "
-                       f"{', '.join(e['endpoint_id'] for e in extra)}.",
-                vpc_id=vpc_id,
-                ips_saved=sum(_endpoint_ip_count(ctx, e) for e in extra),
-                subnet_ids=sorted({s for e in extra for s in e["subnet_ids"]}),
-                eni_ids=[i for e in extra for i in e["eni_ids"]],
-            ))
+            out.append(
+                Suggestion(
+                    key=f"dup-endpoint:{vpc_id}:{service}",
+                    kind="duplicate_endpoint",
+                    title=f"Remove duplicate {service} endpoints in {vpc_id}",
+                    detail=f"{len(eps)} interface endpoints serve {service}; keep "
+                    f"{keep['endpoint_id']} and remove "
+                    f"{', '.join(e['endpoint_id'] for e in extra)}.",
+                    vpc_id=vpc_id,
+                    ips_saved=sum(_endpoint_ip_count(ctx, e) for e in extra),
+                    subnet_ids=sorted({s for e in extra for s in e["subnet_ids"]}),
+                    eni_ids=[i for e in extra for i in e["eni_ids"]],
+                )
+            )
         if service.endswith(GATEWAY_CAPABLE):
-            out.append(Suggestion(
-                key=f"gw-endpoint:{vpc_id}:{service}",
-                kind="gateway_endpoint",
-                title=f"Use a gateway endpoint for {service} in {vpc_id}",
-                detail="S3 and DynamoDB support gateway endpoints, which are free, stay "
-                       "private and consume no subnet IPs.",
-                vpc_id=vpc_id,
-                ips_saved=sum(_endpoint_ip_count(ctx, e) for e in eps),
-                subnet_ids=sorted({s for e in eps for s in e["subnet_ids"]}),
-                eni_ids=[i for e in eps for i in e["eni_ids"]],
-            ))
+            out.append(
+                Suggestion(
+                    key=f"gw-endpoint:{vpc_id}:{service}",
+                    kind="gateway_endpoint",
+                    title=f"Use a gateway endpoint for {service} in {vpc_id}",
+                    detail="S3 and DynamoDB support gateway endpoints, which are free, stay "
+                    "private and consume no subnet IPs.",
+                    vpc_id=vpc_id,
+                    ips_saved=sum(_endpoint_ip_count(ctx, e) for e in eps),
+                    subnet_ids=sorted({s for e in eps for s in e["subnet_ids"]}),
+                    eni_ids=[i for e in eps for i in e["eni_ids"]],
+                )
+            )
 
     nat_vpcs = {e["vpc_id"] for e in ctx.enis.values() if e["owner_type"] == "nat"}
     by_vpc: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -256,18 +300,20 @@ def _endpoints(ctx: Context) -> list[Suggestion]:
     for vpc_id, eps in sorted(by_vpc.items()):
         if vpc_id not in nat_vpcs:
             continue
-        out.append(Suggestion(
-            key=f"endpoint-nat:{vpc_id}",
-            kind="endpoint_via_nat",
-            title=f"Reach AWS services through the NAT gateway in {vpc_id}",
-            detail=f"Removing {len(eps)} interface endpoint(s) frees their ENIs, but traffic "
-                   "would leave the VPC over public service endpoints.",
-            vpc_id=vpc_id,
-            ips_saved=sum(_endpoint_ip_count(ctx, e) for e in eps),
-            subnet_ids=sorted({s for e in eps for s in e["subnet_ids"]}),
-            eni_ids=[i for e in eps for i in e["eni_ids"]],
-            flags={"public_path:vpc_endpoint"},
-        ))
+        out.append(
+            Suggestion(
+                key=f"endpoint-nat:{vpc_id}",
+                kind="endpoint_via_nat",
+                title=f"Reach AWS services through the NAT gateway in {vpc_id}",
+                detail=f"Removing {len(eps)} interface endpoint(s) frees their ENIs, but traffic "
+                "would leave the VPC over public service endpoints.",
+                vpc_id=vpc_id,
+                ips_saved=sum(_endpoint_ip_count(ctx, e) for e in eps),
+                subnet_ids=sorted({s for e in eps for s in e["subnet_ids"]}),
+                eni_ids=[i for e in eps for i in e["eni_ids"]],
+                flags={"public_path:vpc_endpoint"},
+            )
+        )
     return out
 
 
@@ -288,16 +334,18 @@ def _az_imbalance(ctx: Context) -> list[Suggestion]:
         candidates = [s for s in vpc.subnets if s.az == cold]
         target = max(candidates, key=lambda s: (s.free, s.subnet_id))
         shift = delta // 2
-        out.append(Suggestion(
-            key=f"az:{vpc.vpc_id}",
-            kind="az_imbalance",
-            title=f"Rebalance IP usage across AZs in {vpc.vpc_id}",
-            detail=f"{hot} uses {per_az[hot]} IPs vs {per_az[cold]} in {cold}. Shifting "
-                   f"~{shift} IPs of workload to {target.subnet_id} evens out exhaustion risk.",
-            vpc_id=vpc.vpc_id,
-            impact=f"~{shift} IPs headroom in {hot}",
-            target_subnets={target.subnet_id: shift},
-        ))
+        out.append(
+            Suggestion(
+                key=f"az:{vpc.vpc_id}",
+                kind="az_imbalance",
+                title=f"Rebalance IP usage across AZs in {vpc.vpc_id}",
+                detail=f"{hot} uses {per_az[hot]} IPs vs {per_az[cold]} in {cold}. Shifting "
+                f"~{shift} IPs of workload to {target.subnet_id} evens out exhaustion risk.",
+                vpc_id=vpc.vpc_id,
+                impact=f"~{shift} IPs headroom in {hot}",
+                target_subnets={target.subnet_id: shift},
+            )
+        )
     return out
 
 
@@ -311,20 +359,68 @@ def _secondary_cidr(ctx: Context) -> list[Suggestion]:
         consumed_pct = 100.0 * consumed / usable
         if vpc.allocated_pct < VPC_SPACE_ALLOCATED_PCT or consumed_pct < VPC_CONSUMED_PCT:
             continue
-        out.append(Suggestion(
-            key=f"cidr:{vpc.vpc_id}",
-            kind="secondary_cidr",
-            title=f"Add a secondary CIDR to {vpc.vpc_id}",
-            detail=f"{vpc.allocated_pct:.0f}% of the VPC range is carved into subnets and "
-                   f"{consumed_pct:.0f}% of subnet IPs are in use. A secondary CIDR (for example "
-                   "from 100.64.0.0/10 for non-routable workloads) adds room for new subnets.",
-            vpc_id=vpc.vpc_id,
-            impact="adds capacity",
-        ))
+        out.append(
+            Suggestion(
+                key=f"cidr:{vpc.vpc_id}",
+                kind="secondary_cidr",
+                title=f"Add a secondary CIDR to {vpc.vpc_id}",
+                detail=f"{vpc.allocated_pct:.0f}% of the VPC range is carved into subnets and "
+                f"{consumed_pct:.0f}% of subnet IPs are in use. A secondary CIDR (for example "
+                "from 100.64.0.0/10 for non-routable workloads) adds room for new subnets.",
+                vpc_id=vpc.vpc_id,
+                impact="adds capacity",
+            )
+        )
     return out
 
 
-GENERATORS = (_detached_enis, _lambda, _endpoints, _az_imbalance, _secondary_cidr)
+def _ecs_idle(ctx: Context) -> list[Suggestion]:
+    """Services whose tasks hold many IPs but have not been deployed recently."""
+    if ctx.taken_at is None:
+        return []
+    by_service: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for m in ctx.ecs_task_enis:
+        if m["service"] and m["eni_id"] in ctx.enis:
+            by_service[(m["cluster"], m["service"])].append(m["eni_id"])
+
+    out = []
+    for svc in ctx.ecs_services:
+        ref = f"{svc['cluster']}/{svc['service']}"
+        eni_ids = sorted(by_service.get((svc["cluster"], svc["service"]), []))
+        n = sum(ctx.eni_ip_count.get(e, 0) for e in eni_ids)
+        last = _parse_ts(svc.get("last_deployment"))
+        if n < ECS_IDLE_MIN_IPS or last is None:
+            continue
+        age = (ctx.taken_at - last).days
+        if age < ECS_IDLE_DAYS:
+            continue
+        enis = [ctx.enis[e] for e in eni_ids]
+        out.append(
+            Suggestion(
+                key=f"ecs-idle:{ref}",
+                kind="ecs_idle_service",
+                title=f"Scale down / delete idle environment: ECS service {ref}",
+                detail=f"{len(eni_ids)} task ENI(s) of {ref} hold {n} private IP(s) and the "
+                f"service has not been deployed for {age} days. If this environment is "
+                "idle, scale it to zero or delete it.",
+                vpc_id=enis[0]["vpc_id"] or "",
+                ips_saved=n,
+                subnet_ids=sorted({e["subnet_id"] for e in enis if e["subnet_id"]}),
+                eni_ids=eni_ids,
+                flags={f"ecs_scale_down:{ref}"},
+            )
+        )
+    return out
+
+
+GENERATORS = (
+    _detached_enis,
+    _lambda,
+    _endpoints,
+    _az_imbalance,
+    _secondary_cidr,
+    _ecs_idle,
+)
 
 
 def generate(ctx: Context, rules: list[Rule]) -> list[Suggestion]:

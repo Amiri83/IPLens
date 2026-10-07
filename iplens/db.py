@@ -105,6 +105,25 @@ CREATE TABLE IF NOT EXISTS load_balancers (
     PRIMARY KEY (snapshot_id, name)
 );
 
+CREATE TABLE IF NOT EXISTS ecs_services (
+    snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    cluster         TEXT NOT NULL,
+    service         TEXT NOT NULL,
+    desired_count   INTEGER,
+    running_count   INTEGER,
+    last_deployment TEXT,           -- ISO timestamp of the newest deployment
+    PRIMARY KEY (snapshot_id, cluster, service)
+);
+
+CREATE TABLE IF NOT EXISTS ecs_task_enis (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    eni_id      TEXT NOT NULL,
+    cluster     TEXT NOT NULL,
+    service     TEXT NOT NULL,      -- '' for standalone tasks
+    task_id     TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, eni_id)
+);
+
 CREATE TABLE IF NOT EXISTS rules (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,

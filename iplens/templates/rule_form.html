@@ -35,8 +35,14 @@
       {% for sc in scopes %}<option value="{{ sc }}" {{ 'selected' if sc == p.get('scope', 'both') }}>{{ sc }}</option>{% endfor %}
     </select>
   </fieldset>
-  <fieldset data-kinds="protected_eni">
-    <label for="pattern">Pattern (regex, matched against ENI id / description / name / owner)</label>
+  <fieldset data-kinds="ecs_scale_down">
+    <label for="mode">Mode (deny: block matching services, blank pattern = all; allow: only matching services may be scaled down)</label>
+    <select id="mode" name="mode">
+      {% for m in ecs_modes %}<option value="{{ m }}" {{ 'selected' if m == p.get('mode', 'deny') }}>{{ m }}</option>{% endfor %}
+    </select>
+  </fieldset>
+  <fieldset data-kinds="protected_eni ecs_scale_down">
+    <label for="pattern">Pattern (regex; protected ENI: ENI id / description / name / owner; ECS: cluster/service)</label>
     <input id="pattern" name="pattern" class="mono" size="60" value="{{ p.get('pattern', '') }}">
   </fieldset>
   <p><button type="submit">Save</button></p>

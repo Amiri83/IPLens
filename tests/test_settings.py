@@ -24,8 +24,12 @@ def test_defaults(store):
 
 
 def test_secret_is_encrypted_at_rest(store, db_path):
-    store.save(auth_mode="keys", region="eu-west-1", access_key_id=FAKE_KEY_ID,
-               secret_access_key=FAKE_SECRET)
+    store.save(
+        auth_mode="keys",
+        region="eu-west-1",
+        access_key_id=FAKE_KEY_ID,
+        secret_access_key=FAKE_SECRET,
+    )
     with closing(db_path) as conn:
         dump = "\n".join(conn.iterdump())
     assert FAKE_SECRET not in dump
@@ -35,18 +39,27 @@ def test_secret_is_encrypted_at_rest(store, db_path):
 
 
 def test_secret_kept_when_blank_and_clearable(store):
-    store.save(auth_mode="keys", region="us-east-1", access_key_id=FAKE_KEY_ID,
-               secret_access_key=FAKE_SECRET)
-    store.save(auth_mode="keys", region="us-east-2", access_key_id=FAKE_KEY_ID,
-               secret_access_key=None)
+    store.save(
+        auth_mode="keys",
+        region="us-east-1",
+        access_key_id=FAKE_KEY_ID,
+        secret_access_key=FAKE_SECRET,
+    )
+    store.save(
+        auth_mode="keys", region="us-east-2", access_key_id=FAKE_KEY_ID, secret_access_key=None
+    )
     assert store.load(with_secret=True).secret_access_key == FAKE_SECRET
     store.save(auth_mode="env", region="us-east-2", clear_secret=True)
     assert not store.load().has_secret
 
 
 def test_public_dict_never_contains_secret(store):
-    store.save(auth_mode="keys", region="us-east-1", access_key_id=FAKE_KEY_ID,
-               secret_access_key=FAKE_SECRET)
+    store.save(
+        auth_mode="keys",
+        region="us-east-1",
+        access_key_id=FAKE_KEY_ID,
+        secret_access_key=FAKE_SECRET,
+    )
     s = store.load(with_secret=True)
     pub = s.public_dict()
     assert FAKE_SECRET not in str(pub)
@@ -54,12 +67,15 @@ def test_public_dict_never_contains_secret(store):
     assert FAKE_SECRET not in repr(s)
 
 
-@pytest.mark.parametrize("kwargs, msg", [
-    ({"auth_mode": "bogus", "region": "us-east-1"}, "auth_mode"),
-    ({"auth_mode": "env", "region": " "}, "region"),
-    ({"auth_mode": "profile", "region": "us-east-1"}, "profile"),
-    ({"auth_mode": "keys", "region": "us-east-1", "access_key_id": FAKE_KEY_ID}, "secret"),
-])
+@pytest.mark.parametrize(
+    "kwargs, msg",
+    [
+        ({"auth_mode": "bogus", "region": "us-east-1"}, "auth_mode"),
+        ({"auth_mode": "env", "region": " "}, "region"),
+        ({"auth_mode": "profile", "region": "us-east-1"}, "profile"),
+        ({"auth_mode": "keys", "region": "us-east-1", "access_key_id": FAKE_KEY_ID}, "secret"),
+    ],
+)
 def test_validation(store, kwargs, msg):
     with pytest.raises(ValueError, match=msg):
         store.save(**kwargs)

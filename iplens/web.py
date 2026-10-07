@@ -9,7 +9,6 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from botocore.exceptions import BotoCoreError, ClientError
 from flask import (
     Flask,
     Response,
@@ -28,7 +27,7 @@ from . import queries
 from . import rules as rules_mod
 from . import suggestions as sugg_mod
 from .attribution import OWNER_LABELS, OWNER_TYPES
-from .aws import AwsGateway, ReadOnlyViolation, check_connection
+from .aws import AwsGateway, check_connection
 from .collector import Collector
 from .config import AppPaths, default_paths
 from .crypto import SecretBox
@@ -40,6 +39,22 @@ log = logging.getLogger(__name__)
 
 GatewayFactory = Callable[[Settings], AwsGateway]
 IP_PAGE_SIZE = 200
+# DNS-rebinding protection: only these Host header names are served.
+ALLOWED_HOSTS = ("127.0.0.1", "localhost")
+
+
+def host_allowed(host: str, port: int | None) -> bool:
+    """True if ``host`` (a raw Host header) names this local server.
+
+    With a known ``port`` the header must carry exactly that port (a bare name
+    is only valid for port 80). With ``port=None`` any numeric port is accepted.
+    """
+    name, sep, host_port = host.strip().lower().partition(":")
+    if name not in ALLOWED_HOSTS:
+        return False
+    if port is None:
+        return not sep or host_port.isdigit()
+    return host_port == str(port) if sep else port == 80
 
 
 def _flask_secret(paths: AppPaths) -> bytes:
@@ -58,7 +73,10 @@ def create_app(
     *,
     gateway_factory: GatewayFactory | None = None,
     testing: bool = False,
+    port: int | None = None,
 ) -> Flask:
+    """Build the app. ``port`` is the port the server listens on; when given,
+    the Host header must be ``127.0.0.1:<port>`` or ``localhost:<port>``."""
     paths = default_paths(home).ensure()
     init_db(paths.db_path)
     box = SecretBox.from_path(paths.key_path)
@@ -76,6 +94,7 @@ def create_app(
         "paths": paths,
         "store": store,
         "gateway_factory": gateway_factory or AwsGateway.from_settings,
+        "port": port,
     }
     apply_log_dir(app, store.load())
     log.info("IPLens started (data dir %s)", paths.home)
@@ -125,6 +144,17 @@ def _register(app: Flask) -> None:
         if db is not None:
             db.close()
 
+    # Registered first so it runs before anything else touches the request.
+    @app.before_request
+    def _trusted_host() -> None:
+        # Raw header: werkzeug's request.host drops default ports.
+        host = request.headers.get("Host", "")
+        if not host_allowed(host, _ext()["port"]):
+            log.warning(
+                "rejected request %s with untrusted Host header %r", request.path, host[:100]
+            )
+            abort(400, "invalid Host header")
+
     @app.before_request
     def _csrf() -> None:
         if "csrf" not in session:
@@ -157,23 +187,31 @@ def _register(app: Flask) -> None:
             tree = queries.vpc_tree(_db(), snap["id"])
             owners = queries.owner_breakdown(_db(), snap["id"])
         return render_template(
-            "overview.html", snap=snap, tree=tree, owners=owners,
+            "overview.html",
+            snap=snap,
+            tree=tree,
+            owners=owners,
             history=queries.recent_snapshots(_db(), 5),
         )
 
     @app.post("/refresh")
     def refresh():
-        settings = _store().load(with_secret=True)
         try:
+            settings = _store().load(with_secret=True)
             gw = _ext()["gateway_factory"](settings)
             result = Collector(gw, _paths().db_path).run()
-        except (BotoCoreError, ClientError, ValueError, ReadOnlyViolation) as exc:
-            flash(f"Refresh failed: {type(exc).__name__}: {exc}", "error")
+            with closing(_paths().db_path) as conn:
+                queries.prune_snapshots(conn)
+        except Exception:
+            # Full details (type, message, traceback) go to the log file only;
+            # raw errors can carry ARNs, account ids or request ids.
+            log.exception("refresh failed")
+            flash("Refresh failed. See the log for details.", "error")
             return redirect(url_for("overview"))
-        with closing(_paths().db_path) as conn:
-            queries.prune_snapshots(conn)
-        msg = (f"Snapshot #{result.snapshot_id}: {result.vpcs} VPCs, {result.subnets} subnets, "
-               f"{result.enis} ENIs, {result.ips} IPs")
+        msg = (
+            f"Snapshot #{result.snapshot_id}: {result.vpcs} VPCs, {result.subnets} subnets, "
+            f"{result.enis} ENIs, {result.ips} IPs"
+        )
         flash(msg, "ok")
         for w in result.warnings:
             flash(w, "warn")
@@ -214,13 +252,26 @@ def _register(app: Flask) -> None:
         rows, total = [], 0
         if snap:
             rows, total = queries.search_ips(
-                _db(), snap["id"], q=q, owner=owner if owner in OWNER_TYPES else "",
-                state=state, limit=IP_PAGE_SIZE, offset=page * IP_PAGE_SIZE,
+                _db(),
+                snap["id"],
+                q=q,
+                owner=owner if owner in OWNER_TYPES else "",
+                state=state,
+                limit=IP_PAGE_SIZE,
+                offset=page * IP_PAGE_SIZE,
             )
         pages = max((total + IP_PAGE_SIZE - 1) // IP_PAGE_SIZE, 1)
         return render_template(
-            "ips.html", snap=snap, rows=rows, total=total, q=q, owner=owner, state=state,
-            page=page, pages=pages, owner_types=OWNER_TYPES,
+            "ips.html",
+            snap=snap,
+            rows=rows,
+            total=total,
+            q=q,
+            owner=owner,
+            state=state,
+            page=page,
+            pages=pages,
+            owner_types=OWNER_TYPES,
         )
 
     # -- rules -----------------------------------------------------------------
@@ -234,8 +285,9 @@ def _register(app: Flask) -> None:
         rules = rules_mod.list_rules(_db())
         ctx, _snap = _context()
         violations = {r.id: r.violations(ctx) for r in rules} if ctx else {}
-        return render_template("rules.html", rules=rules, violations=violations,
-                               kinds=rules_mod.RULE_KINDS)
+        return render_template(
+            "rules.html", rules=rules, violations=violations, kinds=rules_mod.RULE_KINDS
+        )
 
     def _rule_from_form(rule_id: int | None) -> rules_mod.Rule:
         f = request.form
@@ -250,20 +302,23 @@ def _register(app: Flask) -> None:
                 "subnet_ids": f.get("subnet_ids", ""),
                 "scope": f.get("scope", ""),
                 "pattern": f.get("pattern", ""),
+                "mode": f.get("mode", ""),
             },
         )
 
     def _rule_form(rule: rules_mod.Rule, status: int = 200):
         return render_template(
-            "rule_form.html", rule=rule, kinds=rules_mod.RULE_KINDS,
+            "rule_form.html",
+            rule=rule,
+            kinds=rules_mod.RULE_KINDS,
             scopes=rules_mod.INTERNAL_SCOPES,
+            ecs_modes=rules_mod.ECS_MODES,
         ), status
 
     @app.route("/rules/new", methods=["GET", "POST"])
     def rule_new():
         if request.method == "GET":
-            return _rule_form(rules_mod.Rule(name="", kind="min_free_pct",
-                                             params={"percent": 20}))
+            return _rule_form(rules_mod.Rule(name="", kind="min_free_pct", params={"percent": 20}))
         rule = _rule_from_form(None)
         try:
             with closing(_paths().db_path) as conn:
@@ -307,8 +362,11 @@ def _register(app: Flask) -> None:
     @app.get("/rules/export.yaml")
     def rules_export():
         body = rules_mod.export_yaml(rules_mod.list_rules(_db()))
-        return Response(body, mimetype="application/x-yaml",
-                        headers={"Content-Disposition": "attachment; filename=iplens-rules.yaml"})
+        return Response(
+            body,
+            mimetype="application/x-yaml",
+            headers={"Content-Disposition": "attachment; filename=iplens-rules.yaml"},
+        )
 
     @app.post("/rules/import")
     def rules_import():
@@ -335,8 +393,9 @@ def _register(app: Flask) -> None:
         items: list[sugg_mod.Suggestion] = []
         if ctx:
             items = sugg_mod.generate(ctx, rules_mod.list_rules(_db()))
-        return render_template("suggestions.html", snap=snap, items=items,
-                               totals=sugg_mod.totals(items))
+        return render_template(
+            "suggestions.html", snap=snap, items=items, totals=sugg_mod.totals(items)
+        )
 
     # -- logs --------------------------------------------------------------------
 
@@ -347,16 +406,26 @@ def _register(app: Flask) -> None:
         limit = min(max(request.args.get("limit", 500, type=int), 1), 5000)
         log_dir = _ext()["log_dir"]
         entries = read_log(log_dir, min_level=level, q=q, limit=limit)
-        return render_template("logs.html", entries=entries, level=level, q=q, limit=limit,
-                               levels=LEVELS, log_dir=log_dir)
+        return render_template(
+            "logs.html",
+            entries=entries,
+            level=level,
+            q=q,
+            limit=limit,
+            levels=LEVELS,
+            log_dir=log_dir,
+        )
 
     # -- settings ----------------------------------------------------------------
 
     @app.get("/settings")
     def settings_page():
         return render_template(
-            "settings.html", s=_store().load().public_dict(), modes=AUTH_MODES,
-            regions=REGIONS, default_log_dir=_paths().default_log_dir,
+            "settings.html",
+            s=_store().load().public_dict(),
+            modes=AUTH_MODES,
+            regions=REGIONS,
+            default_log_dir=_paths().default_log_dir,
         )
 
     @app.post("/settings")
@@ -382,8 +451,12 @@ def _register(app: Flask) -> None:
             return redirect(url_for("settings_page"))
         settings = _store().load()
         new_dir = apply_log_dir(current_app, settings)
-        log.info("settings saved: auth_mode=%s region=%s log_dir=%s",
-                 settings.auth_mode, settings.region, new_dir)
+        log.info(
+            "settings saved: auth_mode=%s region=%s log_dir=%s",
+            settings.auth_mode,
+            settings.region,
+            new_dir,
+        )
         flash("Settings saved", "ok")
         return redirect(url_for("settings_page"))
 

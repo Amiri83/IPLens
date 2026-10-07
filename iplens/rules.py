@@ -25,9 +25,13 @@ RULE_KINDS: dict[str, str] = {
     "subnet_reserved": "Subnet is reserved: no changes or new placements",
     "min_free_pct": "Subnets must keep a minimum percentage of free IPs",
     "protected_eni": "ENIs matching a pattern must never be removed",
+    "ecs_scale_down": "ECS scale-down / delete-idle-environment suggestions: allow or deny",
 }
 
 INTERNAL_SCOPES = ("load_balancer", "vpc_endpoint", "both")
+# deny:  block scale-down suggestions for services matching the pattern (blank = all)
+# allow: block scale-down suggestions for every service NOT matching the pattern
+ECS_MODES = ("deny", "allow")
 
 
 @dataclass
@@ -54,6 +58,8 @@ class Rule:
             return f"scope: {p.get('scope', 'both')}"
         if self.kind == "protected_eni":
             return f"pattern: {p.get('pattern', '')}"
+        if self.kind == "ecs_scale_down":
+            return f"{p.get('mode', 'deny')}: {p.get('pattern') or 'all services'}"
         return ""
 
     # -- suggestion veto -------------------------------------------------
@@ -96,10 +102,25 @@ class Rule:
                 eni = ctx.enis.get(eni_id)
                 hay = [eni_id]
                 if eni:
-                    hay += [eni.get("description") or "", eni.get("name") or "",
-                            eni.get("owner_ref") or ""]
+                    hay += [
+                        eni.get("description") or "",
+                        eni.get("name") or "",
+                        eni.get("owner_ref") or "",
+                    ]
                 if any(rx.search(h) for h in hay):
                     return f"{eni_id} is protected"
+        elif self.kind == "ecs_scale_down":
+            rx = _compile(p.get("pattern", ""))
+            for f in sorted(s.flags):
+                if not f.startswith("ecs_scale_down:"):
+                    continue
+                ref = f.split(":", 1)[1]
+                matched = rx is None or bool(rx.search(ref))
+                if p.get("mode", "deny") == "allow":
+                    if not matched:
+                        return f"{ref} is not on the ECS scale-down allow-list"
+                elif matched:
+                    return f"scaling down {ref} is not allowed"
         return None
 
     # -- compliance --------------------------------------------------------
@@ -109,11 +130,17 @@ class Rule:
         p = self.params
         out: list[str] = []
         if self.kind == "lambda_vpc_required":
-            out += [f"Lambda {fn['name']} is not VPC-attached"
-                    for fn in ctx.lambdas if not fn.get("vpc_id")]
+            out += [
+                f"Lambda {fn['name']} is not VPC-attached"
+                for fn in ctx.lambdas
+                if not fn.get("vpc_id")
+            ]
         elif self.kind == "internal_only" and p.get("scope", "both") in ("load_balancer", "both"):
-            out += [f"Load balancer {lb['name']} is {lb['scheme']}"
-                    for lb in ctx.load_balancers if lb.get("scheme") == "internet-facing"]
+            out += [
+                f"Load balancer {lb['name']} is {lb['scheme']}"
+                for lb in ctx.load_balancers
+                if lb.get("scheme") == "internet-facing"
+            ]
         elif self.kind == "min_free_pct":
             pct = float(p.get("percent", 0))
             scope = set(p.get("subnet_ids") or [])
@@ -121,12 +148,16 @@ class Rule:
                 if scope and st.subnet_id not in scope:
                     continue
                 if st.free_pct < pct:
-                    out.append(f"{st.subnet_id} ({st.cidr}) has {st.free_pct:.1f}% free "
-                               f"(< {pct:g}%)")
+                    out.append(
+                        f"{st.subnet_id} ({st.cidr}) has {st.free_pct:.1f}% free (< {pct:g}%)"
+                    )
         elif self.kind == "subnet_reserved":
             known = set(ctx.subnets)
-            out += [f"reserved subnet {sid} not found in snapshot"
-                    for sid in p.get("subnet_ids") or [] if known and sid not in known]
+            out += [
+                f"reserved subnet {sid} not found in snapshot"
+                for sid in p.get("subnet_ids") or []
+                if known and sid not in known
+            ]
         return out
 
 
@@ -189,6 +220,14 @@ def normalize_params(kind: str, params: dict[str, Any]) -> dict[str, Any]:
         if not pattern:
             raise ValueError("protected_eni needs a pattern")
         return {"pattern": pattern}
+    if kind == "ecs_scale_down":
+        mode = params.get("mode") or "deny"
+        if mode not in ECS_MODES:
+            raise ValueError(f"mode must be one of {ECS_MODES}")
+        pattern = str(params.get("pattern") or "").strip()
+        if mode == "allow" and not pattern:
+            raise ValueError("allow mode needs a pattern of cluster/service names to allow")
+        return {"mode": mode, "pattern": pattern}
     return params  # pragma: no cover
 
 
@@ -203,9 +242,16 @@ def validate(rule: Rule) -> Rule:
 
 # -- storage ----------------------------------------------------------------
 
+
 def _row_to_rule(r: sqlite3.Row) -> Rule:
-    return Rule(id=r["id"], name=r["name"], kind=r["kind"], params=json.loads(r["params"]),
-                enabled=bool(r["enabled"]), description=r["description"] or "")
+    return Rule(
+        id=r["id"],
+        name=r["name"],
+        kind=r["kind"],
+        params=json.loads(r["params"]),
+        enabled=bool(r["enabled"]),
+        description=r["description"] or "",
+    )
 
 
 def list_rules(conn: sqlite3.Connection) -> list[Rule]:
@@ -223,15 +269,26 @@ def save_rule(conn: sqlite3.Connection, rule: Rule) -> int:
         if rule.id is None:
             cur = conn.execute(
                 "INSERT INTO rules(name, kind, params, enabled, description) VALUES(?,?,?,?,?)",
-                (rule.name, rule.kind, json.dumps(rule.params), int(rule.enabled),
-                 rule.description),
+                (
+                    rule.name,
+                    rule.kind,
+                    json.dumps(rule.params),
+                    int(rule.enabled),
+                    rule.description,
+                ),
             )
             rule.id = int(cur.lastrowid or 0)
         else:
             conn.execute(
                 "UPDATE rules SET name=?, kind=?, params=?, enabled=?, description=? WHERE id=?",
-                (rule.name, rule.kind, json.dumps(rule.params), int(rule.enabled),
-                 rule.description, rule.id),
+                (
+                    rule.name,
+                    rule.kind,
+                    json.dumps(rule.params),
+                    int(rule.enabled),
+                    rule.description,
+                    rule.id,
+                ),
             )
     except sqlite3.IntegrityError as exc:
         raise ValueError(f"a rule named {rule.name!r} already exists") from exc
@@ -244,12 +301,20 @@ def delete_rule(conn: sqlite3.Connection, rule_id: int) -> None:
 
 # -- YAML -------------------------------------------------------------------
 
+
 def export_yaml(rules: Iterable[Rule]) -> str:
-    doc = {"rules": [
-        {"name": r.name, "kind": r.kind, "enabled": r.enabled,
-         "description": r.description, "params": r.params}
-        for r in rules
-    ]}
+    doc = {
+        "rules": [
+            {
+                "name": r.name,
+                "kind": r.kind,
+                "enabled": r.enabled,
+                "description": r.description,
+                "params": r.params,
+            }
+            for r in rules
+        ]
+    }
     return yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
 
 
@@ -267,13 +332,15 @@ def parse_yaml(text: str) -> list[Rule]:
         if not isinstance(item, dict):
             raise ValueError(f"rule #{i} must be a mapping")
         try:
-            rule = validate(Rule(
-                name=str(item.get("name") or ""),
-                kind=str(item.get("kind") or ""),
-                params=item.get("params") or {},
-                enabled=bool(item.get("enabled", True)),
-                description=str(item.get("description") or ""),
-            ))
+            rule = validate(
+                Rule(
+                    name=str(item.get("name") or ""),
+                    kind=str(item.get("kind") or ""),
+                    params=item.get("params") or {},
+                    enabled=bool(item.get("enabled", True)),
+                    description=str(item.get("description") or ""),
+                )
+            )
         except ValueError as exc:
             raise ValueError(f"rule #{i} ({item.get('name', '?')}): {exc}") from exc
         if rule.name in seen:

@@ -22,8 +22,10 @@ _REDACTIONS = (
     # Access key ids (long-term AKIA / temporary ASIA)
     (re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"), "[REDACTED-KEY-ID]"),
     # Anything labelled as a secret / token / password
-    (re.compile(r"(?i)((?:secret|token|password)[\w-]*['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+"),
-     r"\1[REDACTED]"),
+    (
+        re.compile(r"(?i)((?:secret|token|password)[\w-]*['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+"),
+        r"\1[REDACTED]",
+    ),
     # Bare 40-char secret access keys
     (re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"), "[REDACTED]"),
 )

@@ -5,6 +5,10 @@ Signals, in priority order:
 2. ``RequesterId`` for AWS-managed interfaces (``amazon-elb``, ``amazon-rds``, ...)
 3. ``Description`` conventions used by AWS services
 4. An EC2 instance attachment
+
+ECS task ENIs are only recognised heuristically here (their description is the
+ECS attachment ARN); the collector's ECS enrichment step resolves them to a
+cluster/service authoritatively when permissions allow.
 """
 
 from __future__ import annotations
@@ -13,20 +17,37 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-OWNER_TYPES = ("ec2", "lambda", "vpc_endpoint", "elb", "nat", "rds", "other")
+OWNER_TYPES = (
+    "ec2",
+    "lambda",
+    "ecs",
+    "vpc_endpoint",
+    "elb",
+    "nat",
+    "rds",
+    "elasticache",
+    "opensearch",
+    "other",
+)
 
 OWNER_LABELS = {
     "ec2": "EC2",
     "lambda": "Lambda",
+    "ecs": "ECS task",
     "vpc_endpoint": "VPC endpoint",
     "elb": "Load balancer",
     "nat": "NAT gateway",
     "rds": "RDS",
+    "elasticache": "ElastiCache",
+    "opensearch": "OpenSearch",
     "other": "Other",
 }
 
+# Keys are lower-cased InterfaceType values. AWS has used both NAT spellings
+# (``nat_gateway`` and ``natGateway``), so both map to "nat".
 _INTERFACE_TYPE_MAP = {
     "nat_gateway": "nat",
+    "natgateway": "nat",
     "vpc_endpoint": "vpc_endpoint",
     "gateway_load_balancer_endpoint": "vpc_endpoint",
     "lambda": "lambda",
@@ -42,6 +63,9 @@ _INTERFACE_TYPE_MAP = {
 _REQUESTER_MAP = {
     "amazon-elb": "elb",
     "amazon-rds": "rds",
+    "amazon-elasticache": "elasticache",
+    "amazon-elasticsearch": "opensearch",
+    "amazon-opensearch": "opensearch",
 }
 
 _DESC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -51,6 +75,10 @@ _DESC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^Interface for NAT Gateway (?P<ref>nat-[0-9a-f]+)"), "nat"),
     (re.compile(r"^VPC Endpoint Interface (?P<ref>vpce-[0-9a-f]+)"), "vpc_endpoint"),
     (re.compile(r"^RDSNetworkInterface"), "rds"),
+    # Fargate / awsvpc task ENIs: "arn:aws:ecs:<region>:<account>:attachment/<uuid>"
+    (re.compile(r"^arn:aws[\w-]*:ecs:[^:]*:[^:]*:attachment/(?P<ref>[0-9a-f-]+)"), "ecs"),
+    (re.compile(r"^ElastiCache (?:Serverless )?(?P<ref>\S+)"), "elasticache"),
+    (re.compile(r"^(?:ES|OpenSearch(?: Service)?) (?P<ref>\S+)$"), "opensearch"),
 ]
 
 _OTHER_DESC_HINTS = (
@@ -58,7 +86,6 @@ _OTHER_DESC_HINTS = (
     ("EFS mount target", "EFS"),
     ("Network Interface for Transit Gateway", "Transit Gateway"),
     ("AWS created network interface for directory", "Directory Service"),
-    ("ElastiCache", "ElastiCache"),
     ("Route 53 Resolver", "Route 53 Resolver"),
 )
 
@@ -80,6 +107,9 @@ def attribute_eni(eni: dict[str, Any]) -> Attribution:
     desc_owner, desc_ref = _from_description(desc)
 
     owner = _INTERFACE_TYPE_MAP.get(itype)
+    if owner == "ec2" and desc_owner == "ecs":
+        # ENI trunking: awsvpc tasks on EC2 get "branch" ENIs described as ECS attachments.
+        return Attribution("ecs", desc_ref)
     if owner:
         return Attribution(owner, desc_ref if desc_owner == owner else (instance_id or desc_ref))
 
