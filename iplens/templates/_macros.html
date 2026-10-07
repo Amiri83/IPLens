@@ -1,0 +1,15 @@
+{% macro usage_bar(s) -%}
+  <div class="bar" title="used {{ s.used }} · idle {{ s.idle }} · reserved {{ s.reserved }} · free {{ s.free }} / {{ s.size }}">
+    <span class="used" style="width: {{ s.pct(s.used) }}%"></span>
+    <span class="idle" style="width: {{ s.pct(s.idle) }}%"></span>
+    <span class="reserved" style="width: {{ s.pct(s.reserved) }}%"></span>
+  </div>
+{%- endmacro %}
+{% macro legend() -%}
+  <div class="legend">
+    <span><i style="background: var(--used)"></i>used</span>
+    <span><i style="background: var(--idle)"></i>idle ENI</span>
+    <span><i style="background: var(--reserved)"></i>reserved (AWS)</span>
+    <span><i style="background: var(--free)"></i>free</span>
+  </div>
+{%- endmacro %}

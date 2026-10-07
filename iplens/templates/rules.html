@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Rules{% endblock %}
+{% block content %}
+<div class="row" style="justify-content: space-between">
+  <h1>Rules</h1>
+  <div>
+    <a class="btn" href="{{ url_for('rule_new') }}">New rule</a>
+    <a class="btn secondary" href="{{ url_for('rules_export') }}">Export YAML</a>
+  </div>
+</div>
+<p class="muted">Rules encode company policy. Suggestions that would break an enabled rule are shown greyed out as blocked.</p>
+
+<table>
+  <thead><tr><th>Name</th><th>Kind</th><th>Parameters</th><th>Status</th><th>Current violations</th><th></th></tr></thead>
+  <tbody>
+  {% for r in rules %}
+    <tr class="{{ '' if r.enabled else 'blocked' }}">
+      <td><b>{{ r.name }}</b><div class="muted">{{ r.description }}</div></td>
+      <td>{{ r.kind_label }}<div class="muted mono">{{ r.kind }}</div></td>
+      <td class="mono">{{ r.summary() }}</td>
+      <td><span class="badge {{ 'ok' if r.enabled else '' }}">{{ 'enabled' if r.enabled else 'disabled' }}</span></td>
+      <td>
+        {% set v = violations.get(r.id, []) %}
+        {% if v %}
+          <span class="badge err">{{ v | length }}</span>
+          <ul>{% for item in v[:10] %}<li>{{ item }}</li>{% endfor %}{% if v | length > 10 %}<li class="muted">… {{ v | length - 10 }} more</li>{% endif %}</ul>
+        {% elif r.enabled %}<span class="badge ok">none</span>{% endif %}
+      </td>
+      <td style="white-space: nowrap">
+        <a class="btn secondary" href="{{ url_for('rule_edit', rule_id=r.id) }}">Edit</a>
+        <form class="inline" method="post" action="{{ url_for('rule_delete', rule_id=r.id) }}"
+              onsubmit="return confirm('Delete rule {{ r.name }}?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="danger" type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">No rules yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Import YAML</h2>
+<form class="card" method="post" action="{{ url_for('rules_import') }}" enctype="multipart/form-data">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label for="file">File</label><input id="file" type="file" name="file" accept=".yaml,.yml">
+  <label for="yaml">…or paste</label>
+  <textarea id="yaml" name="yaml" rows="8" cols="80" class="mono" placeholder="rules:
+  - name: keep-20pct-free
+    kind: min_free_pct
+    params: {percent: 20}"></textarea>
+  <label><input type="checkbox" name="replace"> Replace all existing rules (otherwise merge by name)</label>
+  <button type="submit">Import</button>
+</form>
+
+<h2>Rule kinds</h2>
+<table>
+  {% for k, label in kinds.items() %}<tr><td class="mono">{{ k }}</td><td>{{ label }}</td></tr>{% endfor %}
+</table>
+{% endblock %}
