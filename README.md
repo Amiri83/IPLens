@@ -40,6 +40,9 @@ ec2:DescribeVpcs  ec2:DescribeSubnets  ec2:DescribeNetworkInterfaces  ec2:Descri
 lambda:ListFunctions  elasticloadbalancing:DescribeLoadBalancers  sts:GetCallerIdentity
 ```
 
+Optional: `iam:ListAccountAliases` shows the account alias in the header (without it, IPLens
+shows the account id only, or the *Account display name* set in Settings).
+
 ## Rules
 
 | kind | params | effect |

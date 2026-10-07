@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     taken_at    TEXT NOT NULL,
     region      TEXT NOT NULL,
     account_id  TEXT,
+    account_alias TEXT,             -- IAM account alias; '' if none or not permitted
     status      TEXT NOT NULL,
     error       TEXT,
     warnings    TEXT
@@ -142,9 +143,17 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     return conn
 
 
+# Columns added after v0.1, applied to existing databases: (table, column, type).
+_ADDED_COLUMNS = (("snapshots", "account_alias", "TEXT"),)
+
+
 def init_db(db_path: Path | str) -> None:
     with closing(db_path) as conn:
         conn.executescript(SCHEMA)
+        for table, column, ddl in _ADDED_COLUMNS:
+            cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 @contextmanager

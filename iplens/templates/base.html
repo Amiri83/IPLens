@@ -4,21 +4,32 @@
   <meta charset="utf-8">
   <title>{% block title %}IPLens{% endblock %} · IPLens</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="{{ url_for('static', filename='localtime.js') }}" defer></script>
 </head>
 <body>
 <header>
   <span class="brand">IPLens</span>
-  <nav class="tabs">
+  <nav class="tabs" aria-label="Main">
     {% set ep = request.endpoint or '' %}
-    <a href="{{ url_for('overview') }}" class="{{ 'active' if ep in ('overview', 'subnet', 'eni') }}">Discovery</a>
-    <a href="{{ url_for('ips') }}" class="{{ 'active' if ep.startswith('ips') }}">IP List</a>
-    <a href="{{ url_for('visual') }}" class="{{ 'active' if ep.startswith('visual') }}">Visual</a>
-    <a href="{{ url_for('rules_list') }}" class="{{ 'active' if ep.startswith('rule') }}">Rules</a>
-    <a href="{{ url_for('suggestions') }}" class="{{ 'active' if ep == 'suggestions' }}">Suggestions</a>
-    <a href="{{ url_for('settings_page') }}" class="{{ 'active' if ep.startswith('settings') }}">Settings</a>
-    <a href="{{ url_for('logs') }}" class="{{ 'active' if ep == 'logs' }}">Logs</a>
+    {% macro nav_link(endpoint, label, active) -%}
+      <a href="{{ url_for(endpoint) }}"{% if active %} class="active" aria-current="page"{% endif %}>{{ label }}</a>
+    {%- endmacro %}
+    {{ nav_link('overview', 'Discovery', ep in ('overview', 'subnet', 'eni')) }}
+    {{ nav_link('ips', 'IP List', ep.startswith('ips')) }}
+    {{ nav_link('visual', 'Visual', ep.startswith('visual')) }}
+    {{ nav_link('rules_list', 'Rules', ep.startswith('rule')) }}
+    {{ nav_link('suggestions', 'Suggestions', ep == 'suggestions') }}
+    {{ nav_link('settings_page', 'Settings', ep.startswith('settings')) }}
+    {{ nav_link('logs', 'Logs', ep == 'logs') }}
   </nav>
-  <span class="ctx">{{ current_settings.region }} · auth: {{ current_settings.auth_mode }}</span>
+  <span class="ctx" title="auth: {{ current_settings.auth_mode }}">
+    {% if header_snap %}
+      <b>{{ account_label(header_snap) }}</b> · {{ header_snap.region }} ·
+      updated {{ header_snap.taken_at | localtime }}
+    {% else %}
+      no snapshot yet · {{ current_settings.region }}
+    {% endif %}
+  </span>
 </header>
 <main>
   {% for category, message in get_flashed_messages(with_categories=true) %}

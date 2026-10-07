@@ -58,15 +58,23 @@ def db_path(tmp_path) -> Path:
 class SnapshotBuilder:
     """Write a synthetic snapshot straight into SQLite."""
 
-    def __init__(self, db_path: Path, region: str = "us-east-1"):
+    def __init__(
+        self,
+        db_path: Path,
+        region: str = "us-east-1",
+        *,
+        account_alias: str = "",
+        taken_at: datetime | None = None,
+    ):
         self.db_path = db_path
         self._subnet_vpc: dict[str, str] = {}
         self._subnet_az: dict[str, str] = {}
+        taken_at = taken_at or datetime.now(UTC)
         with closing(db_path) as conn:
             cur = conn.execute(
-                "INSERT INTO snapshots(taken_at, region, account_id, status) "
-                "VALUES(?, ?, '123456789012', 'ok')",
-                (datetime.now(UTC).isoformat(timespec="seconds"), region),
+                "INSERT INTO snapshots(taken_at, region, account_id, account_alias, status) "
+                "VALUES(?, ?, '123456789012', ?, 'ok')",
+                (taken_at.isoformat(timespec="seconds"), region, account_alias),
             )
             self.id = int(cur.lastrowid)
 

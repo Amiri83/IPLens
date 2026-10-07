@@ -198,6 +198,52 @@ def test_optional_permissions_become_warnings(aws_env, db_path, monkeypatch):
         assert queries.latest_snapshot(conn)["id"] == result.snapshot_id
 
 
+def test_account_alias_persisted_per_snapshot(aws_env, db_path):
+    first = Collector(_gateway(), db_path).run()
+    # Setup only, outside the read-only gateway.
+    boto3.client("iam", region_name=REGION).create_account_alias(AccountAlias="example-alias")
+    second = Collector(_gateway(), db_path).run()
+
+    assert (first.account_alias, second.account_alias) == ("", "example-alias")
+    assert second.warnings == []
+    with closing(db_path) as conn:
+        rows = dict(conn.execute("SELECT id, account_alias FROM snapshots").fetchall())
+    assert rows == {first.snapshot_id: "", second.snapshot_id: "example-alias"}
+
+
+def test_account_alias_permission_denied_falls_back_to_account_id(
+    aws_env, db_path, monkeypatch, caplog
+):
+    boto3.client("iam", region_name=REGION).create_account_alias(AccountAlias="example-alias")
+    gw = _gateway()
+    real_client = gw.client
+
+    def client(service):
+        c = real_client(service)
+        if service == "iam":
+
+            def deny(**_):
+                raise ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "no"}}, "ListAccountAliases"
+                )
+
+            c.meta.events.register("before-call.iam.ListAccountAliases", deny)
+        return c
+
+    monkeypatch.setattr(gw, "client", client)
+    with caplog.at_level("WARNING", logger="iplens"):
+        result = Collector(gw, db_path).run()
+
+    assert result.warnings == ["iam:ListAccountAliases skipped (AccessDenied)"]
+    assert "iam:ListAccountAliases skipped" in caplog.text
+    with closing(db_path) as conn:
+        snap = queries.latest_snapshot(conn)
+    assert snap["id"] == result.snapshot_id and snap["status"] == "ok"
+    assert snap["account_id"] == "123456789012"
+    assert snap["account_alias"] == ""
+    assert result.enis >= 4  # the rest of the snapshot is unaffected
+
+
 @pytest.fixture
 def moto_ecs_awsvpc(monkeypatch):
     """moto 5.2.x: ECS awsvpc run_task reads NetworkInterface.private_dns_name, which the

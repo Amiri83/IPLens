@@ -16,10 +16,10 @@
     then press <b>Refresh from AWS</b>. All AWS calls are read-only.
   </div>
 {% else %}
-  <div class="card">
-    Snapshot <b>#{{ snap.id }}</b> taken {{ snap.taken_at }} UTC ·
-    account <span class="mono">{{ snap.account_id or 'unknown' }}</span> ·
-    region <span class="mono">{{ snap.region }}</span>
+  <div class="card" title="Snapshot #{{ snap.id }}">
+    <b>{{ account_label(snap) }}</b> ·
+    region <span class="mono">{{ snap.region }}</span> ·
+    taken {{ snap.taken_at | localtime }}
     {% if owners %}
       <div style="margin-top: .5rem">
         {% for o, n in owners.items() %}
@@ -67,10 +67,12 @@
 {% if history %}
   <h2>Recent snapshots</h2>
   <table>
-    <thead><tr><th>#</th><th>Taken (UTC)</th><th>Region</th><th>Status</th><th>Notes</th></tr></thead>
+    <thead><tr><th>Account</th><th>Region</th><th>Taken</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
     {% for h in history %}
-      <tr><td>{{ h.id }}</td><td>{{ h.taken_at }}</td><td>{{ h.region }}</td>
+      <tr title="Snapshot #{{ h.id }}">
+        <td>{% if h.account_id or h.account_alias %}{{ account_label(h) }}{% else %}<span class="muted">–</span>{% endif %}</td>
+        <td class="mono">{{ h.region }}</td><td>{{ h.taken_at | localtime }}</td>
         <td><span class="badge {{ 'ok' if h.status == 'ok' else 'err' if h.status == 'failed' else '' }}">{{ h.status }}</span></td>
         <td class="muted">{{ h.error or '' }}</td></tr>
     {% endfor %}

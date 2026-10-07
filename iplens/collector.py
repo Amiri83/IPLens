@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 @dataclass
 class CollectResult:
     snapshot_id: int
+    account_id: str = ""
+    account_alias: str = ""
     vpcs: int = 0
     subnets: int = 0
     enis: int = 0
@@ -155,6 +157,9 @@ class Collector:
             account_id = self.gw.caller_identity()["account"]
         except (BotoCoreError, ClientError) as exc:
             result.warnings.append(f"sts:GetCallerIdentity unavailable ({type(exc).__name__})")
+        # Display-only: without the permission the UI falls back to the account id.
+        aliases = self._optional(result, "iam:ListAccountAliases", self.gw.account_aliases)
+        account_alias = aliases[0] if aliases else ""
 
         vpcs = _paginate(ec2, "describe_vpcs", "Vpcs")
         subnets = _paginate(ec2, "describe_subnets", "Subnets")
@@ -349,10 +354,12 @@ class Collector:
                     (snap_id, eni_id, task.cluster, task.service, task.task_id),
                 )
             conn.execute(
-                "UPDATE snapshots SET status='ok', account_id=?, warnings=? WHERE id=?",
-                (account_id, json.dumps(result.warnings), snap_id),
+                "UPDATE snapshots SET status='ok', account_id=?, account_alias=?, warnings=? "
+                "WHERE id=?",
+                (account_id, account_alias, json.dumps(result.warnings), snap_id),
             )
 
+        result.account_id, result.account_alias = account_id, account_alias
         result.vpcs, result.subnets, result.enis, result.ips = (
             len(vpcs),
             len(subnets),
@@ -408,7 +415,7 @@ class Collector:
         return data
 
     @staticmethod
-    def _optional(result: CollectResult, what: str, fn: Any) -> list[dict[str, Any]]:
+    def _optional(result: CollectResult, what: str, fn: Any) -> list[Any]:
         """Optional enrichment calls: missing permissions downgrade to a warning."""
         try:
             return fn()
