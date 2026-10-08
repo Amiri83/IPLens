@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,7 +27,7 @@ from flask import (
 )
 from markupsafe import Markup
 
-from . import diagram, extgraph, flowlogs, queries, terraform, viewstate
+from . import diagram, extgraph, flowlogs, queries, terraform, tfrepo, viewstate
 from . import rules as rules_mod
 from . import scope as scope_mod
 from . import suggestions as sugg_mod
@@ -159,9 +160,13 @@ def create_app(
     gateway_factory: GatewayFactory | None = None,
     testing: bool = False,
     port: int | None = None,
+    terraform_bin: str | None = None,
+    terraform_runner: tfrepo.Runner | None = None,
 ) -> Flask:
     """Build the app. ``port`` is the port the server listens on; when given,
-    the Host header must be ``127.0.0.1:<port>`` or ``localhost:<port>``."""
+    the Host header must be ``127.0.0.1:<port>`` or ``localhost:<port>``.
+    ``terraform_bin`` (default: found on PATH at sync time) and ``terraform_runner``
+    (default: ``subprocess.run``) are for tests; the command allowlist applies to both."""
     paths = default_paths(home).ensure()
     init_db(paths.db_path)
     box = SecretBox.from_path(paths.key_path)
@@ -184,6 +189,8 @@ def create_app(
         "accounts": account_store,
         "gateway_factory": gateway_factory or AwsGateway.from_account,
         "port": port,
+        "terraform_bin": terraform_bin,
+        "tf_runner": terraform_runner or subprocess.run,
     }
     apply_log_dir(app, store.load())
     log.info("IPLens started (data dir %s)", paths.home)
@@ -433,6 +440,13 @@ def _register(app: Flask) -> None:
             _identity_flash(mismatch, account.id)
         for w in result.warnings:
             flash(w, "warn")
+        # Terraform repos mapped to this account are re-synced with every refresh.
+        if tfrepo.list_envs(_db(), account_ref=account.id):
+            try:
+                _flash_sync(_tf_sync(account_ref=account.id))
+            except Exception:
+                log.exception("terraform sync after refresh failed (account=%s)", account.id)
+                flash("Terraform sync failed. See the log for details.", "warn")
         return redirect(url_for("overview"))
 
     # -- snapshot history ------------------------------------------------------------
@@ -1102,6 +1116,7 @@ def _register(app: Flask) -> None:
             default_log_dir=_paths().default_log_dir,
             tf_roots=terraform.list_roots(_db()),
             tf_types=sorted(terraform.MANAGED_TYPES),
+            tf_repos=tfrepo.list_repos(_db()),
         )
 
     # -- Terraform state (read-only; only ids / addresses / types are kept) ----------
@@ -1188,6 +1203,121 @@ def _register(app: Flask) -> None:
         log.info("terraform root removed: id=%s", root_id)
         flash("Terraform root removed (the state file itself is never touched)", "ok")
         return redirect(url_for("settings_page"))
+
+    # -- Terraform repos (discovery parses files; sync runs allowlisted commands only) --
+
+    def _repo_or_404(repo_id: int) -> dict[str, Any]:
+        repo = tfrepo.get_repo(_db(), repo_id)
+        if repo is None:
+            abort(404)
+        return repo
+
+    def _discover(repo_id: int, path: str) -> bool:
+        try:
+            roots = tfrepo.discover(path)
+        except (ValueError, OSError) as exc:
+            msg = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            flash(f"Terraform repo not scanned: {msg}", "error")
+            return False
+        with closing(_paths().db_path) as conn:
+            pairs = tfrepo.save_discovery(conn, repo_id, roots, _accounts().list())
+        log.info("terraform repo %s discovered: %d root(s), %d env(s)", repo_id, len(roots), pairs)
+        flash(
+            f"Found {len(roots)} root(s) and {pairs} root × environment pair(s). "
+            "Confirm the account of each one below.",
+            "ok" if pairs else "warn",
+        )
+        return True
+
+    @app.post("/settings/tfrepos")
+    def tfrepo_add():
+        try:
+            with closing(_paths().db_path) as conn:
+                repo_id = tfrepo.add_repo(conn, request.form.get("path", ""))
+        except ValueError as exc:
+            flash(f"Terraform repo not added: {exc}", "error")
+            return redirect(url_for("settings_page") + "#tfrepos")
+        repo = _repo_or_404(repo_id)
+        _discover(repo_id, repo["path"])
+        return redirect(url_for("settings_tfrepo", repo_id=repo_id))
+
+    @app.get("/settings/tfrepos/<int:repo_id>")
+    def settings_tfrepo(repo_id: int):
+        repo = _repo_or_404(repo_id)
+        return render_template(
+            "tfrepo.html",
+            repo=repo,
+            envs=tfrepo.list_envs(_db(), repo_id=repo_id),
+            accounts=_account_choices(),
+        )
+
+    @app.post("/settings/tfrepos/<int:repo_id>")
+    def tfrepo_save_mapping(repo_id: int):
+        _repo_or_404(repo_id)
+        mapping: dict[int, int | None] = {}
+        for key, value in request.form.items():
+            env_id = key.removeprefix("account_")
+            if key.startswith("account_") and env_id.isdigit():
+                mapping[int(env_id)] = int(value) if value.isdigit() else None
+        with closing(_paths().db_path) as conn:
+            synced = tfrepo.save_mapping(conn, repo_id, mapping)
+        log.info("terraform repo %s mapping saved: %d pair(s) to sync", repo_id, synced)
+        flash(f"Mapping saved: {synced} root × environment pair(s) will be synced.", "ok")
+        return redirect(url_for("settings_tfrepo", repo_id=repo_id))
+
+    @app.post("/settings/tfrepos/<int:repo_id>/discover")
+    def tfrepo_discover(repo_id: int):
+        repo = _repo_or_404(repo_id)
+        _discover(repo_id, repo["path"])
+        return redirect(url_for("settings_tfrepo", repo_id=repo_id))
+
+    @app.post("/settings/tfrepos/<int:repo_id>/delete")
+    def tfrepo_delete(repo_id: int):
+        with closing(_paths().db_path) as conn:
+            if not tfrepo.delete_repo(conn, repo_id):
+                abort(404)
+        log.info("terraform repo removed: id=%s", repo_id)
+        flash("Terraform repo removed from IPLens (the repository itself is never touched)", "ok")
+        return redirect(url_for("settings_page") + "#tfrepos")
+
+    def _tf_sync(*, account_ref: int | None = None, repo_id: int | None = None):
+        ext = _ext()
+        tf_bin = ext["terraform_bin"]
+        return tfrepo.sync(
+            _paths().db_path,
+            lambda ref: _accounts().get(ref, with_secret=True),
+            cache_dir=_paths().tf_cache_dir,
+            terraform_bin=tfrepo.find_terraform() if tf_bin is None else tf_bin,
+            account_ref=account_ref,
+            repo_id=repo_id,
+            runner=ext["tf_runner"],
+        )
+
+    def _flash_sync(results: list[tfrepo.SyncResult]) -> None:
+        if not results:
+            flash("Terraform sync: no confirmed root × environment pairs.", "warn")
+            return
+        ok = all(r.status == tfrepo.OK for r in results)
+        flash(f"Terraform sync: {tfrepo.summarise(results)}", "ok" if ok else "warn")
+
+    @app.post("/terraform/sync")
+    def terraform_sync():
+        raw = request.form.get("repo_id", "")
+        _flash_sync(_tf_sync(repo_id=int(raw) if raw.isdigit() else None))
+        return redirect(_safe_next(request.form.get("next") or url_for("terraform_page")))
+
+    @app.get("/terraform")
+    def terraform_page():
+        ref = _active_ref()
+        snap = _snapshot_or_none()
+        envs = tfrepo.list_envs(_db(), account_ref=ref) if ref is not None else []
+        return render_template(
+            "terraform.html",
+            envs=envs,
+            snap=snap,
+            drift=tfrepo.drift(_db(), ref, snap) if snap is not None and ref is not None else None,
+            any_roots=bool(terraform.list_roots(_db())),
+        )
 
     @app.post("/settings")
     def settings_save():

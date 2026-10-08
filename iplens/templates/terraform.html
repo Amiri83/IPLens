@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Terraform{% endblock %}
+{% block content %}
+<div class="row" style="justify-content: space-between">
+  <h1>Terraform</h1>
+  <form method="post" action="{{ url_for('terraform_sync') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="next" value="{{ url_for('terraform_page') }}">
+    <button type="submit">Sync all repos</button>
+  </form>
+</div>
+<p class="muted">Sync status of the Terraform repo roots mapped to the active account, and drift between
+  them and the latest snapshot. Repos and their account mapping are managed in
+  <a href="{{ url_for('settings_page') }}#tfrepos">Settings</a>.</p>
+
+<h2>Roots of this account</h2>
+<table class="tf-status">
+  <thead><tr><th>Root</th><th>Environment</th><th>Repository</th><th>Status</th><th>Resource ids</th><th>Synced</th></tr></thead>
+  <tbody>
+  {% for e in envs %}
+    <tr{% if not e.present %} class="muted"{% endif %}>
+      <td><b>{{ e.root_label }}</b></td>
+      <td class="mono">{{ e.env }}</td>
+      <td class="mono small"><a href="{{ url_for('settings_tfrepo', repo_id=e.repo_id) }}">{{ e.repo_path }}</a></td>
+      <td>{% if e.status %}<span class="badge {{ 'ok' if e.status == 'ok' else 'warn' if e.status == 'no state' else 'err' }}">{{ e.status }}</span>
+        {% if e.status_detail %}<span class="muted small">{{ e.status_detail }}</span>{% endif %}
+        {% else %}<span class="muted">not synced yet</span>{% endif %}</td>
+      <td>{{ e.resources }}</td>
+      <td>{{ e.synced_at | localtime }}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">No Terraform repo roots are mapped to this account.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Drift</h2>
+{% if drift is none %}
+  <p class="muted">No snapshot of this account yet — Refresh on the Discovery page first.</p>
+{% elif not any_roots %}
+  <p class="muted">No Terraform roots are loaded, so drift cannot be computed.</p>
+{% else %}
+  <p class="muted">Compared with the snapshot from {{ snap.taken_at | localtime }} ({{ snap.region }}).
+    Default VPCs, their subnets and <span class="mono">default</span> security groups are not counted.
+    {% if drift.skipped_kinds %}Not compared (none in the snapshot, e.g. a missing permission):
+      {{ drift.skipped_kinds | join(', ') }}.{% endif %}</p>
+  {% if drift.skipped_roots %}
+  <p class="muted small">Roots skipped for "in Terraform, not in AWS":
+    {% for s in drift.skipped_roots %}<span class="mono">{{ s.root }}</span> ({{ s.reason }}){{ ', ' if not loop.last }}{% endfor %}</p>
+  {% endif %}
+
+  <h3>In AWS, not in Terraform <span class="badge">{{ drift.not_in_terraform | length }}</span></h3>
+  <p class="muted small">Resources of the snapshot that no loaded Terraform root manages.</p>
+  <table class="tf-drift">
+    <thead><tr><th>Type</th><th>Resource</th></tr></thead>
+    <tbody>
+    {% for r in drift.not_in_terraform %}
+      <tr><td>{{ r.label }}</td><td class="mono">{{ r.resource_id }}</td></tr>
+    {% else %}
+      <tr><td colspan="2" class="muted">None.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h3>In Terraform, not in AWS <span class="badge">{{ drift.not_in_aws | length }}</span></h3>
+  <p class="muted small">Resources of the repo roots mapped to this account that the snapshot does not contain
+    ({{ drift.roots | length }} root(s) compared).</p>
+  <table class="tf-drift">
+    <thead><tr><th>Root</th><th>Address</th><th>Type</th><th>Resource</th></tr></thead>
+    <tbody>
+    {% for r in drift.not_in_aws %}
+      <tr><td class="mono small">{{ r.root }}</td><td class="mono small">{{ r.address }}</td>
+        <td class="mono small">{{ r.type }}</td><td class="mono">{{ r.resource_id }}</td></tr>
+    {% else %}
+      <tr><td colspan="4" class="muted">None.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

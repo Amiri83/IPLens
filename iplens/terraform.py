@@ -186,12 +186,28 @@ def parse_state(text: str | bytes) -> list[TfResource]:
 
     Raises ValueError for anything that is neither. Never returns attribute values.
     """
+    return parse_document(load_document(text))
+
+
+def load_document(text: str | bytes) -> Any:
+    """Decode a state / ``show -json`` document (size-checked); see :func:`parse_document`."""
     if len(text) > MAX_STATE_BYTES:
         raise ValueError("state file is too large")
     try:
-        doc = json.loads(text)
+        return json.loads(text)
     except ValueError:
         raise ValueError("not a JSON document") from None
+
+
+def has_state(doc: Any) -> bool:
+    """False for a ``terraform show -json`` of an empty / missing state (no ``values``)."""
+    if isinstance(doc, dict) and "format_version" in doc:
+        return isinstance(doc.get("values"), dict)
+    return True
+
+
+def parse_document(doc: Any) -> list[TfResource]:
+    """Managed AWS resources of an already decoded document (see :func:`parse_state`)."""
     if not isinstance(doc, dict):
         raise ValueError("not a Terraform state document")
     if "values" in doc or "format_version" in doc:  # terraform show -json
@@ -203,7 +219,6 @@ def parse_state(text: str | bytes) -> list[TfResource]:
         found = _from_state_v4(doc)
     else:
         raise ValueError("not a Terraform state or 'terraform show -json' document")
-    del doc  # nothing but the extracted ids outlives parsing
     return sorted(set(found), key=lambda r: (r.address, r.kind, r.resource_id))
 
 
@@ -245,22 +260,26 @@ def save_root(
     *,
     source: str = "",
     source_path: str = "",
+    origin: str = "",
 ) -> int:
-    """Create or replace the root ``name`` with ``resources``; returns its id."""
+    """Create or replace the root ``name`` with ``resources``; returns its id.
+
+    ``origin`` is ``""`` for state files / uploads and ``"repo"`` for repo syncs.
+    """
     name = validate_root_name(name)
     now = datetime.now(UTC).isoformat(timespec="seconds")
     row = conn.execute("SELECT id FROM tf_roots WHERE name=?", (name,)).fetchone()
     if row:
         root_id = row["id"]
         conn.execute(
-            "UPDATE tf_roots SET source=?, source_path=?, loaded_at=? WHERE id=?",
-            (source[:300], source_path[:1000], now, root_id),
+            "UPDATE tf_roots SET source=?, source_path=?, loaded_at=?, origin=? WHERE id=?",
+            (source[:300], source_path[:1000], now, origin, root_id),
         )
         conn.execute("DELETE FROM tf_resources WHERE root_id=?", (root_id,))
     else:
         cur = conn.execute(
-            "INSERT INTO tf_roots(name, source, source_path, loaded_at) VALUES(?,?,?,?)",
-            (name, source[:300], source_path[:1000], now),
+            "INSERT INTO tf_roots(name, source, source_path, loaded_at, origin) VALUES(?,?,?,?,?)",
+            (name, source[:300], source_path[:1000], now, origin),
         )
         root_id = int(cur.lastrowid or 0)
     conn.executemany(
@@ -275,7 +294,7 @@ def list_roots(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [
         dict(r)
         for r in conn.execute(
-            "SELECT r.id, r.name, r.source, r.source_path, r.loaded_at, "
+            "SELECT r.id, r.name, r.source, r.source_path, r.loaded_at, r.origin, "
             "COUNT(t.resource_id) AS resources FROM tf_roots r "
             "LEFT JOIN tf_resources t ON t.root_id = r.id GROUP BY r.id ORDER BY r.name"
         )

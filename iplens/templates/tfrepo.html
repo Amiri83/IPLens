@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Terraform repo{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('settings_page') }}#tfrepos" class="back-link">← Settings</a></p>
+<h1>Terraform repo</h1>
+<p class="mono">{{ repo.path }}</p>
+<p class="muted">Each root × environment found in the repository is listed below with the AWS account
+  id and region guessed from its provider, backend and <span class="mono">.tfvars</span> files. Choose the
+  IPLens account whose credentials the sync uses, or <i>don't sync</i>. Only the confirmed pairs are
+  synced. Scanned {{ repo.discovered_at | localtime }}.</p>
+
+<form class="inline" method="post" action="{{ url_for('tfrepo_discover', repo_id=repo.id) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit" class="secondary">Scan again</button>
+</form>
+
+<form method="post" action="{{ url_for('tfrepo_save_mapping', repo_id=repo.id) }}" autocomplete="off">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <table class="tf-mapping">
+    <thead><tr>
+      <th>Root</th><th>Environment</th><th>Found via</th><th>Backend</th><th>Guessed account · region</th>
+      <th>IPLens account</th><th>Last sync</th>
+    </tr></thead>
+    <tbody>
+    {% for e in envs %}
+      <tr{% if not e.present %} class="muted"{% endif %}>
+        <td><b>{{ e.root_label }}</b>{% if e.root_rel != e.root_label %}<div class="muted mono small">{{ e.root_rel }}</div>{% endif %}</td>
+        <td class="mono">{{ e.env }}{% if not e.present %} <span class="badge warn">not found in the latest scan</span>{% endif %}
+          {% if e.workspace %}<div class="muted small">workspace <span class="mono">{{ e.workspace }}</span></div>{% endif %}
+          {% if e.var_file %}<div class="muted small mono">{{ e.var_file }}</div>{% endif %}</td>
+        <td class="small">{{ e.kinds | replace(',', ', ') }}</td>
+        <td class="mono small">{{ e.backend }}{% if e.backend_config %}<div class="muted">{{ e.backend_config }}</div>{% endif %}</td>
+        <td class="mono small">{{ e.guess_account or '—' }} · {{ e.guess_region or '—' }}</td>
+        <td>
+          <label for="acct-{{ e.id }}" class="sr-only">IPLens account for {{ e.root_label }} {{ e.env }}</label>
+          <select id="acct-{{ e.id }}" name="account_{{ e.id }}">
+            <option value="">— don't sync —</option>
+            {% for c in accounts %}
+              <option value="{{ c.id }}" {{ 'selected' if e.account_ref == c.id }}>{{ c.label }} · {{ c.account.region }}{% if c.account.aws_account_id %} · {{ c.account.aws_account_id }}{% endif %}{% if not e.confirmed and e.account_ref == c.id %} (suggested){% endif %}</option>
+            {% endfor %}
+          </select>
+          {% if e.confirmed %}<span class="badge ok">confirmed</span>{% endif %}
+        </td>
+        <td>
+          {% if e.status %}
+            <span class="badge {{ 'ok' if e.status == 'ok' else 'warn' if e.status == 'no state' else 'err' }}">{{ e.status }}</span>
+            {% if e.status == 'ok' %}<span class="small">{{ e.resources }} id(s)</span>{% endif %}
+            {% if e.status_detail %}<div class="muted small">{{ e.status_detail }}</div>{% endif %}
+            <div class="small">{{ e.synced_at | localtime }}</div>
+          {% else %}<span class="muted">never</span>{% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="7" class="muted">No Terraform roots found (a root has a <span class="mono">backend</span>,
+        <span class="mono">cloud</span> or <span class="mono">provider</span> block outside <span class="mono">modules/</span>).</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if envs %}<p><button type="submit">Save mapping</button></p>{% endif %}
+</form>
+
+{% if envs %}
+<form method="post" action="{{ url_for('terraform_sync') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="repo_id" value="{{ repo.id }}">
+  <input type="hidden" name="next" value="{{ url_for('settings_tfrepo', repo_id=repo.id) }}">
+  <button type="submit" class="secondary">Sync confirmed pairs now</button>
+  <span class="muted small">Runs only terraform init (read-only lock file), workspace select and show -json.</span>
+</form>
+{% endif %}
+{% endblock %}

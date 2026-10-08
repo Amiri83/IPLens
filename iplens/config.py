@@ -32,6 +32,11 @@ class AppPaths:
     def default_log_dir(self) -> Path:
         return self.home / "logs"
 
+    @property
+    def tf_cache_dir(self) -> Path:
+        """TF_DATA_DIR parent for repo syncs (keeps ``.terraform`` out of the repos)."""
+        return self.home / "tf-cache"
+
     def ensure(self) -> AppPaths:
         self.home.mkdir(parents=True, exist_ok=True)
         with contextlib.suppress(OSError):
