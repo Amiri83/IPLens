@@ -8,6 +8,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import terraform
 from .scope import UNSCOPED, ResolvedScope
 from .visual import EDGE_TYPES, visual_edges
 
@@ -335,6 +336,19 @@ def eni_detail(conn: sqlite3.Connection, snap_id: int, eni_id: str) -> dict[str,
             (snap_id, eni_id),
         )
     ]
+    tf_index = terraform.load_index(conn)
+    names = sg_names(conn, snap_id)
+    d["tags"] = resource_tags(tag_index(conn, snap_id), d)
+    d["tf"] = terraform.ownership(tf_index, terraform.resource_keys(d))
+    d["subnet_tf"] = terraform.ownership(tf_index, [("subnet", d["subnet_id"] or "")])
+    d["sg_details"] = [
+        {
+            "id": sg,
+            "name": names.get(sg, ""),
+            "tf": terraform.ownership(tf_index, [("sg", sg)]),
+        }
+        for sg in d["security_groups"]
+    ]
     return d
 
 
@@ -350,6 +364,95 @@ class IpFilter:
     owner: str = ""  # an attribution OWNER_TYPES value
     state: str = ""  # "used" | "idle"
     q: str = ""
+    tag_key: str = ""  # rows whose resource carries this tag key...
+    tag_value: str = ""  # ...with this value (any value when empty)
+    tf: str = ""  # TF_MANAGED | TF_UNMANAGED | a Terraform root name
+
+
+TF_MANAGED, TF_UNMANAGED = "managed", "unmanaged"
+
+
+# -- resource context: tags, security group names, Terraform ownership ---------------
+
+
+def sg_names(conn: sqlite3.Connection, snap_id: int) -> dict[str, str]:
+    """Security group id -> display name: Name tag, else group name, else the id."""
+    return {
+        r["group_id"]: r["name"] or r["group_name"] or r["group_id"]
+        for r in conn.execute(
+            "SELECT group_id, name, group_name FROM security_groups WHERE snapshot_id=?",
+            (snap_id,),
+        )
+    }
+
+
+TagIndex = dict[tuple[str, str], dict[str, str]]
+
+
+def tag_index(conn: sqlite3.Connection, snap_id: int) -> TagIndex:
+    """``(resource_type, resource_id) -> {key: value}`` for one snapshot."""
+    out: TagIndex = {}
+    for r in conn.execute(
+        "SELECT resource_type, resource_id, key, value FROM resource_tags WHERE snapshot_id=? "
+        "ORDER BY resource_type, resource_id, key",
+        (snap_id,),
+    ):
+        out.setdefault((r["resource_type"], r["resource_id"]), {})[r["key"]] = r["value"]
+    return out
+
+
+def owner_tag_keys(row: dict[str, Any]) -> list[tuple[str, str]]:
+    """``resource_tags`` keys of the resource owning an ENI row (shared Lambda: every owner)."""
+    otype, ref = row.get("owner_type"), row.get("owner_ref") or ""
+    if otype == "elb" and ref:
+        return [("lb", ref)]
+    if otype == "lambda":
+        return [("lambda", n) for n in (row.get("owner_names") or ([ref] if ref else []))]
+    if otype == "ecs" and ref.count("/") == 2:
+        return [("ecs_service", ref.rsplit("/", 1)[0])]
+    if otype == "vpc_endpoint" and ref:
+        return [("endpoint", ref)]
+    return []
+
+
+def resource_tags(index: TagIndex, row: dict[str, Any]) -> dict[str, str]:
+    """Tags of an ENI row: its owning resource's tags, overridden by the ENI's own TagSet."""
+    tags: dict[str, str] = {}
+    for key in reversed(owner_tag_keys(row)):  # the first owner wins on conflicts
+        tags.update(index.get(key, {}))
+    tags.update(index.get(("eni", row["eni_id"]), {}))
+    return dict(sorted(tags.items()))
+
+
+def tag_keys(conn: sqlite3.Connection, snap_id: int) -> list[str]:
+    """Every tag key collected in a snapshot (security group tags excluded)."""
+    return [
+        r["key"]
+        for r in conn.execute(
+            "SELECT DISTINCT key FROM resource_tags WHERE snapshot_id=? AND resource_type != 'sg' "
+            "ORDER BY key",
+            (snap_id,),
+        )
+    ]
+
+
+def tf_label(m: dict[str, str]) -> str:
+    return f"managed by {m['root']}: {m['address']}"
+
+
+def _row_matches(row: dict[str, Any], flt: IpFilter) -> bool:
+    if flt.tag_key:
+        if flt.tag_key not in row["tags"]:
+            return False
+        if flt.tag_value and row["tags"][flt.tag_key] != flt.tag_value:
+            return False
+    if flt.tf == TF_MANAGED:
+        return bool(row["tf"])
+    if flt.tf == TF_UNMANAGED:
+        return not row["tf"]
+    if flt.tf:
+        return any(m["root"] == flt.tf for m in row["tf"])
+    return True
 
 
 _IP_FROM = """
@@ -366,7 +469,7 @@ LEFT JOIN endpoints ep
 _IP_COLUMNS = (
     "i.ip, i.ip_int, i.eni_id, i.subnet_id, i.vpc_id, i.is_primary, i.public_ip, i.owner_type, "
     "e.owner_ref, e.owner_names, e.status, e.description, e.az, e.instance_id, "
-    "e.interface_type, "
+    "e.interface_type, e.security_groups, "
     "e.name AS eni_name, s.name AS subnet_name, s.cidr AS subnet_cidr, v.name AS vpc_name, "
     "lb.lb_type, ep.service_name"
 )
@@ -449,7 +552,9 @@ def ip_list(
     """Every private IP of a snapshot in ``scope`` matching ``flt``, ordered by address.
 
     Each row carries the IP/ENI columns plus subnet/VPC names, ``lb_type`` and
-    endpoint ``service_name`` (when applicable) and a derived ``resource_name``.
+    endpoint ``service_name`` (when applicable), a derived ``resource_name``, the
+    ENI's ``security_groups`` (ids), the resource's ``tags`` and ``tf`` (Terraform
+    roots/addresses managing the ENI or its owning resource; empty = unmanaged).
     """
     flt = flt or IpFilter()
     where = ["i.snapshot_id = ?"]
@@ -481,16 +586,23 @@ def ip_list(
         "ORDER BY i.ip_int, i.eni_id"
     )
     rows = [dict(r) for r in conn.execute(sql, args)]
+    tags = tag_index(conn, snap_id)
+    tf_index = terraform.load_index(conn)
     for r in rows:
         r["owner_names"] = owner_names(r)
         r["resource_name"] = resource_name(r)
-    return rows
+        r["security_groups"] = json.loads(r.get("security_groups") or "[]")
+        r["tags"] = resource_tags(tags, r)
+        r["tf"] = terraform.ownership(tf_index, terraform.resource_keys(r))
+    return [r for r in rows if _row_matches(r, flt)]
 
 
 # -- visual diagram ---------------------------------------------------------------
 
 # More than this many nodes of one type in a subnet are collapsed into a group node.
 VISUAL_GROUP_THRESHOLD = 10
+# Member names listed in a group node's label before the ellipsis.
+GROUP_LABEL_MEMBERS = 3
 
 # Display order of resource types inside a subnet box.
 VISUAL_TYPE_ORDER = (
@@ -560,6 +672,9 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
                 "label_name": name,
                 "ref": r["owner_ref"] or "",
                 "owners": owners,
+                "sgs": r["security_groups"],
+                "tags": r["tags"],
+                "tf": r["tf"],
                 "status": r["status"] or "",
                 "icon": _icon_for(r),
                 "ips": [],
@@ -574,6 +689,17 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
     return out
 
 
+def group_name(count: int, type_label: str, member_names: list[str]) -> str:
+    """``"14 × VPC endpoint: lambda, sts, …"``: the first GROUP_LABEL_MEMBERS distinct
+    member names, then an ellipsis when there are more."""
+    distinct = list(dict.fromkeys(n for n in member_names if n))
+    shown = distinct[:GROUP_LABEL_MEMBERS]
+    if not shown:
+        return f"{count} × {type_label}"
+    more = ", …" if len(distinct) > len(shown) else ""
+    return f"{count} × {type_label}: {', '.join(shown)}{more}"
+
+
 def _group_items(
     subnet_id: str, nodes: list[dict[str, Any]], labels: dict[str, str]
 ) -> list[dict[str, Any]]:
@@ -586,13 +712,16 @@ def _group_items(
         if len(members) <= VISUAL_GROUP_THRESHOLD:
             items.extend(members)
             continue
+        type_label = labels.get(owner_type, owner_type)
+        member_names = list(dict.fromkeys(m["name"] for m in members if m["name"]))
         items.append(
             {
                 "kind": "group",
                 "id": f"group:{subnet_id}:{owner_type}",
                 "type": owner_type,
-                "type_label": labels.get(owner_type, owner_type),
-                "name": f"{len(members)} × {labels.get(owner_type, owner_type)}",
+                "type_label": type_label,
+                "name": group_name(len(members), type_label, member_names),
+                "member_names": member_names,
                 "count": len(members),
                 "ip_count": sum(len(m["ips"]) for m in members),
                 "icon": TYPE_ICONS.get(owner_type, TYPE_ICONS["other"]),
@@ -632,6 +761,7 @@ def visual_data(
 
     subnets = []
     resources: dict[str, dict[str, Any]] = {}
+    names = sg_names(conn, snap_id)
     for s in vpc.subnets:
         nodes = _resource_nodes(by_subnet.get(s.subnet_id, []), labels)
         resources.update((n["eni_id"], n) for n in nodes)
@@ -664,5 +794,12 @@ def visual_data(
             "subnets": subnets,
         },
         "icons": {"vpc": VPC_ICON},
-        **visual_edges(conn, snap_id, vpc.vpc_id, resources, by_ip, edge_types),
+        # Context for the "Group by" options (security group / tag / Terraform root).
+        "sg_names": {
+            sg: names.get(sg, sg)
+            for sg in sorted({g for n in resources.values() for g in n["sgs"]})
+        },
+        "tag_keys": sorted({k for n in resources.values() for k in n["tags"]}),
+        "tf_roots": sorted({m["root"] for n in resources.values() for m in n["tf"]}),
+        **visual_edges(conn, snap_id, vpc.vpc_id, resources, by_ip, edge_types, names),
     }

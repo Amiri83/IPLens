@@ -285,6 +285,26 @@ class SnapshotBuilder:
             )
         return self
 
+    def security_group(
+        self, group_id: str, name: str = "", group_name: str = "", vpc_id: str | None = None
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO security_groups(snapshot_id, group_id, name, group_name, vpc_id) "
+                "VALUES(?,?,?,?,?)",
+                (self.id, group_id, name, group_name, vpc_id),
+            )
+        return self
+
+    def tag(self, resource_type: str, resource_id: str, key: str, value: str) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO resource_tags(snapshot_id, resource_type, resource_id, key, value) "
+                "VALUES(?,?,?,?,?)",
+                (self.id, resource_type, resource_id, key, value),
+            )
+        return self
+
     def sg_cidr(
         self,
         group_id: str,

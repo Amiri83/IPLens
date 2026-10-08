@@ -144,7 +144,8 @@ def test_reach_edge_from_resource_security_group(db_path, snapshot_builder):
     reach = _edges(data, "reach")
     assert set(reach) == {(TASK_1, VPCE), (TASK_2, VPCE)}
     edge = reach[(TASK_1, VPCE)]
-    assert edge["label"] == "can reach (SG)"
+    # no security_groups row was collected for the endpoint SG: labelled with its id
+    assert edge["label"] == "sg-000vpce"
     assert edge["title"] == (
         "example-cluster/example-svc can reach vpce-0example0001: "
         "sg-000vpce allows tcp/443 from sg-000task on example-cluster/example-svc"

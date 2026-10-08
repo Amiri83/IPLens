@@ -60,12 +60,65 @@
   <p><button type="submit">Save</button></p>
 </form>
 
+<section class="card" id="terraform">
+  <h2 style="margin-top: 0">Terraform state</h2>
+  <p class="muted">Load one or more <span class="mono">.tfstate</span> files or
+    <span class="mono">terraform show -json</span> outputs, each as a named <b>root</b>. IPLens
+    reads them locally and never modifies them. Only resource ids, addresses and types are kept
+    (for <span class="mono">{{ tf_types | join(', ') }}</span>); attribute values, outputs and
+    sensitive data are discarded while reading. The IP List, ENI pages and the Visual page then show
+    which root manages each resource.</p>
+  <table class="tf-roots">
+    <thead><tr><th>Root</th><th>Source</th><th>Resource ids</th><th>Loaded</th><th></th></tr></thead>
+    <tbody>
+    {% for r in tf_roots %}
+      <tr>
+        <td><b>{{ r.name }}</b></td>
+        <td class="mono small">{{ r.source }}{% if not r.source_path %} <span class="badge">upload</span>{% endif %}</td>
+        <td>{{ r.resources }}</td>
+        <td>{{ r.loaded_at | localtime }}</td>
+        <td style="white-space: nowrap">
+          {% if r.source_path %}
+          <form class="inline" method="post" action="{{ url_for('terraform_reload', root_id=r.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit" class="secondary">Reload</button>
+          </form>
+          {% endif %}
+          <form class="inline" method="post" action="{{ url_for('terraform_delete', root_id=r.id) }}"
+                onsubmit="return confirm('Remove this Terraform root from IPLens? The state file is not touched.')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="danger" type="submit">Remove</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="5" class="muted">No Terraform roots loaded.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <form method="post" action="{{ url_for('terraform_add') }}" enctype="multipart/form-data" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div><label for="tf-name">Root name</label>
+        <input id="tf-name" name="name" size="24" maxlength="64" placeholder="e.g. root-a (default: file name)"></div>
+      <div><label for="tf-files">Upload state file(s)</label>
+        <input id="tf-files" name="files" type="file" multiple accept=".tfstate,.json,application/json"></div>
+      <div><label for="tf-path">…or local path</label>
+        <input id="tf-path" name="path" size="40" class="mono" placeholder="/path/to/root-a/terraform.tfstate"></div>
+    </div>
+    <p><button type="submit">Load</button>
+      <span class="muted small">Loading a root name again replaces it.</span></p>
+  </form>
+</section>
+
 <div class="card muted">
   IPLens only performs read-only AWS calls (Describe*/List*/Get*). Minimal IAM permissions:
   <span class="mono">ec2:DescribeVpcs, ec2:DescribeSubnets, ec2:DescribeNetworkInterfaces,
   ec2:DescribeVpcEndpoints, lambda:ListFunctions, elasticloadbalancing:DescribeLoadBalancers</span>.
   Optional: <span class="mono">iam:ListAccountAliases</span> (account name in the header);
   <span class="mono">elasticloadbalancing:DescribeTargetGroups, elasticloadbalancing:DescribeTargetHealth,
-  ec2:DescribeSecurityGroups</span> (connections on the Visual page).
+  ec2:DescribeSecurityGroups</span> (connections and security group names on the Visual page);
+  <span class="mono">elasticloadbalancing:DescribeTags, lambda:ListTags</span> (load balancer and
+  Lambda tags).
 </div>
 {% endblock %}

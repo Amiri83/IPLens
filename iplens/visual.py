@@ -6,7 +6,7 @@ Edges are derived from the stored snapshot only:
 - ``ecs_lb``: ECS service task ENI -> load balancer the service forwards through
 - ``reach``: resource -> VPC endpoint whose security group ingress allows tcp/443
   (or all traffic) from a security group on the resource or from a CIDR containing
-  one of the resource's private IPs (drawn dashed)
+  one of the resource's private IPs (drawn dashed, labelled with the endpoint SG name)
 - ``sg``: a security group rule on one resource that names a security group held
   by another resource (drawn dashed)
 
@@ -41,7 +41,6 @@ MAX_REACH_EDGES = 400
 
 # VPC interface endpoints are reached over HTTPS.
 ENDPOINT_PORT = 443
-REACH_LABEL = "can reach (SG)"
 
 # Labels are sent in full; the Visual page's "Shorten long names" option cuts names
 # longer than this in the browser (``middleEllipsize`` in static/visual.js mirrors
@@ -342,10 +341,23 @@ def _rule_ports(protocol: str, from_port: int | None, to_port: int | None) -> st
     return f"{protocol}/{from_port}-{to_port}"
 
 
+def sg_label(group_id: str, names: dict[str, str] | None) -> str:
+    """A security group's display name; its id when the name is unknown or empty."""
+    return (names or {}).get(group_id) or group_id
+
+
 def _reach_edges(
-    conn: sqlite3.Connection, snap_id: int, nodes: dict[str, _Node], edges: _EdgeSet
+    conn: sqlite3.Connection,
+    snap_id: int,
+    nodes: dict[str, _Node],
+    edges: _EdgeSet,
+    sg_names: dict[str, str] | None = None,
 ) -> bool:
-    """Add resource -> VPC endpoint reach edges; True if MAX_REACH_EDGES cut the list short."""
+    """Add resource -> VPC endpoint reach edges; True if MAX_REACH_EDGES cut the list short.
+
+    Each edge is labelled with the name(s) of the endpoint security group(s) whose
+    ingress rules admit the resource.
+    """
     endpoints: dict[tuple[str, str], list[_Node]] = {}
     for n in nodes.values():
         if n.owner_type == "vpc_endpoint":
@@ -388,12 +400,12 @@ def _reach_edges(
             continue
         for a in sources:
             reasons = [
-                f"{sg} allows {ports} from {src} on {a.name}"
+                (sg, f"{sg} allows {ports} from {src} on {a.name}")
                 for sg, src, ports in sg_rules
                 if src in a.sgs
             ]
             reasons += [
-                f"{sg} allows {ports} from {net} ({ip})"
+                (sg, f"{sg} allows {ports} from {net} ({ip})")
                 for sg, net, ports in cidr_rules
                 for ip in addrs[a.eni_id]
                 if ip in net
@@ -403,8 +415,10 @@ def _reach_edges(
             if added >= MAX_REACH_EDGES:
                 return True
             b = _nearest(enis, a.az)
-            for reason in reasons:
-                edges.add("reach", a, b, REACH_LABEL, f"{a.name} can reach {b.name}: {reason}")
+            groups = dict.fromkeys(sg for sg, _ in reasons)
+            label = ", ".join(sg_label(sg, sg_names) for sg in groups)
+            for _sg, reason in reasons:
+                edges.add("reach", a, b, label, f"{a.name} can reach {b.name}: {reason}")
             added += 1
     return False
 
@@ -416,11 +430,13 @@ def visual_edges(
     resources: dict[str, dict[str, Any]],
     by_ip: dict[str, str],
     edge_types: Iterable[str] = EDGE_TYPES,
+    sg_names: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Edges between the resource nodes of one VPC.
 
-    ``resources`` maps ENI id -> resource node (as built for the Visual page) and
-    ``by_ip`` maps private IP -> ENI id. Returns ``edges`` (only ``edge_types``),
+    ``resources`` maps ENI id -> resource node (as built for the Visual page),
+    ``by_ip`` maps private IP -> ENI id and ``sg_names`` security group id -> name
+    (reach edge labels). Returns ``edges`` (only ``edge_types``),
     per-type ``edge_types`` metadata with unfiltered counts and a ``truncated`` flag,
     and ``edges_truncated`` (true if any type was truncated).
     """
@@ -434,7 +450,7 @@ def visual_edges(
     _lb_edges(conn, snap_id, nodes, by_ip, lb_enis, edges)
     _ecs_edges(conn, snap_id, nodes, lb_enis, edges)
     truncated = {
-        "reach": _reach_edges(conn, snap_id, nodes, edges),
+        "reach": _reach_edges(conn, snap_id, nodes, edges, sg_names),
         "sg": _sg_edges(conn, snap_id, nodes, edges),
     }
 

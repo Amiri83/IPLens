@@ -37,8 +37,18 @@
   const showVpcBox = document.getElementById("show-vpc");
   const showSubnetsBox = document.getElementById("show-subnets");
   const shortenBox = document.getElementById("shorten-names");
+  const groupBySelect = document.getElementById("group-by");
+  const groupTagSelect = document.getElementById("group-tag");
+  const expandExportBox = document.getElementById("export-expand");
   const SHORT_MAX = parseInt(container.dataset.shortMax, 10) || 32;
   const SAVE_DELAY_MS = 400;
+  const GROUP_LABEL_MEMBERS = 3;  // mirrors iplens.queries.GROUP_LABEL_MEMBERS
+  const CTX_PAD = 12;             // "Group by" box padding around its resources
+  const CTX_LABEL_H = 16;
+  // "Group by" box / outline colours (dark enough for text on white).
+  const PALETTE = ["#2457c5", "#c2410c", "#2f8f4e", "#9333ea", "#b0469b", "#0e7490",
+    "#a16207", "#be123c", "#4d7c0f", "#475569"];
+  const UNMANAGED_COLOR = "#8a94a3";
   // Dragged positions for this account + VPC: {node id: {x, y}}.
   let saved = JSON.parse(document.getElementById("visual-positions").textContent || "{}");
 
@@ -148,8 +158,26 @@
       .join("\n");
   }
 
+  // "14 × VPC endpoint: lambda, sts, …" (mirrors iplens.queries.group_name; member
+  // names are shortened with the other labels).
+  function groupName(g) {
+    const names = g.member_names || [];
+    const shown = names.slice(0, GROUP_LABEL_MEMBERS).map(shortName);
+    const base = `${g.count} × ${g.type_label}`;
+    if (!shown.length) return base;
+    return `${base}: ${shown.join(", ")}${names.length > shown.length ? ", …" : ""}`;
+  }
+
   function groupLabel(g, expanded) {
-    return `${expanded ? "▾" : "▸"} ${g.name}\n${g.ip_count} IPs · click to ${expanded ? "collapse" : "expand"}`;
+    return `${expanded ? "▾" : "▸"} ${wrapLine(groupName(g), "res")}\n` +
+      `${g.ip_count} IPs · click to ${expanded ? "collapse" : "expand"}`;
+  }
+
+  function groupTitle(g) {
+    const names = g.member_names || [];
+    const lines = [`${g.count} × ${g.type_label} · ${g.ip_count} IPs`, ...names.slice(0, MAX_TITLE_LINES)];
+    if (names.length > MAX_TITLE_LINES) lines.push(`… +${names.length - MAX_TITLE_LINES} more`);
+    return lines.join("\n");
   }
 
   // -- elements -----------------------------------------------------------------------
@@ -201,7 +229,7 @@
             group: "nodes",
             data: {
               id: item.id, parent: sid, order: i, label: groupLabel(item, false),
-              title: `${item.name}\n${item.ip_count} IPs`,
+              title: groupTitle(item), expanded: false,
               icon: iconBase + item.icon, iconFile: item.icon, raw: item,
             },
             classes: "group",
@@ -225,8 +253,100 @@
         if (n.hasClass("vpc")) n.data("label", vpcLabel(raw));
         else if (n.hasClass("subnet")) n.data("label", subnetLabel(raw));
         else if (n.hasClass("res")) n.data("label", resourceLabel(raw));
+        else if (n.hasClass("group")) n.data("label", groupLabel(raw, n.data("expanded")));
       });
     });
+  }
+
+  // -- "Group by": dashed boxes around resources sharing an SG / tag value / TF root ----
+
+  function contextKeys(raw, mode, tagKey, data) {
+    if (mode === "sg") {
+      return (raw.sgs || []).map((id) => ({ key: "sg:" + id, label: "SG " + ((data.sg_names || {})[id] || id) }));
+    }
+    if (mode === "tag") {
+      const tags = raw.tags || {};
+      if (!tagKey || !Object.prototype.hasOwnProperty.call(tags, tagKey)) return [];
+      return [{ key: "tag:" + tags[tagKey], label: `${tagKey}=${tags[tagKey]}` }];
+    }
+    if (mode === "tf") {
+      const roots = Array.from(new Set((raw.tf || []).map((m) => m.root)));
+      if (!roots.length) return [{ key: "tf:", label: "Terraform: unmanaged", unmanaged: true }];
+      return roots.map((r) => ({ key: "tf:" + r, label: "Terraform: " + r }));
+    }
+    return [];
+  }
+
+  /* Rebuild the context boxes: one non-compound "ctx" node per SG / tag value / root,
+     sized to the bounding box of its resources (a collapsed member counts through its
+     group node) and drawn behind them; the resources get an outline in its colour.
+     A resource can sit in several boxes (several SGs); it is outlined in the first. */
+  function syncContext(cy, data) {
+    const mode = groupBySelect ? groupBySelect.value : "";
+    const tagKey = groupTagSelect ? groupTagSelect.value : "";
+    cy.batch(() => {
+      cy.nodes(".ctx").remove();
+      cy.nodes(".tinted").removeClass("tinted").removeData("color");
+      if (!mode) return;
+      const boxes = new Map();
+      cy.nodes(".res").forEach((n) => {
+        const shown = n.hasClass("hidden") ? n.data("memberOf") : n.id();
+        contextKeys(n.data("raw"), mode, tagKey, data).forEach((k) => {
+          if (!boxes.has(k.key)) boxes.set(k.key, { ...k, shown: new Set(), members: [] });
+          const box = boxes.get(k.key);
+          box.shown.add(shown);
+          box.members.push(n.id());
+        });
+      });
+      Array.from(boxes.values())
+        .sort((a, b) => (a.unmanaged ? 1 : 0) - (b.unmanaged ? 1 : 0) || a.label.localeCompare(b.label))
+        .forEach((box, i) => {
+          const color = box.unmanaged ? UNMANAGED_COLOR : PALETTE[i % PALETTE.length];
+          const nodes = cy.collection(Array.from(box.shown).map((id) => cy.getElementById(id)));
+          const bb = nodes.boundingBox({ includeLabels: true, includeOverlays: false });
+          const pad = CTX_PAD + (i % 3) * 4;  // boxes around the same nodes stay apart
+          cy.add({
+            group: "nodes",
+            data: {
+              id: "ctx:" + i, label: box.label, color: color, members: box.members,
+              w: bb.w + 2 * pad, h: bb.h + 2 * pad + CTX_LABEL_H,
+              title: `${box.label}\n${box.members.length} resource(s)`,
+            },
+            position: { x: (bb.x1 + bb.x2) / 2, y: (bb.y1 + bb.y2) / 2 - CTX_LABEL_H / 2 },
+            classes: "ctx",
+            grabbable: false,
+            selectable: false,
+          });
+          nodes.forEach((n) => {
+            if (!n.data("color")) n.data("color", color);
+            n.addClass("tinted");
+          });
+        });
+    });
+  }
+
+  function populateTagKeys(data) {
+    if (!groupTagSelect) return;
+    const wanted = groupTagSelect.dataset.selected || "";
+    (data.tag_keys || []).forEach((k) => {
+      const opt = document.createElement("option");
+      opt.value = k;
+      opt.textContent = k;
+      opt.selected = k === wanted;
+      groupTagSelect.appendChild(opt);
+    });
+    if (!groupTagSelect.value && data.tag_keys && data.tag_keys.length) {
+      groupTagSelect.value = data.tag_keys[0];
+    }
+  }
+
+  function rememberGroupBy() {
+    const params = new URLSearchParams(window.location.search);
+    params.delete("group");
+    params.delete("tag");
+    if (groupBySelect.value) params.set("group", groupBySelect.value);
+    if (groupBySelect.value === "tag" && groupTagSelect.value) params.set("tag", groupTagSelect.value);
+    window.history.replaceState(null, "", `${window.location.pathname}?${params}`);
   }
 
   // -- edges --------------------------------------------------------------------------
@@ -235,19 +355,20 @@
     return new Set(edgeBoxes.filter((b) => b.checked).map((b) => b.value));
   }
 
-  // A member hidden inside a collapsed group is drawn through its group node.
-  function endpointId(cy, eniId) {
+  // A member hidden inside a collapsed group is drawn through its group node
+  // (unless ``expandAll``: exports with "Expand all groups" keep the member).
+  function endpointId(cy, eniId, expandAll) {
     const n = cy.getElementById("res:" + eniId);
     if (n.empty()) return null;
-    return n.hasClass("hidden") ? n.data("memberOf") : n.id();
+    return n.hasClass("hidden") && !expandAll ? n.data("memberOf") : n.id();
   }
 
-  function visibleEdges(cy, edges, types) {
+  function visibleEdges(cy, edges, types, expandAll) {
     const merged = new Map();
     edges.forEach((e) => {
       if (!types.has(e.type)) return;
-      const s = endpointId(cy, e.source);
-      const t = endpointId(cy, e.target);
+      const s = endpointId(cy, e.source, expandAll);
+      const t = endpointId(cy, e.target, expandAll);
       if (!s || !t || s === t) return;
       const key = `${e.type}|${s}|${t}`;
       const m = merged.get(key);
@@ -344,7 +465,7 @@
     g.setDefaultEdgeLabel(() => ({}));
 
     const leaves = [];
-    cy.nodes().filter((n) => !n.hasClass("hidden")).forEach((n) => {
+    cy.nodes().filter((n) => !n.hasClass("hidden") && !n.hasClass("ctx")).forEach((n) => {
       if (n.isParent()) {
         g.setNode(n.id(), {});
       } else {
@@ -407,7 +528,7 @@
   }
 
   function leaves(cy) {
-    return cy.nodes().filter((n) => !n.isParent() && !n.hasClass("hidden"));
+    return cy.nodes().filter((n) => !n.isParent() && !n.hasClass("hidden") && !n.hasClass("ctx"));
   }
 
   function applySaved(cy) {
@@ -459,33 +580,66 @@
   function nodeKind(n) {
     if (n.hasClass("vpc")) return "vpc";
     if (n.hasClass("subnet")) return "subnet";
+    if (n.hasClass("ctx")) return "ctx";
     return n.hasClass("group") ? "group" : "res";
   }
 
-  // The diagram exactly as drawn: visible nodes with absolute boxes, visible edges.
-  function currentView(cy) {
-    const nodes = cy.nodes().filter((n) => n.visible()).map((n) => {
+  function groupMembers(cy, group) {
+    return cy.nodes(".member").filter((n) => n.data("memberOf") === group.id());
+  }
+
+  /* The diagram as drawn: visible nodes with absolute boxes, visible edges. With
+     ``expand`` ("Expand all groups") a collapsed group also carries its members and
+     the edges go to the members; the server lays the members out in place of the
+     group box (iplens.diagram.expand_groups). An expanded group's header is left out. */
+  function currentView(cy, dataEdges, expand) {
+    const nodes = [];
+    cy.nodes().filter((n) => n.visible()).forEach((n) => {
+      const kind = nodeKind(n);
+      if (expand && kind === "group" && n.data("expanded")) return;
       const bb = n.boundingBox({ includeLabels: false, includeOverlays: false });
-      return {
+      const node = {
         id: n.id(),
-        kind: nodeKind(n),
+        kind: kind,
         parent: n.parent().nonempty() ? n.parent().id() : null,
         label: n.data("label") || "",
         x: bb.x1, y: bb.y1, w: bb.w, h: bb.h,
         icon: n.data("iconFile") || "",
         idle: n.hasClass("idle"),
+        color: n.data("color") || "",
       };
+      if (kind === "ctx") node.member_ids = n.data("members") || [];
+      if (expand && kind === "group") {
+        node.members = groupMembers(cy, n).map((m) => ({
+          id: m.id(),
+          label: m.data("label") || "",
+          icon: m.data("iconFile") || "",
+          idle: m.hasClass("idle"),
+          color: m.data("color") || "",
+          w: m.width(),
+          h: m.height(),
+        }));
+      }
+      nodes.push(node);
     });
-    const edges = cy.edges().filter((e) => e.visible()).map((e) => ({
-      source: e.source().id(),
-      target: e.target().id(),
-      type: e.data("etype"),
-      label: e.data("label") || "",
-    }));
+    const edges = expand
+      ? visibleEdges(cy, dataEdges, enabledEdgeTypes(), true).map((m) => ({
+        source: m.source,
+        target: m.target,
+        type: m.type,
+        label: m.n > 1 ? `${shortName(m.label)} ×${m.n}` : shortName(m.label),
+      }))
+      : cy.edges().filter((e) => e.visible()).map((e) => ({
+        source: e.source().id(),
+        target: e.target().id(),
+        type: e.data("etype"),
+        label: e.data("label") || "",
+      }));
     return {
       vpc_id: vpcId,
       show_vpc: showVpcBox.checked,
       show_subnets: showSubnetsBox.checked,
+      expand_groups: Boolean(expand),
       nodes: nodes,
       edges: edges,
     };
@@ -540,9 +694,10 @@
   }
 
   function toggleGroup(cy, group, expand) {
-    const members = cy.nodes(".member").filter((n) => n.data("memberOf") === group.id());
+    const members = groupMembers(cy, group);
     const expanded = expand === undefined ? members.hasClass("hidden") : expand;
     if (expanded) members.removeClass("hidden"); else members.addClass("hidden");
+    group.data("expanded", expanded);
     group.data("label", groupLabel(group.data("raw"), expanded));
   }
 
@@ -584,6 +739,18 @@
     { selector: ".group", style: {
       "border-width": 3, "border-color": "#2457c5", "border-style": "double",
       "font-weight": "bold",
+    } },
+    { selector: ".res.tinted, .group.tinted", style: {
+      "outline-width": 2.5, "outline-color": "data(color)", "outline-offset": 2,
+    } },
+    // "Group by" boxes: translucent, never in the way of clicks, drags or tooltips.
+    { selector: ".ctx", style: {
+      "shape": "round-rectangle", "width": "data(w)", "height": "data(h)",
+      "background-color": "data(color)", "background-opacity": 0.05,
+      "border-width": 1.5, "border-style": "dashed", "border-color": "data(color)",
+      "label": "data(label)", "color": "data(color)", "font-size": 10, "font-weight": "bold",
+      "text-valign": "top", "text-halign": "center", "text-margin-y": CTX_LABEL_H,
+      "events": "no",
     } },
     { selector: ".hidden", style: { "display": "none" } },
     { selector: "node.res:active, node.group:active", style: { "overlay-opacity": 0.15 } },
@@ -651,11 +818,14 @@
       syncEdges(cy, edges);  // re-adds every edge, so the highlight is re-applied
       applyFocus(cy, focused);
     };
+    populateTagKeys(data);
+    const refreshContext = () => syncContext(cy, data);
     // Saved (dragged) positions always win over the automatic layout.
     const relayout = () => {
       refreshEdges();
       runLayout(cy, edges);
       applySaved(cy);
+      refreshContext();
     };
     relayout();
     cy.fit(undefined, 30);
@@ -707,15 +877,29 @@
     layoutSelect.addEventListener("change", () => {
       runLayout(cy, edges);
       applySaved(cy);
+      refreshContext();
       cy.fit(undefined, 30);
     });
-    cy.on("dragfree", "node", () => savePositions(cy));
+    cy.on("dragfree", "node", () => {
+      savePositions(cy);
+      refreshContext();
+    });
+    // Boxes follow a dragged resource (at most once per frame).
+    let contextFrame = 0;
+    cy.on("drag", "node.res, node.group", () => {
+      if (!groupBySelect.value || contextFrame) return;
+      contextFrame = requestAnimationFrame(() => {
+        contextFrame = 0;
+        refreshContext();
+      });
+    });
     cy.on("grab", "node", hideTip);
     document.getElementById("reset-layout").addEventListener("click", () => {
       post(container.dataset.resetUrl, { vpc: vpcId })
         .then(() => {
           saved = {};
           runLayout(cy, edges);
+          refreshContext();
           cy.fit(undefined, 30);
           note.textContent = "Layout reset.";
         })
@@ -731,12 +915,18 @@
       relayout();
       savePrefs({ shorten_names: shortenBox.checked ? "1" : "0" });
     });
+    const exportView = () => currentView(cy, edges, expandExportBox && expandExportBox.checked);
     document.getElementById("export-svg").addEventListener("click", () => {
-      download(container.dataset.exportSvg, currentView(cy));
+      download(container.dataset.exportSvg, exportView());
     });
     document.getElementById("export-drawio").addEventListener("click", () => {
-      download(container.dataset.exportDrawio, currentView(cy));
+      download(container.dataset.exportDrawio, exportView());
     });
+    [groupBySelect, groupTagSelect].forEach((sel) => sel.addEventListener("change", () => {
+      groupTagSelect.hidden = groupBySelect.value !== "tag";
+      refreshContext();
+      rememberGroupBy();
+    }));
     edgeBoxes.forEach((box) => box.addEventListener("change", () => {
       refreshEdges();
       rememberEdgeFilter();

@@ -16,7 +16,15 @@
     <tr><th>Instance</th><td class="mono">{{ e.instance_id or '' }}</td></tr>
     <tr><th>Description</th><td>{{ e.description }}</td></tr>
     <tr><th>VPC / subnet / AZ</th><td class="mono">{{ e.vpc_id }} / {{ e.subnet_id }} / {{ e.az }}</td></tr>
-    <tr><th>Security groups</th><td class="mono">{{ e.security_groups | join(', ') }}</td></tr>
+    <tr><th>Security groups</th><td>{% for g in e.sg_details %}
+      <div><span class="mono">{{ g.id }}</span>{% if g.name and g.name != g.id %} · {{ g.name }}{% endif %}
+        {% for m in g.tf %}<span class="muted small"> — managed by <b>{{ m.root }}</b>: <span class="mono">{{ m.address }}</span></span>{% endfor %}</div>
+      {% endfor %}</td></tr>
+    <tr><th>Terraform</th><td class="tf-ownership">{% for m in e.tf %}
+      <div>managed by <b>{{ m.root }}</b>: <span class="mono">{{ m.address }}</span></div>
+      {% else %}<span class="muted">unmanaged — in no loaded Terraform root</span>{% endfor %}
+      {% for m in e.subnet_tf %}<div class="muted small">subnet managed by <b>{{ m.root }}</b>: <span class="mono">{{ m.address }}</span></div>{% endfor %}</td></tr>
+    <tr><th>Tags</th><td>{% for k, v in e.tags.items() %}<span class="tag mono small">{{ k }}={{ v }}</span> {% else %}<span class="muted">none</span>{% endfor %}</td></tr>
   </table>
 </div>
 <h2>Private IPs ({{ e.ips | length }})</h2>

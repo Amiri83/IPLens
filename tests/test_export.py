@@ -49,7 +49,7 @@ def test_xlsx_headers_layout_and_rows(db_path, snapshot_builder):
     ):
         assert col in header
     assert ws.freeze_panes == "A2"
-    assert ws.auto_filter.ref == f"A1:K{ws.max_row}"
+    assert ws.auto_filter.ref == f"A1:M{ws.max_row}"  # ... Primary, Tags, Terraform
     data = [dict(zip(header, (c.value for c in r), strict=True)) for r in ws.iter_rows(min_row=2)]
     assert [d["IP"] for d in data] == ["10.0.1.9", "10.0.1.10", "10.0.2.5", "10.0.2.6"]
     first = data[0]

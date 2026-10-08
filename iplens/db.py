@@ -189,6 +189,47 @@ CREATE TABLE IF NOT EXISTS sg_cidr_rules (
     PRIMARY KEY (snapshot_id, group_id, cidr, ip_protocol, from_port, to_port)
 );
 
+-- Security group names: the Name tag ('' if none) and the group name.
+CREATE TABLE IF NOT EXISTS security_groups (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    group_id    TEXT NOT NULL,
+    name        TEXT NOT NULL DEFAULT '',   -- Name tag
+    group_name  TEXT NOT NULL DEFAULT '',   -- GroupName
+    vpc_id      TEXT,
+    PRIMARY KEY (snapshot_id, group_id)
+);
+
+-- Tags of ENI-owning resources. resource_type: eni | lb | lambda | ecs_service | endpoint | sg;
+-- resource_id: ENI id, LB name, function name, "cluster/service", vpce id or SG id.
+CREATE TABLE IF NOT EXISTS resource_tags (
+    snapshot_id   INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    resource_type TEXT NOT NULL,
+    resource_id   TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    value         TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (snapshot_id, resource_type, resource_id, key)
+);
+
+-- Terraform roots loaded from local state files (read-only). Only resource ids,
+-- addresses and types are kept; attribute values, outputs and secrets never are.
+CREATE TABLE IF NOT EXISTS tf_roots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    source      TEXT NOT NULL DEFAULT '',   -- uploaded file name or local path
+    source_path TEXT NOT NULL DEFAULT '',   -- local path for "Reload" ('' for uploads)
+    loaded_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tf_resources (
+    root_id     INTEGER NOT NULL REFERENCES tf_roots(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,              -- subnet | eni | sg | vpce | lb | lambda | ...
+    resource_id TEXT NOT NULL,
+    address     TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    PRIMARY KEY (root_id, address, kind, resource_id)
+);
+CREATE INDEX IF NOT EXISTS ix_tf_resources_id ON tf_resources(kind, resource_id);
+
 CREATE TABLE IF NOT EXISTS rules (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,

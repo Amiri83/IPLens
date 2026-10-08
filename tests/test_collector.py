@@ -672,3 +672,96 @@ def test_failed_collection_is_recorded(aws_env, db_path, monkeypatch):
         row = queries.recent_snapshots(conn)[0]
         assert row["status"] == "failed"
         assert "UnauthorizedOperation" in row["error"]
+
+
+def test_security_group_names_and_resource_tags_collected(aws_env, db_path):
+    ec2 = boto3.client("ec2", region_name=REGION)
+    named = ec2.create_security_group(
+        GroupName="example-vpce-group",
+        Description="example",
+        VpcId=aws_env["vpc_id"],
+        TagSpecifications=[
+            {
+                "ResourceType": "security-group",
+                "Tags": [
+                    {"Key": "Name", "Value": "example-vpce-sg"},
+                    {"Key": "team", "Value": "platform"},
+                ],
+            }
+        ],
+    )["GroupId"]
+    unnamed = ec2.create_security_group(
+        GroupName="example-unnamed", Description="example", VpcId=aws_env["vpc_id"]
+    )["GroupId"]
+    ec2.create_tags(
+        Resources=[aws_env["detached"]],
+        Tags=[{"Key": "team", "Value": "app"}, {"Key": "env", "Value": "dev"}],
+    )
+    vpce = ec2.create_vpc_endpoint(
+        VpcId=aws_env["vpc_id"],
+        ServiceName=f"com.amazonaws.{REGION}.sts",
+        VpcEndpointType="Interface",
+        SubnetIds=[aws_env["sa"]],
+        SecurityGroupIds=[named],
+        TagSpecifications=[
+            {"ResourceType": "vpc-endpoint", "Tags": [{"Key": "team", "Value": "platform"}]}
+        ],
+    )["VpcEndpoint"]["VpcEndpointId"]
+    elbv2 = boto3.client("elbv2", region_name=REGION)
+    lb_arn = elbv2.describe_load_balancers(Names=["example-alb"])["LoadBalancers"][0][
+        "LoadBalancerArn"
+    ]
+    elbv2.add_tags(ResourceArns=[lb_arn], Tags=[{"Key": "team", "Value": "web"}])
+    lam = boto3.client("lambda", region_name=REGION)
+    fn_arn = lam.get_function(FunctionName="example-fn")["Configuration"]["FunctionArn"]
+    lam.tag_resource(Resource=fn_arn, Tags={"team": "app"})
+
+    result = Collector(_gateway(), db_path).run()
+    assert result.warnings == []
+    with closing(db_path) as conn:
+        groups = {
+            r["group_id"]: (r["name"], r["group_name"])
+            for r in conn.execute(
+                "SELECT * FROM security_groups WHERE snapshot_id=?", (result.snapshot_id,)
+            )
+        }
+        tags = {
+            (r["resource_type"], r["resource_id"], r["key"]): r["value"]
+            for r in conn.execute(
+                "SELECT * FROM resource_tags WHERE snapshot_id=?", (result.snapshot_id,)
+            )
+        }
+        names = queries.sg_names(conn, result.snapshot_id)
+    assert groups[named] == ("example-vpce-sg", "example-vpce-group")
+    assert groups[unnamed] == ("", "example-unnamed")
+    assert names[named] == "example-vpce-sg" and names[unnamed] == "example-unnamed"
+    assert tags[("eni", aws_env["detached"], "team")] == "app"
+    assert tags[("eni", aws_env["detached"], "env")] == "dev"
+    assert tags[("sg", named, "team")] == "platform"
+    assert tags[("endpoint", vpce, "team")] == "platform"
+    assert tags[("lb", "example-alb", "team")] == "web"
+    assert tags[("lambda", "example-fn", "team")] == "app"
+
+
+def test_tag_permissions_denied_are_warnings(aws_env, db_path, monkeypatch):
+    gw = _gateway()
+    real_client = gw.client
+
+    def denied(op):
+        def call(*_a, **_k):
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": "no"}}, op)
+
+        return call
+
+    def client(service):
+        c = real_client(service)
+        if service == "elbv2":
+            monkeypatch.setattr(c, "describe_tags", denied("DescribeTags"))
+        if service == "lambda":
+            monkeypatch.setattr(c, "list_tags", denied("ListTags"))
+        return c
+
+    monkeypatch.setattr(gw, "client", client)
+    result = Collector(gw, db_path).run()
+    assert "elasticloadbalancing:DescribeTags skipped (AccessDenied)" in result.warnings
+    assert "lambda:ListTags skipped (AccessDenied)" in result.warnings
