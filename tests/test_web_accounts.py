@@ -653,6 +653,126 @@ def test_extended_view_keeps_its_own_layout(client, two_accounts):
     assert f'data-layout-key="{VPC_A}"' in page and 'id="visual-positions">{}</script>' in page
 
 
+LAYOUT_CHOICES = ("grid", "dagre", "circle", "concentric", "breadthfirst")
+TOOLBAR_IDS = (
+    "zoom-in",
+    "zoom-out",
+    "zoom-fit",
+    "expand-all",
+    "collapse-all",
+    "reset-layout",
+    "layout",
+    "show-vpc",
+    "show-subnets",
+    "show-legend",
+    "shorten-names",
+    "export-svg",
+    "export-drawio",
+)
+
+
+def _selected_layout(page: str) -> str:
+    select = page.split('<select id="layout"', 1)[1].split("</select>", 1)[0]
+    chosen = [v for v in LAYOUT_CHOICES if f'<option value="{v}" selected>' in select]
+    assert len(chosen) == 1, chosen
+    return chosen[0]
+
+
+def _expanded(page: str) -> list[str]:
+    raw = page.split('id="visual-expanded">', 1)[1].split("</script>", 1)[0]
+    return json.loads(raw)
+
+
+@pytest.mark.parametrize("query", ["", "&view=extended"])
+def test_visual_default_layout_is_grid_and_every_choice_rendered(client, two_accounts, query):
+    page = client.get(f"/visual?vpc={VPC_A}{query}").data.decode()
+    assert _selected_layout(page) == "grid"
+    select = page.split('<select id="layout"', 1)[1].split("</select>", 1)[0]
+    for value in LAYOUT_CHOICES:
+        assert f'<option value="{value}"' in select, value
+    assert '<div hidden><label for="layout">' not in page  # shown in both views
+    assert _expanded(page) == []
+
+
+def test_visual_layout_and_prefs_remembered_per_account_and_view(client, two_accounts):
+    ip, ext = f"/visual?vpc={VPC_A}", f"/visual?vpc={VPC_A}&view=extended"
+    assert _post(client, "/visual/prefs", {"view": "ip", "layout": "circle"}).status_code == 204
+    assert _selected_layout(client.get(ip).data.decode()) == "circle"
+    assert _selected_layout(client.get(ext).data.decode()) == "grid"  # the other view keeps its own
+    resp = _post(client, "/visual/prefs", {"view": "extended", "layout": "dagre"})
+    assert resp.status_code == 204
+    assert _selected_layout(client.get(ext).data.decode()) == "dagre"
+    assert _selected_layout(client.get(ip).data.decode()) == "circle"
+
+    # Expanded groups: per view and VPC.
+    groups = json.dumps(["svc:sqs", "group:subnet:subnet-0000000a:lambda"])
+    resp = _post(client, "/visual/prefs", {"view": "extended", "vpc": VPC_A, "expanded": groups})
+    assert resp.status_code == 204
+    assert _expanded(client.get(ext).data.decode()) == sorted(json.loads(groups))
+    assert _expanded(client.get(ip).data.decode()) == []
+
+    # Legend / border toggles are shared by both views and leave the layout alone.
+    resp = _post(client, "/visual/prefs", {"show_legend": "0", "show_vpc": "0"})
+    assert resp.status_code == 204
+    for url in (ip, ext):
+        page = client.get(url).data.decode()
+        assert 'id="show-legend" >' in page and 'id="show-vpc" >' in page
+        assert 'id="visual-legend" aria-labelledby="legend-title" hidden' in page
+    assert _selected_layout(client.get(ext).data.decode()) == "dagre"
+
+    # Another account starts from the defaults.
+    _activate(client, two_accounts["b_id"])
+    for url in ("/visual", "/visual?view=extended"):
+        page = client.get(url).data.decode()
+        assert _selected_layout(page) == "grid" and _expanded(page) == []
+        assert 'id="show-legend" checked' in page
+    assert _post(client, "/visual/prefs", {"view": "ip", "layout": "concentric"}).status_code == 204
+
+    _activate(client, 1)
+    assert _selected_layout(client.get(ip).data.decode()) == "circle"
+    assert _selected_layout(client.get(ext).data.decode()) == "dagre"
+    assert _expanded(client.get(ext).data.decode()) == sorted(json.loads(groups))
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"view": "ip", "layout": "spiral"},
+        {"layout": "grid"},  # no view
+        {"view": "other", "layout": "grid"},
+        {"view": "ip", "vpc": VPC_A, "expanded": "not json"},
+        {"view": "ip", "vpc": VPC_A, "expanded": '{"a": 1}'},
+        {"view": "ip", "vpc": VPC_A, "expanded": "[1]"},
+        {"view": "ip", "expanded": "[]"},  # no VPC
+    ],
+)
+def test_visual_prefs_reject_bad_layout_or_groups(client, two_accounts, fields):
+    assert _post(client, "/visual/prefs", fields).status_code == 400
+
+
+@pytest.mark.parametrize("query", ["", "&view=extended"])
+def test_visual_toolbar_present_in_both_views(client, two_accounts, query):
+    page = client.get(f"/visual?vpc={VPC_A}{query}").data.decode()
+    for marker in TOOLBAR_IDS:
+        assert f'id="{marker}"' in page, marker
+    key = f"{VPC_A}:extended" if query else VPC_A
+    assert f'data-layout-key="{key}"' in page
+    assert f'data-mode="{"extended" if query else "ip"}"' in page
+    assert 'id="visual-expanded"' in page and 'id="visual-legend"' in page
+
+
+def test_reset_layout_keeps_views_apart(client, two_accounts):
+    positions = json.dumps({f"res:{ENI_A}": {"x": 10, "y": 20}})
+    for key in (VPC_A, f"{VPC_A}:extended"):
+        assert (
+            _post(client, "/visual/layout", {"vpc": key, "positions": positions}).status_code == 204
+        )
+    assert _post(client, "/visual/layout/reset", {"vpc": f"{VPC_A}:extended"}).status_code == 204
+    ext = client.get(f"/visual?vpc={VPC_A}&view=extended").data.decode()
+    assert 'id="visual-positions">{}</script>' in ext
+    assert f"res:{ENI_A}" in client.get(f"/visual?vpc={VPC_A}").data.decode()
+
+
 @pytest.mark.parametrize(
     "positions",
     ["not json", "[]", '{"a": {"x": "1", "y": 2}}', '{"a": {"x": 1e99, "y": 2}}', '{"a": 1}'],

@@ -1,5 +1,6 @@
-"""Per-account Visual page state: border/label toggles, the Extended view's evidence
-filter and dragged node positions."""
+"""Per-account Visual page state: border/label/legend toggles, the Extended view's
+evidence filter, and per view ("ip" | "extended") the chosen layout, the expanded groups
+and the dragged node positions."""
 
 from __future__ import annotations
 
@@ -15,12 +16,33 @@ MAX_POSITIONS = 5000
 MAX_NODE_ID = 200
 MAX_COORD = 1e7
 
-DEFAULT_PREFS = {"show_vpc": True, "show_subnets": True, "shorten_names": False}
+DEFAULT_PREFS = {
+    "show_vpc": True,
+    "show_subnets": True,
+    "shorten_names": False,
+    "show_legend": True,
+}
+
+VIEWS = ("ip", "extended")
+# Layout choices of the Visual page (both views): "dagre" is the vendored hierarchical
+# layout, the others are cytoscape.js built-ins applied box by box (see visual.js).
+LAYOUTS = {
+    "grid": "Grid",
+    "dagre": "Hierarchy (dagre)",
+    "circle": "Circle",
+    "concentric": "Concentric",
+    "breadthfirst": "Breadthfirst",
+}
+DEFAULT_LAYOUT = "grid"
+# The Extended view's dragged positions are stored under "<vpc id>:extended", so that
+# dragging in one view never moves nodes in the other (the IP view keeps the bare id).
+EXT_LAYOUT_SUFFIX = ":extended"
 
 
 def get_prefs(conn: sqlite3.Connection, account_ref: int) -> dict[str, bool]:
     row = conn.execute(
-        "SELECT show_vpc, show_subnets, shorten_names FROM visual_prefs WHERE account_ref=?",
+        "SELECT show_vpc, show_subnets, shorten_names, show_legend FROM visual_prefs "
+        "WHERE account_ref=?",
         (account_ref,),
     ).fetchone()
     if row is None:
@@ -35,9 +57,10 @@ def save_prefs(conn: sqlite3.Connection, account_ref: int, **changes: bool) -> N
         raise ValueError(f"unknown visual prefs: {', '.join(sorted(unknown))}")
     prefs = {**get_prefs(conn, account_ref), **changes}
     conn.execute(
-        "INSERT INTO visual_prefs(account_ref, show_vpc, show_subnets, shorten_names) "
-        "VALUES(?,?,?,?) ON CONFLICT(account_ref) DO UPDATE SET show_vpc=excluded.show_vpc, "
-        "show_subnets=excluded.show_subnets, shorten_names=excluded.shorten_names",
+        "INSERT INTO visual_prefs(account_ref, show_vpc, show_subnets, shorten_names, "
+        "show_legend) VALUES(?,?,?,?,?) ON CONFLICT(account_ref) DO UPDATE SET "
+        "show_vpc=excluded.show_vpc, show_subnets=excluded.show_subnets, "
+        "shorten_names=excluded.shorten_names, show_legend=excluded.show_legend",
         (account_ref, *(int(prefs[k]) for k in DEFAULT_PREFS)),
     )
 
@@ -115,3 +138,66 @@ def reset_layout(conn: sqlite3.Connection, account_ref: int, vpc_id: str) -> boo
         "DELETE FROM visual_layouts WHERE account_ref=? AND vpc_id=?", (account_ref, vpc_id)
     )
     return cur.rowcount > 0
+
+
+def layout_key(vpc_id: str, view: str) -> str:
+    """Key of the saved positions of ``vpc_id`` in ``view``."""
+    return f"{vpc_id}{EXT_LAYOUT_SUFFIX}" if vpc_id and view == "extended" else vpc_id
+
+
+def _view(view: str) -> str:
+    if view not in VIEWS:
+        raise ValueError(f"unknown view: {view!r}")
+    return view
+
+
+def get_view_layout(conn: sqlite3.Connection, account_ref: int, view: str) -> str:
+    """The layout chosen in ``view`` (default: grid)."""
+    row = conn.execute(
+        "SELECT layout FROM visual_view_prefs WHERE account_ref=? AND view=?",
+        (account_ref, _view(view)),
+    ).fetchone()
+    return row["layout"] if row is not None and row["layout"] in LAYOUTS else DEFAULT_LAYOUT
+
+
+def save_view_layout(conn: sqlite3.Connection, account_ref: int, view: str, layout: str) -> None:
+    if layout not in LAYOUTS:
+        raise ValueError(f"unknown layout: {layout!r}")
+    conn.execute(
+        "INSERT INTO visual_view_prefs(account_ref, view, layout) VALUES(?,?,?) "
+        "ON CONFLICT(account_ref, view) DO UPDATE SET layout=excluded.layout",
+        (account_ref, _view(view), layout),
+    )
+
+
+def parse_expanded(raw: str) -> list[str]:
+    """Validate the ``["group id", ...]`` list of expanded groups posted by the page."""
+    try:
+        doc = json.loads(raw or "[]")
+    except ValueError:
+        raise ValueError("expanded groups must be JSON") from None
+    if not isinstance(doc, list):
+        raise ValueError("expanded groups must be a JSON list")
+    if len(doc) > MAX_POSITIONS:
+        raise ValueError(f"at most {MAX_POSITIONS} groups")
+    if not all(isinstance(g, str) and 0 < len(g) <= MAX_NODE_ID for g in doc):
+        raise ValueError("invalid group id")
+    return sorted(set(doc))
+
+
+def get_expanded(conn: sqlite3.Connection, account_ref: int, view: str, vpc_id: str) -> list[str]:
+    row = conn.execute(
+        "SELECT expanded FROM visual_groups WHERE account_ref=? AND view=? AND vpc_id=?",
+        (account_ref, _view(view), vpc_id),
+    ).fetchone()
+    return json.loads(row["expanded"]) if row else []
+
+
+def save_expanded(
+    conn: sqlite3.Connection, account_ref: int, view: str, vpc_id: str, groups: list[str]
+) -> None:
+    conn.execute(
+        "INSERT INTO visual_groups(account_ref, view, vpc_id, expanded) VALUES(?,?,?,?) "
+        "ON CONFLICT(account_ref, view, vpc_id) DO UPDATE SET expanded=excluded.expanded",
+        (account_ref, _view(view), vpc_id, json.dumps(sorted(set(groups)))),
+    )

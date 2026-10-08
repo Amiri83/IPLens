@@ -7,7 +7,10 @@
        groups; edges between collapsed groups merge into one, wider with its count;
      - one left-to-right dagre layout (sources -> compute -> targets), edges routed
        along dagre's paths; swimlanes per app when grouping by tag / Terraform root;
-     - focus mode: a clicked or searched node and its 1- or 2-hop neighbourhood only. */
+     - focus mode: a clicked or searched node and its 1- or 2-hop neighbourhood only.
+   Both views share the toolbar: the Layout choice (grid by default; dagre, or a
+   cytoscape.js layout applied box by box) and the expanded groups are remembered per
+   account and view, dragged positions per account, VPC and view. */
 (function () {
   "use strict";
 
@@ -15,14 +18,14 @@
   const CELL_H = 140;          // vertical spacing (icon + name + up to 4 IP lines)
   const COLS = 4;              // resource columns per subnet box
   const SUBNETS_PER_ROW = 3;
-  const SUBNET_GAP_X = 90;
-  const SUBNET_GAP_Y = 130;    // leaves room for the subnet label above each box
   const SUBNET_MIN_W = 2 * CELL_W - 40;
   const SUBNET_PAD = 28;
   const SUBNET_LABEL_H = 48;   // three 11px lines above each subnet box
   const MAX_IPS_IN_LABEL = 3;
   const MAX_TITLE_LINES = 12;  // tooltip lines listed for an edge merged into a group node
   const CELL_GAP = 24;         // grid layout: space between two wrapped resource labels
+  const BLOCK_GAP_X = 90;      // block layouts: space between two boxes in a row
+  const BLOCK_GAP_Y = 60;      // ... and between two rows (box labels are measured)
   // Label line widths in px; full names are wrapped after "- _ . /" to fit.
   const TEXT_W = { res: 180, subnet: 300, vpc: 420 };
   const FONTS = {
@@ -45,11 +48,14 @@
   const layoutKey = container.dataset.layoutKey || vpcId;  // saved positions per view
   const showVpcBox = document.getElementById("show-vpc");
   const showSubnetsBox = document.getElementById("show-subnets");
+  const showLegendBox = document.getElementById("show-legend");
+  const legend = document.getElementById("visual-legend");
   const shortenBox = document.getElementById("shorten-names");
   const groupBySelect = document.getElementById("group-by");
   const groupTagSelect = document.getElementById("group-tag");
   const expandExportBox = document.getElementById("export-expand");
   const extended = container.dataset.mode === "extended";
+  const view = extended ? "extended" : "ip";  // per-view state key (iplens.viewstate.VIEWS)
   const iconRoot = container.dataset.iconRoot;
   const evidenceBoxes = Array.from(document.querySelectorAll('input[type="checkbox"][name="evidence"]'));
   const serviceFilters = document.getElementById("service-filters");
@@ -477,8 +483,9 @@
 
   // -- extended view: scene (lanes, groups), drawn edges, focus ------------------------
 
-  // Expanded group ids; everything else (service groups, Lambda / ECS groups) is collapsed.
-  const expandedGroups = new Set();
+  // Expanded group ids (both views, saved per account, view and VPC); every other group
+  // is collapsed.
+  const expandedGroups = new Set(JSON.parse(document.getElementById("visual-expanded").textContent || "[]"));
   let focusId = null;  // node whose neighbourhood is shown (focus mode), else null
 
   // Swimlanes replace the "Group by" boxes for tags and Terraform roots.
@@ -1028,39 +1035,101 @@
       .sort((a, b) => a.data("order") - b.data("order"));
   }
 
-  // Deterministic grid layout: subnets in rows, resources in a grid inside each subnet.
-  // Cells grow with the widest / tallest wrapped label so labels never overlap.
-  function gridLayout(cy) {
-    let x0 = 0, y0 = 0, rowH = 0, col = 0;
-    const subnets = cy.nodes(".subnet").sort((a, b) => a.data("order") - b.data("order"));
-    cy.batch(() => {
-      subnets.forEach((sn) => {
-        const kids = sortedKids(sn);
-        const n = Math.max(kids.length, 1);
-        const cols = Math.min(COLS, n);
-        const rows = Math.ceil(n / cols);
-        let cellW = CELL_W, cellH = CELL_H;
-        kids.forEach((k) => {
-          const dim = k.layoutDimensions({ nodeDimensionsIncludeLabels: true });
-          cellW = Math.max(cellW, dim.w + CELL_GAP);
-          cellH = Math.max(cellH, dim.h + CELL_GAP);
-        });
-        const labelW = sn.boundingBox({ includeNodes: false, includeLabels: true }).w || 0;
-        if (kids.length) {
-          kids.forEach((k, i) => {
-            k.position({ x: x0 + (i % cols) * cellW, y: y0 + Math.floor(i / cols) * cellH });
-          });
-        } else {
-          sn.position({ x: x0 + cellW / 2, y: y0 });
-        }
-        x0 += Math.max(cols * cellW, 2 * CELL_W, labelW) + SUBNET_GAP_X;
-        rowH = Math.max(rowH, rows * cellH);
-        col += 1;
-        if (col === SUBNETS_PER_ROW) {
-          col = 0; x0 = 0; y0 += rowH + SUBNET_GAP_Y; rowH = 0;
-        }
-      });
+  function shownInLayout(n) {
+    return n.visible() && !n.hasClass("ctx") && !n.hasClass("pin");
+  }
+
+  // Layout order: the data's order, then (Extended view) source -> compute -> target
+  // tier and service, then id, so every layout is deterministic.
+  function layoutRank(n) {
+    const order = n.data("order");
+    const tier = isServiceNode(n) ? D.serviceTier(n.data("service"), false) : 1;
+    return [order === undefined ? Infinity : order, tier, n.data("service") || "", n.id()];
+  }
+
+  function byLayoutRank(a, b) {
+    const ra = layoutRank(a);
+    const rb = layoutRank(b);
+    for (let i = 0; i < ra.length; i += 1) {
+      if (ra[i] !== rb[i]) return ra[i] < rb[i] ? -1 : 1;
+    }
+    return 0;
+  }
+
+  // Grid cells as large as the widest / tallest wrapped label, so labels never overlap.
+  function gridCells(nodes) {
+    const n = nodes.length;
+    const cols = Math.max(Math.min(COLS, n), Math.ceil(Math.sqrt(n)));
+    let cellW = CELL_W, cellH = CELL_H;
+    nodes.forEach((k) => {
+      const dim = k.layoutDimensions({ nodeDimensionsIncludeLabels: true });
+      cellW = Math.max(cellW, dim.w + CELL_GAP);
+      cellH = Math.max(cellH, dim.h + CELL_GAP);
     });
+    nodes.forEach((k, i) => k.position({ x: (i % cols) * cellW, y: Math.floor(i / cols) * cellH }));
+  }
+
+  /* Grid / circle / concentric / breadthfirst, box by box. Inside every box (VPC,
+     subnet, expanded service group, swimlane, and the page itself) the shown nodes that
+     are not boxes are laid out by the chosen layout into one block (grid: gridCells, the
+     others: the cytoscape.js layout of that name), each inner box is laid out the same
+     way into a block of its own, and the blocks are packed in rows (swimlanes: one per
+     row). A box therefore always stays one block: a subnet's resources or an expanded
+     service group's members are never scattered between other nodes. */
+  function blockLayout(cy, name) {
+    const isContainer = (n) => n.isParent() || n.hasClass("subnet");
+    const isBox = (n) => n.isParent() && n.children().some(shownInLayout);
+    const kidsOf = (box) => box.children().filter(shownInLayout).sort(byLayoutRank);
+    // Uncached: a box's bounds must follow the nodes just moved inside it.
+    const bb = (eles) => eles.boundingBox({ includeLabels: true, includeOverlays: false, useCache: false });
+
+    function placeLoose(nodes) {
+      if (name === "grid" || nodes.length < 2) {
+        gridCells(nodes);
+        return;
+      }
+      nodes.union(nodes.edgesWith(nodes)).layout({
+        name: name, fit: false, animate: false, avoidOverlap: true,
+        nodeDimensionsIncludeLabels: true, directed: false,
+        boundingBox: { x1: 0, y1: 0, w: Math.max(400, nodes.length * 60), h: Math.max(300, nodes.length * 45) },
+      }).run();
+    }
+
+    // Lays out ``kids`` (the shown children of one box) with their block at (0, 0).
+    function arrange(kids) {
+      const loose = kids.filter((n) => !isContainer(n));
+      const boxes = kids.filter(isContainer);
+      const blocks = [];
+      if (loose.nonempty()) {
+        placeLoose(loose);
+        blocks.push({ measure: loose, move: loose });
+      }
+      boxes.forEach((b) => {
+        if (!isBox(b)) {  // an empty subnet
+          blocks.push({ measure: b, move: b });
+          return;
+        }
+        arrange(kidsOf(b));
+        blocks.push({ measure: b, move: b.descendants().filter((d) => shownInLayout(d) && !isBox(d)) });
+      });
+      const lanes = boxes.nonempty() && boxes.every((b) => b.hasClass("lane"));
+      const perRow = lanes ? 1 : Math.max(SUBNETS_PER_ROW, Math.ceil(Math.sqrt(blocks.length)));
+      let x = 0, y = 0, rowH = 0;
+      blocks.forEach((blk, i) => {
+        if (i && i % perRow === 0) {
+          x = 0; y += rowH + BLOCK_GAP_Y; rowH = 0;
+        }
+        const box = bb(blk.measure);
+        const dx = x - box.x1;
+        const dy = y - box.y1;
+        blk.move.forEach((n) => n.position({ x: n.position("x") + dx, y: n.position("y") + dy }));
+        x += box.w + BLOCK_GAP_X;
+        rowH = Math.max(rowH, box.h);
+      });
+    }
+
+    // Not batched: compound bounds are only kept up to date outside a batch.
+    arrange(cy.nodes().orphans().filter(shownInLayout).sort(byLayoutRank));
   }
 
   /* Top-down dagre layout of the compound graph. Besides the LB/ECS edges (LB above its
@@ -1176,7 +1245,7 @@
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       post(container.dataset.layoutUrl, { vpc: layoutKey, positions: JSON.stringify(saved) })
-        .then(() => { note.textContent = "Layout saved for this account and VPC."; })
+        .then(() => { note.textContent = "Layout saved for this account, VPC and view."; })
         .catch((err) => { note.textContent = `Could not save the layout (${err.message}).`; });
     }, SAVE_DELAY_MS);
   }
@@ -1296,18 +1365,25 @@
     form.remove();
   }
 
-  function runLayout(cy, edges) {
-    let done = false;
-    if (layoutSelect.value === "dagre" && typeof dagre !== "undefined") {
-      try {
+  /* The chosen layout of either view: dagre (IP view: top-down dagreLayout, Extended
+     view: left-to-right extLayout, which returns dagre's edge routes), else blockLayout.
+     Falls back to the grid. Returns the edge routes (empty unless dagre). */
+  function runLayout(cy, edges, drawn) {
+    const name = layoutSelect.value;
+    try {
+      if (name === "dagre") {
+        if (extended) return extLayout(cy, drawn);
         dagreLayout(cy, edges);
-        done = true;
-      } catch (err) {
-        console.warn("dagre layout failed, using grid layout", err);
-        layoutSelect.value = "grid";
+      } else {
+        cy.nodes(".pin").remove();  // only the dagre swimlanes need them
+        blockLayout(cy, name);
       }
+    } catch (err) {
+      console.warn(`${name} layout failed, using the grid layout`, err);
+      cy.nodes(".pin").remove();
+      blockLayout(cy, "grid");
     }
-    if (!done) gridLayout(cy);
+    return new Map();
   }
 
   // -- focus (single click): highlight one node's edges, dim the rest ------------------
@@ -1330,6 +1406,7 @@
   function toggleGroup(cy, group, expand) {
     const members = groupMembers(cy, group);
     const expanded = expand === undefined ? members.hasClass("hidden") : expand;
+    if (expanded) expandedGroups.add(group.id()); else expandedGroups.delete(group.id());
     if (expanded) members.removeClass("hidden"); else members.addClass("hidden");
     group.data("expanded", expanded);
     group.data("label", groupLabel(group.data("raw"), expanded));
@@ -1501,6 +1578,9 @@
       maxZoom: 3,
       boxSelectionEnabled: false,
     });
+    // Groups expanded when the page was last used (this account, view and VPC).
+    cy.nodes(".group").filter((g) => expandedGroups.has(g.id()))
+      .forEach((g) => (ext ? setExpanded(cy, g, true) : toggleGroup(cy, g, true)));
     applyBorders(cy);
     let focused = null;  // IP view: id of the node whose edges are highlighted
     let drawnCount = 0;
@@ -1514,14 +1594,7 @@
       if (ext) {
         const drawn = syncExtEdges(cy, edges);
         drawnCount = drawn.length;
-        let routes = new Map();
-        try {
-          routes = extLayout(cy, drawn);
-        } catch (err) {
-          console.warn("dagre layout failed, using a plain grid", err);
-          cy.nodes(":visible").filter((n) => !n.isParent())
-            .layout({ name: "grid", avoidOverlap: true, nodeDimensionsIncludeLabels: true }).run();
-        }
+        const routes = runLayout(cy, edges, drawn);
         const moved = savingPositions() ? applySaved(cy) : cy.collection();
         applyRoutes(cy, routes);
         unroute(moved.connectedEdges());
@@ -1534,6 +1607,9 @@
       refreshContext();
     };
     const fitShown = () => cy.fit(cy.elements(":visible"), 30);
+    const saveExpanded = () => savePrefs({
+      view: view, vpc: vpcId, expanded: JSON.stringify(Array.from(expandedGroups)),
+    });
 
     // Extended view: focus mode, groups, filters remembered per account.
     const setFocus = (id) => {
@@ -1560,7 +1636,7 @@
       relayout();
     });
     relayout();
-    cy.fit(undefined, 30);
+    fitShown();
 
     if (ext) {
       // Click a node: its neighbourhood only. Click a group: expand / collapse it;
@@ -1579,12 +1655,14 @@
       cy.on("onetap", "node.group", (evt) => {
         setExpanded(cy, evt.target, !expandedGroups.has(evt.target.id()));
         relayout();
+        saveExpanded();
       });
       cy.on("dbltap", "node.group", (evt) => setFocus(evt.target.id()));
       cy.on("onetap", "node.svcbox", (evt) => {
         if (!evt.target.hasClass("svcbox")) return;  // a tap on a member bubbles up
         setExpanded(cy, cy.getElementById(evt.target.data("group")), false);
         relayout();
+        saveExpanded();
       });
       cy.on("onetap", "edge", (evt) => {
         const e = evt.target;
@@ -1619,7 +1697,10 @@
           return;
         }
         const g = n.data("memberOf");
-        if (g && !expandedGroups.has(g)) setExpanded(cy, cy.getElementById(g), true);
+        if (g && !expandedGroups.has(g)) {
+          setExpanded(cy, cy.getElementById(g), true);
+          saveExpanded();
+        }
         setFocus(n.id());
       };
       if (focusSearch) {
@@ -1647,6 +1728,7 @@
       cy.on("onetap", "node.group", (evt) => {
         toggleGroup(cy, evt.target);
         relayout();
+        saveExpanded();
       });
       cy.on("onetap", (evt) => {
         if (evt.target !== cy || !focused) return;
@@ -1674,18 +1756,19 @@
     };
     document.getElementById("zoom-in").addEventListener("click", () => zoomBy(1.25));
     document.getElementById("zoom-out").addEventListener("click", () => zoomBy(0.8));
-    document.getElementById("zoom-fit").addEventListener("click", () => cy.fit(undefined, 30));
+    document.getElementById("zoom-fit").addEventListener("click", fitShown);
     const expandAll = (on) => {
       cy.nodes(".group").forEach((g) => (ext ? setExpanded(cy, g, on) : toggleGroup(cy, g, on)));
       relayout();
+      fitShown();
+      saveExpanded();
     };
     document.getElementById("expand-all").addEventListener("click", () => expandAll(true));
     document.getElementById("collapse-all").addEventListener("click", () => expandAll(false));
     layoutSelect.addEventListener("change", () => {
-      runLayout(cy, edges);
-      applySaved(cy);
-      refreshContext();
-      cy.fit(undefined, 30);
+      relayout();
+      fitShown();
+      savePrefs({ view: view, layout: layoutSelect.value });
     });
     cy.on("dragfree", "node", () => {
       savePositions(cy);
@@ -1701,21 +1784,33 @@
       });
     });
     cy.on("grab", "node", hideTip);
+    // Forgets the dragged positions of this VPC and view, and leaves focus mode / the
+    // highlight: the full diagram in its automatic layout.
     document.getElementById("reset-layout").addEventListener("click", () => {
+      focusId = null;
+      focused = null;
+      if (focusReset) focusReset.disabled = true;
+      if (detail) detail.hidden = true;
+      applyFocus(cy, null);
       post(container.dataset.resetUrl, { vpc: layoutKey })
         .then(() => {
           saved = {};
-          if (ext) relayout(); else runLayout(cy, edges);
-          refreshContext();
-          cy.fit(undefined, 30);
           note.textContent = "Layout reset.";
         })
-        .catch((err) => { note.textContent = `Could not reset the layout (${err.message}).`; });
+        .catch((err) => { note.textContent = `Could not reset the layout (${err.message}).`; })
+        .finally(() => {
+          relayout();
+          fitShown();
+        });
     });
     [showVpcBox, showSubnetsBox].forEach((box) => box.addEventListener("change", () => {
       applyBorders(cy);
       saveBorders();
     }));
+    showLegendBox.addEventListener("change", () => {
+      legend.hidden = !showLegendBox.checked;
+      savePrefs({ show_legend: showLegendBox.checked ? "1" : "0" });
+    });
     // Label sizes change, so the automatic layout is redone; dragged nodes keep their spot.
     shortenBox.addEventListener("change", () => {
       refreshLabels(cy);

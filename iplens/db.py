@@ -246,7 +246,8 @@ CREATE TABLE IF NOT EXISTS visual_prefs (
     show_vpc     INTEGER NOT NULL DEFAULT 1,
     show_subnets INTEGER NOT NULL DEFAULT 1,
     shorten_names INTEGER NOT NULL DEFAULT 0,
-    evidence     TEXT              -- Extended view evidence filter; NULL: the default levels
+    show_legend  INTEGER NOT NULL DEFAULT 1,
+    evidence    TEXT              -- Extended view evidence filter; NULL: the default levels
 );
 
 -- Per-account scope: the VPCs / subnets / IP ranges every view shows (JSON, see scope.py).
@@ -329,6 +330,23 @@ CREATE TABLE IF NOT EXISTS visual_layouts (
     positions   TEXT NOT NULL,      -- JSON {node id: {"x": .., "y": ..}}
     PRIMARY KEY (account_ref, vpc_id)
 );
+
+-- Visual page state per account and view ("ip" | "extended"): the chosen layout.
+CREATE TABLE IF NOT EXISTS visual_view_prefs (
+    account_ref INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    view        TEXT NOT NULL,
+    layout      TEXT NOT NULL,
+    PRIMARY KEY (account_ref, view)
+);
+
+-- Expanded groups per account, view and VPC (every other group is collapsed).
+CREATE TABLE IF NOT EXISTS visual_groups (
+    account_ref INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    view        TEXT NOT NULL,
+    vpc_id      TEXT NOT NULL,
+    expanded    TEXT NOT NULL,      -- JSON list of group node ids
+    PRIMARY KEY (account_ref, view, vpc_id)
+);
 """
 
 
@@ -350,6 +368,7 @@ _ADDED_COLUMNS = (
     ("enis", "owner_names", "TEXT"),
     ("visual_prefs", "shorten_names", "INTEGER NOT NULL DEFAULT 0"),
     ("visual_prefs", "evidence", "TEXT"),
+    ("visual_prefs", "show_legend", "INTEGER NOT NULL DEFAULT 1"),
 )
 
 # Single-account settings rows from before multi-account support.
