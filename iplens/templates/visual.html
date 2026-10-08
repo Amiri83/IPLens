@@ -31,6 +31,10 @@
     <label class="edge-filter"><input type="checkbox" id="show-vpc" {{ 'checked' if prefs.show_vpc }}> VPC</label>
     <label class="edge-filter"><input type="checkbox" id="show-subnets" {{ 'checked' if prefs.show_subnets }}> Subnets</label>
   </fieldset>
+  <fieldset class="edge-filters">
+    <legend>Labels</legend>
+    <label class="edge-filter" title="Cut names longer than {{ short_name_max }} characters in the middle, keeping their start and end"><input type="checkbox" id="shorten-names" {{ 'checked' if prefs.shorten_names }}> Shorten long names</label>
+  </fieldset>
   <div class="row export-buttons" style="gap: .4rem">
     <button type="button" class="secondary" id="export-svg">Export SVG</button>
     <button type="button" class="secondary" id="export-drawio">Export draw.io</button>
@@ -51,8 +55,9 @@
     load balancer targets and ECS services; dashed lines are security group based: endpoint reach
     (the endpoint's security group allows tcp/443 from the resource) and SG references.
     Drag resources to rearrange them: positions are saved for this account and VPC and override
-    the automatic layout until you press <b>Reset layout</b>. Border toggles are remembered per
-    account. Exports contain the diagram exactly as currently shown.
+    the automatic layout until you press <b>Reset layout</b>. Full names are shown, wrapped at
+    <code>- _ . /</code>; <b>Shorten long names</b> cuts them in the middle instead. Border and
+    label toggles are remembered per account. Exports contain the diagram exactly as currently shown.
   </div>
 </form>
 <div class="cy-wrap">
@@ -62,6 +67,7 @@
        data-icons="{{ url_for('static', filename='icons/aws/') }}"
        data-eni-url="{{ url_for('eni', eni_id='__ENI__') }}"
        data-csrf="{{ csrf_token }}"
+       data-short-max="{{ short_name_max }}"
        data-prefs-url="{{ url_for('visual_prefs') }}"
        data-layout-url="{{ url_for('visual_layout_save') }}"
        data-reset-url="{{ url_for('visual_layout_reset') }}"

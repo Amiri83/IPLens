@@ -1,4 +1,4 @@
-"""Visual page edges and label truncation (synthetic 10.0.x.x data only)."""
+"""Visual page edges and label shortening (synthetic 10.0.x.x data only)."""
 
 import pytest
 
@@ -109,8 +109,8 @@ def test_sg_reference_edges(db_path, snapshot_builder):
     # egress from the task SG to the endpoint SG: task -> endpoint.
     assert set(sg) == {(ALB_A, WEB_1), (ALB_B, WEB_2), (TASK_1, VPCE), (TASK_2, VPCE)}
     assert all(e["type"] == "sg" for e in sg.values())
-    # labels are ellipsized server-side; the full text stays in the tooltip title
-    assert sg[(ALB_A, WEB_1)]["label"] == "from sg-0000alb of example-…"
+    # labels are sent in full; the browser shortens them only on request
+    assert sg[(ALB_A, WEB_1)]["label"] == "from sg-0000alb of example-alb"
     assert sg[(ALB_A, WEB_1)]["title"] == (
         "sg-0000web on i-0example0001 allows tcp/80 from sg-0000alb on example-alb"
     )
@@ -257,25 +257,68 @@ def test_sg_edges_are_capped(db_path, snapshot_builder, monkeypatch):
     assert len(data["edges"]) == 3 and data["edges_truncated"] is True
 
 
-def test_visual_data_truncated_labels(db_path, snapshot_builder):
+def test_visual_data_sends_full_labels(db_path, snapshot_builder):
     long_name = "example-" + "very-long-resource-name-" * 3
+    subnet_name = "example-subnet-" + "x" * 40
     b = snapshot_builder(db_path)
     b.vpc(VPC, "10.0.0.0/16", "10.1.0.0/16", "10.2.0.0/16", "10.3.0.0/16", name="example-vpc")
-    b.subnet(APP_A, VPC, "10.0.1.0/24", name="example-subnet-" + "x" * 40)
+    b.subnet(APP_A, VPC, "10.0.1.0/24", name=subnet_name)
     b.eni(WEB_1, APP_A, ["10.0.1.10"], name=long_name)
     with closing(db_path) as conn:
         data = queries.visual_data(conn, b.id, VPC)
     vpc = data["vpc"]
     subnet = vpc["subnets"][0]
     node = subnet["items"][0]
-    assert node["name"] == long_name  # full name kept for the tooltip
-    assert node["label_name"].endswith("…")
-    assert len(node["label_name"]) == visual.LABEL_MAX["name"]
-    assert subnet["label_name"].endswith("…")
-    assert len(subnet["label_name"]) == visual.LABEL_MAX["subnet"]
-    assert subnet["label_meta"].startswith(APP_A)
-    assert vpc["label_cidrs"].endswith("…") and vpc["cidrs"][3] == "10.3.0.0/16"
+    assert node["name"] == node["label_name"] == long_name
+    assert subnet["label_name"] == subnet_name
+    assert subnet["label_meta"] == f"{APP_A} · 10.0.1.0/24 · us-east-1a"
+    assert vpc["label_cidrs"] == "10.0.0.0/16, 10.1.0.0/16, 10.2.0.0/16, 10.3.0.0/16"
     assert vpc["label_name"] == "example-vpc"
+    assert "…" not in str(data)
+
+
+def test_visual_data_keeps_distinct_lambda_suffixes(db_path, snapshot_builder):
+    prefix = "team-app-dev-platform-shared-lambda-worker-"
+    b = snapshot_builder(db_path)
+    b.vpc(VPC, "10.0.0.0/16", name="example-vpc")
+    b.subnet(APP_A, VPC, "10.0.1.0/24", name="example-app-a")
+    for i, eni in enumerate((WEB_1, WEB_2), start=1):
+        b.eni(eni, APP_A, [f"10.0.1.{10 + i}"], owner_type="lambda", owner_ref=f"{prefix}{i}")
+    with closing(db_path) as conn:
+        data = queries.visual_data(conn, b.id, VPC)
+    names = sorted(n["label_name"] for n in data["vpc"]["subnets"][0]["items"])
+    assert names == [f"{prefix}1", f"{prefix}2"]
+    short = [visual.middle_ellipsize(n) for n in names]
+    assert short[0] != short[1]
+    assert all(len(x) <= visual.SHORT_NAME_MAX for x in short)
+    assert short[0].endswith("-worker-1") and short[1].endswith("-worker-2")
+
+
+@pytest.mark.parametrize(
+    "text, limit, expected",
+    [
+        ("team-app-dev-lambda-worker-1", 32, "team-app-dev-lambda-worker-1"),  # fits: unchanged
+        ("datalab-ingest-pipeline-stream-kafka-producer", 32, "datalab-…-kafka-producer"),
+        ("team-app-dev-lambda-worker-1", 20, "team-…-worker-1"),
+        ("team-app-dev-lambda-worker-2", 20, "team-…-worker-2"),
+        ("abcdefghijklmnopqrstuvwxyz", 10, "abc…uvwxyz"),  # no separator: plain middle cut
+        ("", 5, ""),
+        (None, 5, ""),
+        ("abc", 2, "…"),
+        ("abc", 0, ""),
+    ],
+)
+def test_middle_ellipsize(text, limit, expected):
+    out = visual.middle_ellipsize(text, limit)
+    assert out == expected
+    assert len(out) <= limit
+
+
+def test_middle_ellipsize_defaults_to_short_name_max():
+    name = "team-app-dev-" + "x" * 40 + "-lambda-worker-1"
+    out = visual.middle_ellipsize(name)
+    assert len(out) <= visual.SHORT_NAME_MAX == 32
+    assert out.startswith("team-app-") and out.endswith("-lambda-worker-1")
 
 
 @pytest.mark.parametrize(

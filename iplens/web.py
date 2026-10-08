@@ -50,7 +50,13 @@ from .export import XLSX_MIMETYPE, ips_to_xlsx
 from .logging_setup import LEVELS, configure_logging, read_log
 from .queries import LB_ICONS, TYPE_ICONS
 from .settings import MAX_DISPLAY_NAME, REGIONS, Settings, SettingsStore
-from .visual import DEFAULT_EDGE_TYPES, EDGE_TYPE_LABELS, EDGE_TYPES, parse_edge_types
+from .visual import (
+    DEFAULT_EDGE_TYPES,
+    EDGE_TYPE_LABELS,
+    EDGE_TYPES,
+    SHORT_NAME_MAX,
+    parse_edge_types,
+)
 
 log = logging.getLogger(__name__)
 
@@ -560,6 +566,7 @@ def _register(app: Flask) -> None:
             # ticking "SG refs" later needs no refetch.
             edges_on=_edge_types(DEFAULT_EDGE_TYPES),
             prefs=prefs,
+            short_name_max=SHORT_NAME_MAX,
             positions=viewstate.get_layout(_db(), ref, vpc) if ref is not None and vpc else {},
             legend_icons=_legend_icons(),
         )
@@ -585,13 +592,10 @@ def _register(app: Flask) -> None:
     @app.post("/visual/prefs")
     def visual_prefs():
         ref = _active_or_400()
+        # Only the toggles present in the form change; the others keep their value.
+        changes = {k: request.form[k] == "1" for k in viewstate.DEFAULT_PREFS if k in request.form}
         with closing(_paths().db_path) as conn:
-            viewstate.save_prefs(
-                conn,
-                ref,
-                show_vpc=request.form.get("show_vpc") == "1",
-                show_subnets=request.form.get("show_subnets") == "1",
-            )
+            viewstate.save_prefs(conn, ref, **changes)
         return "", 204
 
     @app.post("/visual/layout")
