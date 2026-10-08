@@ -22,14 +22,35 @@
     {{ nav_link('settings_page', 'Settings', ep.startswith('settings')) }}
     {{ nav_link('logs', 'Logs', ep == 'logs') }}
   </nav>
-  <span class="ctx" title="auth: {{ current_settings.auth_mode }}">
+  <span class="ctx"{% if active_account %} title="auth: {{ active_account.mode_label }}"{% endif %}>
     {% if header_snap %}
       <b>{{ account_label(header_snap) }}</b> · {{ header_snap.region }} ·
       updated {{ header_snap.taken_at | localtime }}
-    {% else %}
-      no snapshot yet · {{ current_settings.region }}
+    {% elif active_account %}
+      no snapshot yet · {{ active_account.region }}
+    {% endif %}
+    {% if active_account and active_account.problem %}
+      · <a class="ctx-warn" href="{{ url_for('account_edit', account_id=active_account.id) }}">{{ active_account.problem }}</a>
+    {% elif active_account and active_account.auth_mode == 'temporary' %}
+      · {{ active_account.status }}
     {% endif %}
   </span>
+  {% if account_choices %}
+  <form class="account-switch" method="post" action="{{ url_for('account_activate') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {# Detail pages belong to one snapshot: after switching, land on Discovery. #}
+    <input type="hidden" name="next" value="{{ url_for('overview') if ep in ('subnet', 'eni') else request.full_path.rstrip('?') }}">
+    <label for="account-select" class="sr-only">Active account</label>
+    <select id="account-select" name="account_id" onchange="this.form.submit()">
+      {% for c in account_choices %}
+        <option value="{{ c.id }}" {{ 'selected' if active_account and c.id == active_account.id }}>{{ c.label }} · {{ c.account.region }}</option>
+      {% endfor %}
+    </select>
+    <noscript><button type="submit" class="secondary">Switch</button></noscript>
+  </form>
+  {% else %}
+  <a class="ctx-warn" href="{{ url_for('account_new') }}">add an AWS account</a>
+  {% endif %}
 </header>
 <main>
   {% for category, message in get_flashed_messages(with_categories=true) %}

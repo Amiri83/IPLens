@@ -42,10 +42,15 @@ class Rule:
     enabled: bool = True
     description: str = ""
     id: int | None = None
+    # IPLens account record (accounts.id) the rule is limited to; None = all accounts.
+    account_ref: int | None = None
 
     @property
     def kind_label(self) -> str:
         return RULE_KINDS.get(self.kind, self.kind)
+
+    def applies_to(self, account_ref: int | None) -> bool:
+        return self.account_ref is None or self.account_ref == account_ref
 
     def summary(self) -> str:
         p = self.params
@@ -237,7 +242,25 @@ def validate(rule: Rule) -> Rule:
         raise ValueError("rule name is required")
     rule.params = normalize_params(rule.kind, rule.params)
     rule.description = (rule.description or "").strip()
+    rule.account_ref = _account_ref(rule.account_ref)
     return rule
+
+
+def _account_ref(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        ref = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("account scope must be an account id") from exc
+    if ref <= 0:
+        raise ValueError("account scope must be an account id")
+    return ref
+
+
+def applicable(rules: Iterable[Rule], account_ref: int | None) -> list[Rule]:
+    """Rules that apply to ``account_ref``: global ones plus those scoped to it."""
+    return [r for r in rules if r.applies_to(account_ref)]
 
 
 # -- storage ----------------------------------------------------------------
@@ -251,6 +274,7 @@ def _row_to_rule(r: sqlite3.Row) -> Rule:
         params=json.loads(r["params"]),
         enabled=bool(r["enabled"]),
         description=r["description"] or "",
+        account_ref=r["account_ref"],
     )
 
 
@@ -268,25 +292,29 @@ def save_rule(conn: sqlite3.Connection, rule: Rule) -> int:
     try:
         if rule.id is None:
             cur = conn.execute(
-                "INSERT INTO rules(name, kind, params, enabled, description) VALUES(?,?,?,?,?)",
+                "INSERT INTO rules(name, kind, params, enabled, description, account_ref) "
+                "VALUES(?,?,?,?,?,?)",
                 (
                     rule.name,
                     rule.kind,
                     json.dumps(rule.params),
                     int(rule.enabled),
                     rule.description,
+                    rule.account_ref,
                 ),
             )
             rule.id = int(cur.lastrowid or 0)
         else:
             conn.execute(
-                "UPDATE rules SET name=?, kind=?, params=?, enabled=?, description=? WHERE id=?",
+                "UPDATE rules SET name=?, kind=?, params=?, enabled=?, description=?, "
+                "account_ref=? WHERE id=?",
                 (
                     rule.name,
                     rule.kind,
                     json.dumps(rule.params),
                     int(rule.enabled),
                     rule.description,
+                    rule.account_ref,
                     rule.id,
                 ),
             )
@@ -302,19 +330,21 @@ def delete_rule(conn: sqlite3.Connection, rule_id: int) -> None:
 # -- YAML -------------------------------------------------------------------
 
 
-def export_yaml(rules: Iterable[Rule]) -> str:
-    doc = {
-        "rules": [
-            {
-                "name": r.name,
-                "kind": r.kind,
-                "enabled": r.enabled,
-                "description": r.description,
-                "params": r.params,
-            }
-            for r in rules
-        ]
+def _yaml_item(r: Rule) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "name": r.name,
+        "kind": r.kind,
+        "enabled": r.enabled,
+        "description": r.description,
+        "params": r.params,
     }
+    if r.account_ref is not None:
+        item["account_scope"] = r.account_ref
+    return item
+
+
+def export_yaml(rules: Iterable[Rule]) -> str:
+    doc = {"rules": [_yaml_item(r) for r in rules]}
     return yaml.safe_dump(doc, sort_keys=False, default_flow_style=False)
 
 
@@ -339,6 +369,7 @@ def parse_yaml(text: str) -> list[Rule]:
                     params=item.get("params") or {},
                     enabled=bool(item.get("enabled", True)),
                     description=str(item.get("description") or ""),
+                    account_ref=item.get("account_scope"),
                 )
             )
         except ValueError as exc:
@@ -354,6 +385,10 @@ def import_rules(conn: sqlite3.Connection, rules: list[Rule], *, replace: bool =
     """Upsert rules by name; with ``replace`` drop all existing rules first."""
     if replace:
         conn.execute("DELETE FROM rules")
+    accounts = {r["id"] for r in conn.execute("SELECT id FROM accounts")}
+    unknown = sorted({r.account_ref for r in rules if r.account_ref is not None} - accounts)
+    if unknown:
+        raise ValueError(f"unknown account_scope id(s): {', '.join(map(str, unknown))}")
     existing = {r.name: r.id for r in list_rules(conn)}
     for rule in rules:
         rule.id = existing.get(rule.name)

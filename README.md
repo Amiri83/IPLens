@@ -1,5 +1,5 @@
 # IPLens
-Local web app for private IPv4 usage visibility &amp; optimization in a single AWS account
+Local web app for private IPv4 usage visibility &amp; optimization across one or more AWS accounts
 
 ## Quick start
 
@@ -11,20 +11,32 @@ python3 -m venv .venv
 
 Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (default `~/.iplens`).
 
-1. **Settings** – choose credentials (environment/default chain, named profile, or access key +
-   secret; the secret is Fernet-encrypted in SQLite and never logged), pick a region, set the log
-   directory, and use **Test connection**.
+1. **Settings → Accounts** – add one entry per AWS account (display name, region, auth mode) and
+   use **Test**. Auth modes: environment/default chain, named profile (dropdown of
+   `~/.aws/config` + `~/.aws/credentials`, SSO profiles included), access key + secret, or
+   temporary credentials (paste three fields, an `export AWS_…` block, or `aws sts` JSON including
+   `Expiration`; the form shows "expires in Xm"). Secrets and session tokens are Fernet-encrypted
+   in SQLite, or kept in process memory only with **memory only**; they are never logged or
+   rendered. Expired/rejected tokens produce "credentials expired, paste new ones" with an edit
+   link. The **account selector** in the top bar picks the active account: snapshots, IP list,
+   Visual and suggestions are scoped to it; rules are global unless given an account scope. An
+   existing single-account database is migrated into one account automatically.
 2. **Discovery → Refresh from AWS** – takes a read-only snapshot of VPCs, subnets, ENIs and their
    private IPs (plus Lambda, VPC endpoint and load balancer metadata), and shows the
-   **VPC → subnet tree** and the per-subnet **address grid**.
+   **VPC → subnet tree** and the per-subnet **address grid**. The history table can delete
+   selected snapshots or **Clear history**; both need `DELETE` typed to confirm, and the latest
+   snapshot of every account is always kept.
 3. **IP List** – one flat table of every private IP in the latest snapshot (IP, subnet, VPC,
    resource type, resource name/ref, ENI, status), sorted numerically by address. Filter by VPC,
    subnet, resource type, status or free text; **Export to Excel** downloads the current filter as
    an `.xlsx` (one sheet, header row frozen, autofilter enabled).
 4. **Visual** – nested diagram per VPC: VPC box → subnet boxes (CIDR, used/idle/free) → one node
    per resource ENI with its AWS icon, name and IPs. More than 10 nodes of one type in a subnet are
-   collapsed into a group node (click to expand). Scroll/drag to zoom and pan; click a node to open
-   its ENI. Data comes from `GET /visual/data.json?vpc=<vpc-id>`.
+   collapsed into a group node (click to expand). Scroll/drag to zoom and pan; double-click a node
+   to open its ENI. VPC/subnet borders can be toggled (remembered per account); dragged node
+   positions are saved per account + VPC until **Reset layout**. **Export SVG** / **Export
+   draw.io** download the view exactly as shown (draw.io: `mxgraph.aws4` shapes, VPC and subnets
+   as containers, edges kept). Data comes from `GET /visual/data.json?vpc=<vpc-id>`.
 5. Define **Rules** (GUI or YAML import/export) and review **Suggestions**; anything a rule forbids is
    greyed out together with the IPs it would have saved.
 6. **Logs** shows the application log file.
@@ -80,6 +92,10 @@ The app must work without CDN access, so all browser assets are shipped in the p
 | asset | path | source | license |
 |---|---|---|---|
 | cytoscape.js 3.34.3 (`dist/cytoscape.min.js`, unmodified) | `iplens/static/vendor/cytoscape.min.js` | npm package `cytoscape@3.34.3` | MIT – `iplens/static/vendor/cytoscape.LICENSE` |
+| dagre (`dagre.min.js`, unmodified) | `iplens/static/vendor/dagre.min.js` | npm package `dagre` | MIT – `iplens/static/vendor/dagre.LICENSE` |
+
+SVG export is rendered server-side (`iplens/diagram.py`, icons embedded as data URIs) rather than
+with the `cytoscape-svg` extension, which is GPL-3.0 licensed, not MIT.
 | AWS Architecture Icons (14 SVGs, unmodified, original file names) | `iplens/static/icons/aws/` | AWS Architecture Icons package, release 2026-07-31 (`Icon-package_07312026`), https://aws.amazon.com/architecture/icons/ | see below |
 
 **AWS Architecture Icons license.** The icons are © Amazon Web Services, Inc. or its affiliates.

@@ -53,6 +53,7 @@ TEXT_PAIRS = [
     ("nav-fg-active", "nav-bg"),
     ("nav-fg-active", "nav-bg-hover"),
     ("nav-ctx", "nav-bg"),
+    ("nav-warn", "nav-bg"),  # credential problem link in the header
     # badges and flashes
     ("badge-fg", "badge-bg"),
     ("ok-fg", "ok-bg"),

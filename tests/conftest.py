@@ -65,18 +65,33 @@ class SnapshotBuilder:
         *,
         account_alias: str = "",
         taken_at: datetime | None = None,
+        account_ref: int | None = None,
+        account_id: str = "123456789012",
+        status: str = "ok",
     ):
+        """``account_ref`` defaults to the first IPLens account (the migrated default)."""
         self.db_path = db_path
         self._subnet_vpc: dict[str, str] = {}
         self._subnet_az: dict[str, str] = {}
         taken_at = taken_at or datetime.now(UTC)
         with closing(db_path) as conn:
+            if account_ref is None:
+                row = conn.execute("SELECT MIN(id) FROM accounts").fetchone()
+                account_ref = row[0]
             cur = conn.execute(
-                "INSERT INTO snapshots(taken_at, region, account_id, account_alias, status) "
-                "VALUES(?, ?, '123456789012', ?, 'ok')",
-                (taken_at.isoformat(timespec="seconds"), region, account_alias),
+                "INSERT INTO snapshots(taken_at, region, account_id, account_alias, status, "
+                "account_ref) VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    taken_at.isoformat(timespec="seconds"),
+                    region,
+                    account_id,
+                    account_alias,
+                    status,
+                    account_ref,
+                ),
             )
             self.id = int(cur.lastrowid)
+            self.account_ref = account_ref
 
     def vpc(self, vpc_id: str, *cidrs: str, name: str = "example-vpc") -> SnapshotBuilder:
         with closing(self.db_path) as conn:

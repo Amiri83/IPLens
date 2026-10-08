@@ -9,17 +9,22 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from .settings import Settings
+from .accounts import EXPIRED_MESSAGE, Account, CredentialError
 
 log = logging.getLogger(__name__)
 
 READ_ONLY_PREFIXES = ("Describe", "List", "Get")
+
+# AWS error codes meaning "these credentials are no longer valid".
+EXPIRED_CREDENTIAL_CODES = frozenset(
+    {"ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId"}
+)
 
 _BOTO_CONFIG = Config(retries={"max_attempts": 5, "mode": "adaptive"}, user_agent_extra="iplens")
 
@@ -34,23 +39,38 @@ def _guard_read_only(model: Any = None, **_: Any) -> None:
         raise ReadOnlyViolation(f"IPLens is read-only; refusing AWS operation {op_name!r}")
 
 
-def build_session(settings: Settings) -> boto3.session.Session:
-    """Create a boto3 session for the configured auth mode.
+def is_credential_failure(exc: BaseException) -> bool:
+    """True for errors the user fixes by pasting new credentials."""
+    if isinstance(exc, CredentialError):
+        return True
+    if isinstance(exc, ClientError):
+        return exc.response.get("Error", {}).get("Code", "") in EXPIRED_CREDENTIAL_CODES
+    return False
 
-    ``settings`` must have been loaded with ``with_secret=True`` for key auth.
+
+def build_session(account: Account) -> boto3.session.Session:
+    """Create a boto3 session for the account's auth mode.
+
+    ``account`` must have been loaded with ``with_secret=True`` for key and
+    temporary auth. Raises :class:`CredentialError` (safe message) when the
+    credentials are incomplete or already expired.
     """
-    region = settings.region or None
-    if settings.auth_mode == "profile":
-        return boto3.session.Session(profile_name=settings.profile, region_name=region)
-    if settings.auth_mode == "keys":
-        if not settings.access_key_id or not settings.secret_access_key:
-            raise ValueError("access key auth selected but credentials are incomplete")
+    problem = account.credential_problem()
+    if problem:
+        raise CredentialError(problem)
+    region = account.region or None
+    if account.auth_mode == "profile":
+        return boto3.session.Session(profile_name=account.profile, region_name=region)
+    if account.auth_mode in ("keys", "temporary"):
+        if not account.secret_access_key:
+            raise CredentialError("credentials are incomplete")
         return boto3.session.Session(
-            aws_access_key_id=settings.access_key_id,
-            aws_secret_access_key=settings.secret_access_key,
+            aws_access_key_id=account.access_key_id,
+            aws_secret_access_key=account.secret_access_key,
+            aws_session_token=account.session_token or None,
             region_name=region,
         )
-    # "env": default credential chain (env vars, shared config, instance role, ...)
+    # "env": the process environment / default chain (env vars, shared config, role, ...)
     return boto3.session.Session(region_name=region)
 
 
@@ -59,8 +79,8 @@ class AwsGateway:
         self.session = session
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> AwsGateway:
-        return cls(build_session(settings))
+    def from_account(cls, account: Account) -> AwsGateway:
+        return cls(build_session(account))
 
     @property
     def region(self) -> str | None:
@@ -81,19 +101,28 @@ class AwsGateway:
         return list(self.client("iam").list_account_aliases().get("AccountAliases", []))
 
 
+class ConnectionCheck(NamedTuple):
+    ok: bool
+    message: str
+    credentials_problem: bool = False
+
+
 def check_connection(
-    settings: Settings, factory: Callable[[Settings], AwsGateway] | None = None
-) -> tuple[bool, str]:
-    """Return (ok, message) without ever echoing credentials."""
+    account: Account, factory: Callable[[Account], AwsGateway] | None = None
+) -> ConnectionCheck:
+    """Test the account's credentials without ever echoing them."""
     try:
-        gw = (factory or AwsGateway.from_settings)(settings)
+        gw = (factory or AwsGateway.from_account)(account)
         ident = gw.caller_identity()
         gw.client("ec2").describe_vpcs(MaxResults=5)
     except (BotoCoreError, ClientError, ValueError, ReadOnlyViolation) as exc:
         log.warning("connection test failed: %s", type(exc).__name__)
-        return False, f"Connection failed: {_safe_error(exc)}"
+        if is_credential_failure(exc):
+            msg = str(exc) if isinstance(exc, CredentialError) else EXPIRED_MESSAGE
+            return ConnectionCheck(False, f"Connection failed: {msg}", True)
+        return ConnectionCheck(False, f"Connection failed: {_safe_error(exc)}")
     log.info("connection test succeeded (region=%s)", gw.region)
-    return True, f"Connected to account {ident['account']} in {gw.region}"
+    return ConnectionCheck(True, f"Connected to account {ident['account']} in {gw.region}")
 
 
 def _safe_error(exc: Exception) -> str:
