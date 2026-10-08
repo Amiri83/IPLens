@@ -839,6 +839,94 @@ def test_exports_include_extended_areas_and_evidence():
     assert "strokeColor=#1A7F37" in drawio and "dashPattern=2 3" in drawio
 
 
+def _lane_view() -> dict:
+    """Focused, aggregated swimlane view as the Visual page posts it."""
+    return {
+        "vpc_id": VPC,
+        "mode": "extended",
+        "nodes": [
+            {"id": "lane:0", "kind": "lane", "label": "app=app-a", "x": 0, "y": 0, "w": 900},
+            {
+                "id": "group:lane:0:lambda",
+                "kind": "group",
+                "parent": "lane:0",
+                "label": "▸ 3 × Lambda function: fn-a, fn-b, fn-c",
+                "x": 40,
+                "y": 60,
+                "w": 44,
+                "h": 44,
+                "icon": EXT_ICONS["lambda"],
+            },
+            {
+                "id": "box:svc:lane:0:sqs",
+                "kind": "area",
+                "parent": "lane:0",
+                "label": "▾ SQS queue ×2 · click here to collapse",
+                "x": 500,
+                "y": 30,
+                "w": 300,
+                "h": 120,
+            },
+            {
+                "id": "x:sqs:queue-a",
+                "kind": "res",
+                "parent": "box:svc:lane:0:sqs",
+                "label": "queue-a\nSQS queue",
+                "x": 540,
+                "y": 60,
+                "w": 44,
+                "h": 44,
+                "icon": EXT_ICONS["sqs"],
+            },
+        ],
+        "edges": [
+            {
+                "source": "group:lane:0:lambda",
+                "target": "x:sqs:queue-a",
+                "type": "ev_configured",
+                "label": "trigger ×4 +2",
+                "width": 8,
+                "bidir": True,
+            }
+        ],
+    }
+
+
+def test_exports_reflect_lanes_aggregation_and_merged_edges():
+    view = parse_view(json.dumps(_lane_view()))
+    assert view.edges[0].width == 8 and view.edges[0].bidir
+    svg = view_to_svg(view)
+    assert 'class="lane"' in svg and "app=app-a" in svg and 'class="area"' in svg
+    assert 'stroke-width="8"' in svg and 'marker-start="url(#arrow-start-ev_configured)"' in svg
+    assert "trigger ×4 +2" in svg
+    drawio = view_to_drawio(view)
+    assert "swimlane;" in drawio and "strokeWidth=8;" in drawio and "startArrow=block" in drawio
+    # Without width / bidir an edge keeps its evidence style.
+    doc = _lane_view()
+    del doc["edges"][0]["width"], doc["edges"][0]["bidir"]
+    svg = view_to_svg(parse_view(json.dumps(doc)))
+    assert 'stroke-width="2"' in svg and "marker-start" not in svg
+
+
+@pytest.mark.parametrize("width", ["8", True, float("inf")])
+def test_export_rejects_bad_edge_width(width):
+    doc = _lane_view()
+    doc["edges"][0]["width"] = width
+    with pytest.raises(ValueError):
+        parse_view(json.dumps(doc))
+
+
+def test_extended_page_has_focus_controls_and_declutter_script(client, ext_seeded):
+    page = client.get(f"/visual?vpc={VPC}&view=extended").data.decode()
+    for marker in ('id="focus-search"', 'id="focus-hops"', 'id="focus-reset"', "declutter.js"):
+        assert marker in page
+    assert '<option value="1">1 hop</option>' in page
+    assert '<option value="2">2 hops</option>' in page
+    assert "https://" not in page.split("<script", 1)[1]  # vendored scripts only, no CDN
+    ip_page = client.get(f"/visual?vpc={VPC}").data.decode()
+    assert 'id="focus-search"' not in ip_page
+
+
 def test_export_rejects_unknown_evidence_type():
     doc = _ext_view()
     doc["edges"][0]["type"] = "ev_guessed"

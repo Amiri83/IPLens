@@ -37,9 +37,9 @@ Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (defau
    positions are saved per account + VPC until **Reset layout**. **Export SVG** / **Export
    draw.io** download the view exactly as shown (draw.io: `mxgraph.aws4` shapes, VPC and subnets
    as containers, edges kept). Data comes from `GET /visual/data.json?vpc=<vpc-id>`.
-   The **IP view** is the default; the **Extended view** tab adds a "Regional services" area
-   (SNS, SQS, DynamoDB, EventBridge, S3, API Gateway, Step Functions, Lambda, ECS, Secrets Manager
-   names) and an "External" area (Transit Gateway, peering, internet via IGW / NAT) beside the VPC.
+   The **IP view** is the default; the **Extended view** tab adds regional services (SNS, SQS,
+   DynamoDB, EventBridge, S3, API Gateway, Step Functions, Lambda, ECS, Secrets Manager names) and
+   external nodes (Transit Gateway, peering, internet via IGW / NAT) around the VPC.
    **Crawl services** (opt-in) reads them; every connection carries evidence, strongest first:
    *observed* (flow logs, X-Ray) > *configured* (subscriptions, event source mappings, targets,
    routes, ...) > *permitted* (IAM policies of Lambda / ECS roles) > *referenced* (environment
@@ -47,7 +47,17 @@ Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (defau
    against known resource names / ARNs in memory and never stored; IAM `Resource: "*"` shows a
    *broad access* badge. **Flow logs** (opt-in) shows the estimated Logs Insights scan size for the
    chosen window (default 1 hour) before running, and stores only ENI↔ENI/port aggregates.
-   Filters by service and evidence level apply to the diagram and its exports.
+   Filters by service and evidence level apply to the diagram and its exports. To stay readable
+   the Extended view draws **one line per pair of nodes**, styled by its strongest evidence, with a
+   *+N* badge for further evidence lines (all listed when the line is clicked). Only *observed* and
+   *configured* are shown by default; *permitted* / *referenced* are opt-in, and the selection is
+   remembered per account. Regional services of one type ("SQS queue ×18") and Lambda / ECS ENIs
+   of a subnet are collapsible groups; lines between collapsed groups merge into one labelled
+   *×count*, drawn wider the more connections it stands for. One left-to-right dagre layout runs
+   sources (EventBridge, SNS, API Gateway, S3) → compute (Lambda, ECS) → targets, with edges routed
+   along dagre's paths. Click a node or search by name / ARN / IP to see only its 1- or 2-hop
+   neighbourhood (**Show all** or Esc to return). Group by tag or Terraform root draws one
+   swimlane per app. Exports contain exactly what is shown.
 5. Define **Rules** (GUI or YAML import/export) and review **Suggestions**; anything a rule forbids is
    greyed out together with the IPs it would have saved.
 6. **Logs** shows the application log file.

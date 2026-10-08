@@ -128,6 +128,10 @@ label.edge-filter { display: inline-flex; align-items: center; gap: .35rem; marg
 .edge-swatch.ev-permitted { border-top: 2px dashed #c2410c; }
 .edge-swatch.ev-referenced { border-top: 2px dotted #6b7280; }
 .box-swatch.box-area { border: 2px dashed #5b6573; background: #f6f7f9; }
+.box-swatch.box-lane { border: 1.5px solid #2457c5; background: rgba(36, 87, 197, .04); }
+.edge-swatch.edge-agg { border-top: 6px solid #2457c5; }
+.focus-controls { align-items: center; }
+.focus-controls input[type="search"] { width: 14rem; }
 .view-tabs { display: flex; gap: .3rem; margin: 0 0 .7rem; border-bottom: 1px solid var(--line); }
 .view-tab { padding: .35rem .8rem; border: 1px solid transparent; border-bottom: 0;
             border-radius: 5px 5px 0 0; text-decoration: none; }

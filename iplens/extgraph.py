@@ -14,6 +14,9 @@ the same two nodes are merged into one edge whose ``evidence`` is the strongest 
 (:data:`iplens.extended.EVIDENCE_LEVELS`); the detail panel lists every line. In the
 Extended view the IP view's own edges carry evidence too: load balancer targets and
 ECS services are ``configured``, security group reach / references ``permitted``.
+
+The page then declutters this payload without changing it (:mod:`iplens.declutter`):
+one edge per node pair, evidence filter, service / compute groups, focus mode.
 """
 
 from __future__ import annotations
