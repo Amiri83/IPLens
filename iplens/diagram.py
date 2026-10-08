@@ -3,9 +3,15 @@
 The browser posts the view exactly as drawn (see ``currentView`` in static/visual.js):
 every visible node with its absolute top-left position and size, its parent box,
 label and icon, plus every visible edge and the border toggles. Both exporters work
-from that description only, so collapsed groups, edge filters, dragged positions
-and hidden borders are reproduced as-is. Output is built with ElementTree, so all
-text is XML-escaped and the documents are well-formed.
+from that description only, so edge filters, dragged positions and hidden borders
+are reproduced as-is. Output is built with ElementTree, so all text is XML-escaped
+and the documents are well-formed.
+
+With ``expand_groups`` (the "Expand all groups" export option) each collapsed group
+node carries its ``members``; :func:`expand_groups` replaces the group box with the
+member nodes, laid out in rows appended to the group's subnet (everything below is
+moved down). Context boxes (``ctx``: "Group by" security group / tag / Terraform
+root) are dashed boxes around their ``members`` and are refitted after expansion.
 """
 
 from __future__ import annotations
@@ -26,21 +32,29 @@ from .visual import EDGE_TYPES
 
 ICON_DIR = Path(__file__).parent / "static" / "icons" / "aws"
 ALLOWED_ICONS = frozenset({*TYPE_ICONS.values(), *LB_ICONS.values(), VPC_ICON})
-NODE_KINDS = ("vpc", "subnet", "res", "group")
+NODE_KINDS = ("vpc", "subnet", "res", "group", "ctx")
 CONTAINER_KINDS = ("vpc", "subnet")
+LEAF_KINDS = ("res", "group")
 
 MAX_NODES = 5000
 MAX_EDGES = 20000
 MAX_LABEL = 600
 MAX_COORD = 1e7
+MAX_MEMBERS = 5000
+COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+# Expanded group members: grid cells sized like the Visual page's grid layout.
+EXPAND_CELL_W, EXPAND_CELL_H, EXPAND_COLS, EXPAND_PAD = 190.0, 120.0, 4, 28.0
+CTX_PAD = 12.0
 
 # Colours and sizes mirror the cytoscape style in static/visual.js.
 VPC_STROKE, VPC_FILL = "#8c4fff", "#f7f3ff"
 SUBNET_STROKE, SUBNET_FILL = "#7aa116", "#ffffff"
 IDLE_STROKE, GROUP_STROKE = "#e8a33a", "#2457c5"
+CTX_STROKE = "#5b6573"
 TEXT = "#1f2933"
 FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
-FONT_SIZE = {"vpc": 14, "subnet": 11, "res": 10, "group": 10}
+FONT_SIZE = {"vpc": 14, "subnet": 11, "res": 10, "group": 10, "ctx": 10}
 EDGE_STYLES: dict[str, dict[str, Any]] = {
     "targets": {"color": "#2457c5", "width": 2, "dash": "", "head": "triangle"},
     "ecs_lb": {"color": "#2f8f4e", "width": 2, "dash": "", "head": "triangle"},
@@ -64,6 +78,9 @@ class ViewNode:
     parent: str | None = None
     icon: str = ""
     idle: bool = False
+    color: str = ""  # outline (res/group) or box colour (ctx), "#rrggbb"
+    members: list[ViewNode] = field(default_factory=list)  # group: its resources
+    member_ids: list[str] = field(default_factory=list)  # ctx: resource node ids inside
 
     @property
     def cx(self) -> float:
@@ -72,6 +89,17 @@ class ViewNode:
     @property
     def cy(self) -> float:
         return self.y + self.h / 2
+
+    @property
+    def bottom(self) -> float:
+        return self.y + self.h
+
+    def label_height(self) -> float:
+        """Height of the label drawn under a leaf node."""
+        return 5 + len(_lines(self.label)) * _line_height(self.kind)
+
+    def label_width(self) -> float:
+        return max((len(line) for line in _lines(self.label)), default=0) * 6.0
 
 
 @dataclass
@@ -87,6 +115,7 @@ class View:
     vpc_id: str = ""
     show_vpc: bool = True
     show_subnets: bool = True
+    expand_groups: bool = False
     nodes: list[ViewNode] = field(default_factory=list)
     edges: list[ViewEdge] = field(default_factory=list)
 
@@ -124,38 +153,40 @@ def parse_view(raw: str) -> View:
         vpc_id=_text(doc.get("vpc_id"), 64),
         show_vpc=doc.get("show_vpc", True) is not False,
         show_subnets=doc.get("show_subnets", True) is not False,
+        expand_groups=doc.get("expand_groups") is True,
     )
     seen: dict[str, ViewNode] = {}
-    for n in raw_nodes:
-        if not isinstance(n, dict):
-            raise ValueError("nodes must be objects")
-        node_id = _text(n.get("id"), 200)
-        if not node_id or node_id in seen:
+    members: dict[str, ViewNode] = {}  # group members, drawable only after expansion
+    n_members = 0
+
+    def claim(node_id: str) -> None:
+        if not node_id or node_id in seen or node_id in members:
             raise ValueError("node ids must be unique and non-empty")
-        kind = n.get("kind")
-        if kind not in NODE_KINDS:
-            raise ValueError(f"node kind must be one of {', '.join(NODE_KINDS)}")
-        icon = _text(n.get("icon"), 120)
-        if icon and icon not in ALLOWED_ICONS:
-            raise ValueError("unknown icon")
-        node = ViewNode(
-            id=node_id,
-            kind=kind,
-            label=_text(n.get("label")),
-            x=_num(n.get("x"), "x"),
-            y=_num(n.get("y"), "y"),
-            w=max(_num(n.get("w"), "w"), 1.0),
-            h=max(_num(n.get("h"), "h"), 1.0),
-            parent=_text(n.get("parent"), 200) or None,
-            icon=icon,
-            idle=n.get("idle") is True,
-        )
-        seen[node_id] = node
+
+    for n in raw_nodes:
+        node = _parse_node(n)
+        claim(node.id)
+        if node.kind == "group" and view.expand_groups:
+            raw_members = n.get("members") or []
+            if not isinstance(raw_members, list):
+                raise ValueError("group members must be a list")
+            n_members += len(raw_members)
+            if n_members > MAX_MEMBERS:
+                raise ValueError("view is too large")
+            for m in raw_members:
+                member = _parse_node(m, kind="res")
+                claim(member.id)
+                member.parent = node.parent
+                node.members.append(member)
+                members[member.id] = member
+        seen[node.id] = node
         view.nodes.append(node)
     for node in view.nodes:
         parent = seen.get(node.parent or "")
         if node.parent and (parent is None or parent.kind not in CONTAINER_KINDS):
             raise ValueError("a node's parent must be a VPC or subnet node of the view")
+        if node.kind == "ctx" and node.parent:
+            raise ValueError("a context box cannot have a parent")
     for e in raw_edges:
         if not isinstance(e, dict):
             raise ValueError("edges must be objects")
@@ -167,10 +198,123 @@ def parse_view(raw: str) -> View:
         )
         if not edge.type:
             raise ValueError(f"edge type must be one of {', '.join(EDGE_TYPES)}")
-        if edge.source not in seen or edge.target not in seen:
+        ends = (
+            (seen.get(edge.source) or members.get(edge.source)),
+            (seen.get(edge.target) or members.get(edge.target)),
+        )
+        if None in ends or any(n.kind == "ctx" for n in ends if n):
             raise ValueError("edges must connect nodes of the view")
         view.edges.append(edge)
+    if view.expand_groups:
+        expand_groups(view)
     return view
+
+
+def _parse_node(n: Any, kind: str | None = None) -> ViewNode:
+    """One posted node (``kind`` forces the kind of group members)."""
+    if not isinstance(n, dict):
+        raise ValueError("nodes must be objects")
+    kind = kind or n.get("kind")
+    if kind not in NODE_KINDS:
+        raise ValueError(f"node kind must be one of {', '.join(NODE_KINDS)}")
+    icon = _text(n.get("icon"), 120)
+    if icon and icon not in ALLOWED_ICONS:
+        raise ValueError("unknown icon")
+    color = _text(n.get("color"), 7)
+    if color and not COLOR_RE.match(color):
+        raise ValueError("colors must be #rrggbb")
+    raw_ids = (n.get("member_ids") or []) if kind == "ctx" else []
+    if not isinstance(raw_ids, list) or len(raw_ids) > MAX_MEMBERS:
+        raise ValueError("context box members must be a list")
+    has_box = kind != "res" or "x" in n  # members may omit their (unknown) position
+    return ViewNode(
+        id=_text(n.get("id"), 200),
+        kind=kind,
+        label=_text(n.get("label")),
+        x=_num(n.get("x"), "x") if has_box else 0.0,
+        y=_num(n.get("y"), "y") if has_box else 0.0,
+        w=max(_num(n.get("w", 44), "w"), 1.0),
+        h=max(_num(n.get("h", 44), "h"), 1.0),
+        parent=_text(n.get("parent"), 200) or None,
+        icon=icon,
+        idle=n.get("idle") is True,
+        color=color,
+        member_ids=[_text(i, 200) for i in raw_ids],
+    )
+
+
+# -- "Expand all groups" ----------------------------------------------------------------
+
+
+def _chain(node: ViewNode, by_id: dict[str, ViewNode]) -> list[ViewNode]:
+    """``node``'s ancestors, nearest first."""
+    out: list[ViewNode] = []
+    while node.parent and node.parent in by_id and len(out) < 10:
+        node = by_id[node.parent]
+        out.append(node)
+    return out
+
+
+def expand_groups(view: View) -> int:
+    """Replace every group node that carries members by its member nodes; returns the
+    number of groups expanded.
+
+    Members are laid out in rows of up to EXPAND_COLS appended at the bottom of the
+    group's subnet box. The subnet and its ancestors grow by the added height and
+    every other node starting below the old bottom moves down by as much, so nothing
+    overlaps. Edges into a group keep pointing at the group only if it had no
+    members (the browser sends member-level edges when expanding). Context boxes are
+    refitted around their member nodes afterwards.
+    """
+    groups = [n for n in view.nodes if n.kind == "group" and n.members]
+    if not groups:
+        return 0
+    for g in sorted(groups, key=lambda n: (n.y, n.x)):
+        by_id = {n.id: n for n in view.nodes}
+        parent = by_id.get(g.parent or "")
+        box_x, box_w = (parent.x, parent.w) if parent else (g.x, EXPAND_CELL_W * EXPAND_COLS)
+        top = parent.bottom if parent else g.bottom + g.label_height()
+        cell_w = max(EXPAND_CELL_W, *(m.w + 20 for m in g.members))
+        cell_w = max(cell_w, *(m.label_width() + 16 for m in g.members))
+        cell_h = max(EXPAND_CELL_H, *(m.h + m.label_height() + 16 for m in g.members))
+        fit = int((box_w - 2 * EXPAND_PAD) // cell_w) if parent else EXPAND_COLS
+        cols = max(1, min(EXPAND_COLS, len(g.members), fit))
+        rows = math.ceil(len(g.members) / cols)
+        delta = rows * cell_h
+        family = {g.id, *(a.id for a in _chain(g, by_id))}
+        below = top - 0.5
+        for n in view.nodes:
+            if n.id in family or n.kind == "ctx" or n.y < below:
+                continue
+            # A node inside a box that stays put (e.g. a taller subnet beside this
+            # one) stays put with it.
+            if all(a.y >= below for a in _chain(n, by_id) if a.id not in family):
+                n.y += delta
+        for a in _chain(g, by_id):
+            a.h += delta
+        for i, m in enumerate(g.members):
+            col, row = i % cols, i // cols
+            m.x = box_x + EXPAND_PAD + col * cell_w + (cell_w - m.w) / 2
+            m.y = top - EXPAND_PAD / 2 + row * cell_h
+        idx = view.nodes.index(g)
+        view.nodes[idx : idx + 1] = g.members
+    gone = {g.id for g in groups}
+    view.edges = [e for e in view.edges if e.source not in gone and e.target not in gone]
+    _refit_context_boxes(view)
+    return len(groups)
+
+
+def _refit_context_boxes(view: View) -> None:
+    by_id = {n.id: n for n in view.nodes}
+    for box in (n for n in view.nodes if n.kind == "ctx" and n.member_ids):
+        inside = [by_id[i] for i in box.member_ids if i in by_id and by_id[i].kind in LEAF_KINDS]
+        if not inside:
+            continue
+        x0 = min(min(n.x, n.cx - n.label_width() / 2) for n in inside) - CTX_PAD
+        x1 = max(max(n.x + n.w, n.cx + n.label_width() / 2) for n in inside) + CTX_PAD
+        y0 = min(n.y for n in inside) - CTX_PAD - _line_height("ctx")
+        y1 = max(n.bottom + n.label_height() for n in inside) + CTX_PAD
+        box.x, box.y, box.w, box.h = x0, y0, x1 - x0, y1 - y0
 
 
 def export_filename(view: View, ext: str) -> str:
@@ -341,6 +485,30 @@ def view_to_svg(view: View) -> str:
         first = n.y - margin - (len(lines) - 1) * _line_height(n.kind) - 3
         _text_el(g, n.cx, first, lines, n.kind)
 
+    contexts = ET.SubElement(svg, "g", {"class": "contexts"})
+    for n in nodes:
+        if n.kind != "ctx":
+            continue
+        color = n.color or CTX_STROKE
+        g = ET.SubElement(contexts, "g", {"class": "ctx", "data-id": n.id})
+        ET.SubElement(
+            g,
+            "rect",
+            {
+                "x": _fmt(n.x),
+                "y": _fmt(n.y),
+                "width": _fmt(n.w),
+                "height": _fmt(n.h),
+                "rx": "8",
+                "fill": color,
+                "fill-opacity": "0.05",
+                "stroke": color,
+                "stroke-width": "1.5",
+                "stroke-dasharray": "6 4",
+            },
+        )
+        _text_el(g, n.x + 6, n.y + 12, _lines(n.label), "ctx", anchor="start")
+
     edges = ET.SubElement(svg, "g", {"class": "edges"})
     for e in view.edges:
         s, t = by_id[e.source], by_id[e.target]
@@ -391,7 +559,7 @@ def view_to_svg(view: View) -> str:
 
     leaves = ET.SubElement(svg, "g", {"class": "nodes"})
     for n in nodes:
-        if n.kind in CONTAINER_KINDS:
+        if n.kind not in LEAF_KINDS:
             continue
         g = ET.SubElement(leaves, "g", {"class": n.kind, "data-id": n.id})
         ET.SubElement(
@@ -413,6 +581,8 @@ def view_to_svg(view: View) -> str:
                 _outline(g, n, inset, GROUP_STROKE, 1)
         elif n.idle:
             _outline(g, n, 0.0, IDLE_STROKE, 3)
+        if n.color:
+            _outline(g, n, -3.0, n.color, 2)
         _text_el(g, n.cx, n.y + n.h + 5 + FONT_SIZE[n.kind], _lines(n.label), n.kind)
 
     ET.indent(svg)
@@ -494,6 +664,10 @@ DRAWIO_SUBNET = (
     "strokeColor=#7AA116;fillColor=#F2F6E8;fontColor=#248814;"
 )
 DRAWIO_HIDDEN_BOX = "strokeColor=none;fillColor=none;grIcon=none;"
+DRAWIO_CTX = (
+    "rounded=1;arcSize=4;dashed=1;dashPattern=6 4;fillColor=none;html=1;whiteSpace=wrap;"
+    "verticalAlign=top;align=left;spacingLeft=6;fontSize=10;strokeWidth=1.5;"
+)
 DRAWIO_EDGE = "html=1;rounded=0;edgeStyle=none;fontSize=9;labelBackgroundColor=#FFFFFF;"
 DRAWIO_EDGE_STYLES = {
     "targets": "endArrow=block;endFill=1;strokeColor=#2457C5;strokeWidth=2;",
@@ -512,6 +686,9 @@ def drawio_style(node: ViewNode, view: View) -> str:
         return DRAWIO_VPC + ("" if view.show_vpc else DRAWIO_HIDDEN_BOX)
     if node.kind == "subnet":
         return DRAWIO_SUBNET + ("" if view.show_subnets else DRAWIO_HIDDEN_BOX)
+    if node.kind == "ctx":
+        color = (node.color or CTX_STROKE).upper()
+        return f"{DRAWIO_CTX}strokeColor={color};fontColor={color};"
     style = _DRAWIO_RES + DRAWIO_SHAPES.get(node.icon, DRAWIO_SHAPES[TYPE_ICONS["other"]])
     if node.kind == "group":
         style += "fontStyle=1;"

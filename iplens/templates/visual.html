@@ -35,9 +35,19 @@
     <legend>Labels</legend>
     <label class="edge-filter" title="Cut names longer than {{ short_name_max }} characters in the middle, keeping their start and end"><input type="checkbox" id="shorten-names" {{ 'checked' if prefs.shorten_names }}> Shorten long names</label>
   </fieldset>
+  <fieldset class="edge-filters">
+    <legend>Group by</legend>
+    <select id="group-by" name="group" aria-label="Group by">
+      {% for value, label in group_by_choices.items() %}<option value="{{ value }}" {{ 'selected' if value == group_by }}>{{ label }}</option>{% endfor %}
+    </select>
+    <select id="group-tag" name="tag" aria-label="Tag key" data-selected="{{ group_tag }}" {{ 'hidden' if group_by != 'tag' }}>
+      <option value="">(tag key)</option>
+    </select>
+  </fieldset>
   <div class="row export-buttons" style="gap: .4rem">
     <button type="button" class="secondary" id="export-svg">Export SVG</button>
     <button type="button" class="secondary" id="export-drawio">Export draw.io</button>
+    <label class="edge-filter" title="Exports show every member of a collapsed group instead of one group box"><input type="checkbox" id="export-expand" checked> Expand all groups</label>
   </div>
   <fieldset class="edge-filters">
     <legend>Connections</legend>
@@ -57,7 +67,11 @@
     Drag resources to rearrange them: positions are saved for this account and VPC and override
     the automatic layout until you press <b>Reset layout</b>. Full names are shown, wrapped at
     <code>- _ . /</code>; <b>Shorten long names</b> cuts them in the middle instead. Border and
-    label toggles are remembered per account. Exports contain the diagram exactly as currently shown.
+    label toggles are remembered per account. Endpoint reach lines are labelled with the endpoint's
+    security group name. <b>Group by</b> draws a dashed box (and a coloured outline) around the
+    resources sharing a security group, a tag value or a Terraform root (loaded under Settings).
+    Exports contain the diagram as currently shown; with <b>Expand all groups</b> (default) every
+    collapsed group is exported as its member resources.
   </div>
 </form>
 <div class="cy-wrap">
@@ -90,6 +104,7 @@
     <span class="legend-item"><i class="box-swatch box-subnet"></i> Subnet</span>
     <span class="legend-item"><i class="node-swatch node-idle"></i> Idle ENI (available)</span>
     <span class="legend-item"><i class="node-swatch node-group"></i> Group (click to expand)</span>
+    <span class="legend-item"><i class="box-swatch box-ctx"></i> Group by: security group / tag / Terraform root</span>
     {% for t in edge_types %}
       <span class="legend-item"><i class="edge-swatch edge-{{ t }}"></i> {{ edge_labels[t] }}</span>
     {% endfor %}

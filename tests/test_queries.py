@@ -244,7 +244,9 @@ def test_visual_data_groups_more_than_ten_of_a_type(db_path, snapshot_builder):
     groups = [i for i in items if i["kind"] == "group"]
     assert len(groups) == 1
     g = groups[0]
-    assert (g["type"], g["count"], g["ip_count"], g["name"]) == ("ecs", 11, 11, "11 × ECS task")
+    assert (g["type"], g["count"], g["ip_count"]) == ("ecs", 11, 11)
+    # unnamed members fall back to their ENI id; the label lists the first few
+    assert g["name"] == "11 × ECS task: eni-00000ecs00, eni-00000ecs01, eni-00000ecs02, …"
     assert g["id"] == f"group:{SB}:ecs"
     assert [m["ips"][0] for m in g["members"]] == [f"10.0.4.{10 + n}" for n in range(11)]
     assert all(m["kind"] == "resource" for m in g["members"])

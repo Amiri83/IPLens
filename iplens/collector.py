@@ -39,6 +39,16 @@ def _name_tag(tags: Iterable[dict[str, str]] | None) -> str:
     return ""
 
 
+def tag_pairs(tags: Iterable[dict[str, str]] | None) -> list[tuple[str, str]]:
+    """``(key, value)`` pairs of an AWS tag list (``Key``/``Value`` or ECS ``key``/``value``)."""
+    out: dict[str, str] = {}
+    for t in tags or []:
+        key = t.get("Key", t.get("key"))
+        if key:
+            out[str(key)[:128]] = str(t.get("Value", t.get("value")) or "")[:256]
+    return sorted(out.items())
+
+
 def _paginate(client: Any, op: str, key: str, **kwargs: Any) -> list[Any]:
     out: list[Any] = []
     for page in client.get_paginator(op).paginate(**kwargs):
@@ -78,6 +88,8 @@ class EcsData:
 # DescribeServices / DescribeTasks batch limits.
 _ECS_SERVICE_BATCH = 10
 _ECS_TASK_BATCH = 100
+# elbv2 DescribeTags limit.
+_LB_TAG_BATCH = 20
 
 
 @dataclass
@@ -162,6 +174,7 @@ def _ecs_service_row(cluster: str, svc: dict[str, Any]) -> dict[str, Any]:
         "desired_count": svc.get("desiredCount"),
         "running_count": svc.get("runningCount"),
         "last_deployment": last,
+        "tags": tag_pairs(svc.get("tags")),
         # (target group ARN, classic load balancer name); either may be "".
         "load_balancers": [
             (lb.get("targetGroupArn") or "", lb.get("loadBalancerName") or "")
@@ -278,8 +291,23 @@ class Collector:
             lambda: _paginate(ec2, "describe_security_groups", "SecurityGroups"),
         )
         ecs = self._collect_ecs(result)
+        lb_tags = self._collect_lb_tags(result, lbs)
+        lambda_tags = self._collect_lambda_tags(result, lambdas)
 
         lambda_index = lambda_eni_index(lambdas)
+        # (resource_type, resource_id, key, value) for every tagged ENI-owning resource.
+        tag_rows: list[tuple[str, str, str, str]] = []
+        for e in enis:
+            tag_rows += [("eni", e["NetworkInterfaceId"], *kv) for kv in tag_pairs(e.get("TagSet"))]
+        for ep in endpoints:
+            tag_rows += [("endpoint", ep["VpcEndpointId"], *kv) for kv in tag_pairs(ep.get("Tags"))]
+        for g in security_groups:
+            tag_rows += [("sg", g["GroupId"], *kv) for kv in tag_pairs(g.get("Tags"))]
+        for svc in ecs.services:
+            ref = f"{svc['cluster']}/{svc['service']}"
+            tag_rows += [("ecs_service", ref, *kv) for kv in svc["tags"]]
+        tag_rows += [("lb", name, *kv) for name, pairs in lb_tags.items() for kv in pairs]
+        tag_rows += [("lambda", name, *kv) for name, pairs in lambda_tags.items() for kv in pairs]
 
         with closing(self.db_path) as conn:
             for v in vpcs:
@@ -490,6 +518,23 @@ class Collector:
                     "ip_protocol, from_port, to_port) VALUES(?,?,?,?,?,?)",
                     (snap_id, *row),
                 )
+            for g in security_groups:
+                conn.execute(
+                    "INSERT OR IGNORE INTO security_groups(snapshot_id, group_id, name, "
+                    "group_name, vpc_id) VALUES(?,?,?,?,?)",
+                    (
+                        snap_id,
+                        g["GroupId"],
+                        _name_tag(g.get("Tags")),
+                        g.get("GroupName") or "",
+                        g.get("VpcId"),
+                    ),
+                )
+            conn.executemany(
+                "INSERT OR IGNORE INTO resource_tags(snapshot_id, resource_type, resource_id, "
+                "key, value) VALUES(?,?,?,?,?)",
+                [(snap_id, *row) for row in tag_rows],
+            )
             conn.execute(
                 "UPDATE snapshots SET status='ok', account_id=?, account_alias=?, warnings=? "
                 "WHERE id=?",
@@ -549,6 +594,48 @@ class Collector:
         )
         return data
 
+    def _collect_lb_tags(
+        self, result: CollectResult, lbs: list[Any]
+    ) -> dict[str, list[tuple[str, str]]]:
+        """Optional: load balancer name -> tags (DescribeTags, 20 ARNs per call)."""
+        names = {lb["LoadBalancerArn"]: lb["LoadBalancerName"] for lb in lbs}
+        if not names:
+            return {}
+        elbv2 = self.gw.client("elbv2")
+
+        def fetch() -> list[tuple[str, list[tuple[str, str]]]]:
+            out = []
+            for batch in _chunks(sorted(names), _LB_TAG_BATCH):
+                for d in elbv2.describe_tags(ResourceArns=batch).get("TagDescriptions", []):
+                    if d.get("ResourceArn") in names:
+                        out.append((names[d["ResourceArn"]], tag_pairs(d.get("Tags"))))
+            return out
+
+        return dict(self._optional(result, "elasticloadbalancing:DescribeTags", fetch))
+
+    def _collect_lambda_tags(
+        self, result: CollectResult, functions: list[Any]
+    ) -> dict[str, list[tuple[str, str]]]:
+        """Optional: function name -> tags (ListTags) for VPC-attached functions only."""
+        in_vpc = [
+            f
+            for f in functions
+            if f.get("FunctionArn") and (f.get("VpcConfig") or {}).get("SubnetIds")
+        ]
+        if not in_vpc:
+            return {}
+        lam = self.gw.client("lambda")
+
+        def fetch() -> list[tuple[str, list[tuple[str, str]]]]:
+            out = []
+            for fn in in_vpc:
+                tags = lam.list_tags(Resource=fn["FunctionArn"]).get("Tags") or {}
+                pairs = tag_pairs({"Key": k, "Value": v} for k, v in tags.items())
+                out.append((fn["FunctionName"], pairs))
+            return out
+
+        return dict(self._optional(result, "lambda:ListTags", fetch))
+
     def _collect_ecs(self, result: CollectResult) -> EcsData:
         """Optional ECS enrichment: map awsvpc task ENIs to cluster + service.
 
@@ -564,7 +651,9 @@ class Collector:
                 cluster = _arn_name(cluster_arn)
                 svc_arns = _paginate(ecs, "list_services", "serviceArns", cluster=cluster_arn)
                 for batch in _chunks(svc_arns, _ECS_SERVICE_BATCH):
-                    resp = ecs.describe_services(cluster=cluster_arn, services=batch)
+                    resp = ecs.describe_services(
+                        cluster=cluster_arn, services=batch, include=["TAGS"]
+                    )
                     for svc in resp.get("services", []):
                         data.services.append(_ecs_service_row(cluster, svc))
                 task_arns = _paginate(ecs, "list_tasks", "taskArns", cluster=cluster_arn)

@@ -26,7 +26,7 @@ from flask import (
 )
 from markupsafe import Markup
 
-from . import diagram, queries, viewstate
+from . import diagram, queries, terraform, viewstate
 from . import rules as rules_mod
 from . import scope as scope_mod
 from . import suggestions as sugg_mod
@@ -67,6 +67,9 @@ HISTORY_ROWS = 50
 OUT_OF_SCOPE = "This resource is outside the active scope."
 # DNS-rebinding protection: only these Host header names are served.
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+# Visual page "Group by" choices (kept in the URL like the edge filter).
+GROUP_BY = {"": "nothing", "sg": "security group", "tag": "tag", "tf": "Terraform root"}
 
 
 def host_allowed(host: str, port: int | None) -> bool:
@@ -167,7 +170,8 @@ def create_app(
         TESTING=testing,
         SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_HTTPONLY=True,
-        MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+        # Terraform state uploads can be large; everything else is far smaller.
+        MAX_CONTENT_LENGTH=MAX_UPLOAD_BYTES,
     )
     app.extensions["iplens"] = {
         "paths": paths,
@@ -504,16 +508,20 @@ def _register(app: Flask) -> None:
             owner=owner if owner in OWNER_TYPES else "",
             state=state if state in ("used", "idle") else "",
             q=a.get("q", "").strip(),
+            tag_key=a.get("tag_key", "").strip()[:128],
+            tag_value=a.get("tag_value", "").strip()[:256],
+            tf=a.get("tf", "").strip()[: terraform.MAX_ROOT_NAME],
         )
 
     @app.get("/ips")
     def ips():
         snap = _snapshot_or_none()
         flt = _ip_filter()
-        rows, tree = [], []
+        rows, tree, keys = [], [], []
         if snap:
             rows = queries.ip_list(_db(), snap["id"], flt, _scope())
             tree = queries.vpc_tree(_db(), snap["id"], _scope())
+            keys = queries.tag_keys(_db(), snap["id"])
         return render_template(
             "ips.html",
             snap=snap,
@@ -521,6 +529,10 @@ def _register(app: Flask) -> None:
             f=flt,
             tree=tree,
             owner_types=OWNER_TYPES,
+            tag_keys=keys,
+            tf_roots=[r["name"] for r in terraform.list_roots(_db())],
+            tf_managed=queries.TF_MANAGED,
+            tf_unmanaged=queries.TF_UNMANAGED,
             type_label=lambda r: queries.resource_type_label(r, OWNER_LABELS),
         )
 
@@ -555,6 +567,7 @@ def _register(app: Flask) -> None:
             vpc = tree[0].vpc_id
         ref = _active_ref()
         prefs = viewstate.get_prefs(_db(), ref) if ref is not None else viewstate.DEFAULT_PREFS
+        group_by = request.args.get("group", "")
         return render_template(
             "visual.html",
             snap=snap,
@@ -567,6 +580,9 @@ def _register(app: Flask) -> None:
             edges_on=_edge_types(DEFAULT_EDGE_TYPES),
             prefs=prefs,
             short_name_max=SHORT_NAME_MAX,
+            group_by_choices=GROUP_BY,
+            group_by=group_by if group_by in GROUP_BY else "",
+            group_tag=request.args.get("tag", "")[:128],
             positions=viewstate.get_layout(_db(), ref, vpc) if ref is not None and vpc else {},
             legend_icons=_legend_icons(),
         )
@@ -905,7 +921,94 @@ def _register(app: Flask) -> None:
             s=_store().load(),
             accounts=_account_choices(),
             default_log_dir=_paths().default_log_dir,
+            tf_roots=terraform.list_roots(_db()),
+            tf_types=sorted(terraform.MANAGED_TYPES),
         )
+
+    # -- Terraform state (read-only; only ids / addresses / types are kept) ----------
+
+    def _tf_flash_loaded(name: str, count: int) -> None:
+        log.info("terraform root loaded: %s (%d resource id(s))", name, count)
+        flash(f"Terraform root '{name}': {count} resource id(s) loaded", "ok")
+
+    @app.post("/settings/terraform")
+    def terraform_add():
+        f = request.form
+        uploads = [u for u in request.files.getlist("files") if u and u.filename]
+        path = f.get("path", "").strip()
+        name = f.get("name", "").strip()
+        if not uploads and not path:
+            flash("Choose a state file to upload or enter a local path.", "error")
+            return redirect(url_for("settings_page"))
+        if uploads and path:
+            flash("Upload files or enter a path, not both.", "error")
+            return redirect(url_for("settings_page"))
+        if name and len(uploads) > 1:
+            flash(
+                "A root name applies to one file; leave it empty to name roots after files.",
+                "error",
+            )
+            return redirect(url_for("settings_page"))
+        # Parse everything first: nothing is stored unless every file is valid.
+        loaded: list[tuple[str, list[terraform.TfResource], str, str]] = []
+        try:
+            if path:
+                resolved, resources = terraform.read_state_file(path)
+                root = terraform.validate_root_name(
+                    name or terraform.root_name_from_filename(resolved)
+                )
+                loaded.append((root, resources, resolved, resolved))
+            for u in uploads:
+                resources = terraform.parse_state(u.read(terraform.MAX_STATE_BYTES + 1))
+                root = terraform.validate_root_name(
+                    name or terraform.root_name_from_filename(u.filename or "")
+                )
+                loaded.append((root, resources, Path(u.filename or "").name, ""))
+        except (ValueError, OSError) as exc:
+            # Messages come from the parser / file system, never from file contents.
+            msg = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            flash(f"Terraform state not loaded: {msg}", "error")
+            return redirect(url_for("settings_page"))
+        with closing(_paths().db_path) as conn:
+            for root, resources, source, source_path in loaded:
+                terraform.save_root(conn, root, resources, source=source, source_path=source_path)
+        for root, resources, _s, _p in loaded:
+            _tf_flash_loaded(root, len(resources))
+        return redirect(url_for("settings_page"))
+
+    @app.post("/settings/terraform/<int:root_id>/reload")
+    def terraform_reload(root_id: int):
+        root = terraform.get_root(_db(), root_id)
+        if root is None:
+            abort(404)
+        if not root["source_path"]:
+            flash("Uploaded roots are refreshed by uploading the file again.", "error")
+            return redirect(url_for("settings_page"))
+        try:
+            _resolved, resources = terraform.read_state_file(root["source_path"])
+        except (ValueError, OSError) as exc:
+            msg = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            flash(f"Terraform state not reloaded: {msg}", "error")
+            return redirect(url_for("settings_page"))
+        with closing(_paths().db_path) as conn:
+            terraform.save_root(
+                conn,
+                root["name"],
+                resources,
+                source=root["source"],
+                source_path=root["source_path"],
+            )
+        _tf_flash_loaded(root["name"], len(resources))
+        return redirect(url_for("settings_page"))
+
+    @app.post("/settings/terraform/<int:root_id>/delete")
+    def terraform_delete(root_id: int):
+        with closing(_paths().db_path) as conn:
+            if not terraform.delete_root(conn, root_id):
+                abort(404)
+        log.info("terraform root removed: id=%s", root_id)
+        flash("Terraform root removed (the state file itself is never touched)", "ok")
+        return redirect(url_for("settings_page"))
 
     @app.post("/settings")
     def settings_save():

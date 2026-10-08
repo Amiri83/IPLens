@@ -129,6 +129,9 @@ label.edge-filter { display: inline-flex; align-items: center; gap: .35rem; marg
 .box-swatch { display: inline-block; width: 26px; height: 16px; }
 .box-swatch.box-vpc { border: 2px solid #8c4fff; background: #f7f3ff; }
 .box-swatch.box-subnet { border: 1.5px solid #7aa116; background: #fff; }
+.box-swatch.box-ctx { border: 1.5px dashed #5b6573; border-radius: 4px; }
+.tag { display: inline-block; padding: 0 .35rem; border-radius: 4px; margin: 1px 0;
+       background: var(--badge-bg); color: var(--badge-fg); white-space: nowrap; }
 .node-swatch { display: inline-block; width: 18px; height: 18px; border-radius: 4px; }
 .node-swatch.node-idle { border: 3px solid #e8a33a; }
 .node-swatch.node-group { border: 3px double #2457c5; }

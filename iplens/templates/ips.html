@@ -32,6 +32,20 @@
       <option value="used" {{ 'selected' if f.state == 'used' }}>attached</option>
       <option value="idle" {{ 'selected' if f.state == 'idle' }}>idle ENI</option>
     </select></div>
+  <div><label for="tag_key">Tag</label>
+    <select id="tag_key" name="tag_key">
+      <option value="">any</option>
+      {% for k in tag_keys %}<option value="{{ k }}" {{ 'selected' if k == f.tag_key }}>{{ k }}</option>{% endfor %}
+      {% if f.tag_key and f.tag_key not in tag_keys %}<option value="{{ f.tag_key }}" selected>{{ f.tag_key }}</option>{% endif %}
+    </select>
+    <input id="tag_value" name="tag_value" value="{{ f.tag_value }}" placeholder="value (any)" size="12" aria-label="Tag value"></div>
+  <div><label for="tf">Terraform</label>
+    <select id="tf" name="tf">
+      <option value="">all</option>
+      <option value="{{ tf_managed }}" {{ 'selected' if f.tf == tf_managed }}>managed (any root)</option>
+      <option value="{{ tf_unmanaged }}" {{ 'selected' if f.tf == tf_unmanaged }}>unmanaged (no root)</option>
+      {% for r in tf_roots %}<option value="{{ r }}" {{ 'selected' if r == f.tf }}>root: {{ r }}</option>{% endfor %}
+    </select></div>
   <div><label for="q">Search</label>
     <input id="q" name="q" value="{{ f.q }}" placeholder="IP, name, ENI, subnet, VPC, description…" size="36"></div>
   <div class="row" style="gap: .5rem">
@@ -42,7 +56,7 @@
 </form>
 <p class="muted">{{ rows | length }} IP(s) · snapshot #{{ snap.id }} · sorted by address</p>
 <table class="ip-list">
-  <thead><tr><th>IP</th><th>Subnet</th><th>VPC</th><th>Resource type</th><th>Resource name / ref</th><th>ENI</th><th>Status</th></tr></thead>
+  <thead><tr><th>IP</th><th>Subnet</th><th>VPC</th><th>Resource type</th><th>Resource name / ref</th><th>ENI</th><th>Status</th><th>Tags</th><th>Terraform</th></tr></thead>
   <tbody>
   {% for r in rows %}
     <tr>
@@ -57,9 +71,12 @@
         {% elif r.owner_ref and r.owner_ref != r.resource_name %}<div class="muted mono">{{ r.owner_ref }}</div>{% endif %}</td>
       <td class="mono"><a href="{{ url_for('eni', eni_id=r.eni_id) }}">{{ r.eni_id }}</a></td>
       <td><span class="badge {{ 'warn' if r.status == 'available' else '' }}">{{ r.status }}</span></td>
+      <td class="tags">{% for k, v in r.tags.items() %}<span class="tag mono small">{{ k }}={{ v }}</span> {% endfor %}</td>
+      <td class="small">{% for m in r.tf %}<div>managed by <b>{{ m.root }}</b>: <span class="mono">{{ m.address }}</span></div>
+        {% else %}{% if tf_roots %}<span class="muted">unmanaged</span>{% endif %}{% endfor %}</td>
     </tr>
   {% else %}
-    <tr><td colspan="7" class="muted">No matches</td></tr>
+    <tr><td colspan="9" class="muted">No matches</td></tr>
   {% endfor %}
   </tbody>
 </table>

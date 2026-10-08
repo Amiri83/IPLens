@@ -376,6 +376,9 @@ def test_visual_data_endpoint(client, seeded):
         "edges",
         "edge_types",
         "edges_truncated",
+        "sg_names",
+        "tag_keys",
+        "tf_roots",
     }
     assert data["vpcs"] == [{"vpc_id": VPC, "name": "example-vpc"}]
     vpc = data["vpc"]

@@ -27,6 +27,12 @@ _COLUMNS: list[tuple[str, int, Any]] = [
     ("ENI ID", 24, lambda r, _l: r["eni_id"]),
     ("Status", 12, lambda r, _l: r["status"] or ""),
     ("Primary", 9, lambda r, _l: "yes" if r["is_primary"] else "no"),
+    ("Tags", 40, lambda r, _l: "; ".join(f"{k}={v}" for k, v in (r.get("tags") or {}).items())),
+    (
+        "Terraform",
+        40,
+        lambda r, _l: "; ".join(f"{m['root']}: {m['address']}" for m in r.get("tf") or []),
+    ),
 ]
 HEADERS = [c[0] for c in _COLUMNS]
 
