@@ -404,13 +404,22 @@ def test_visual_data_endpoint(client, seeded):
     assert client.get("/visual/data.json").get_json()["vpc"]["vpc_id"] == VPC
     page = client.get("/visual").data.decode()
     assert "vendor/cytoscape.min.js" in page and "/visual/data.json?vpc=" in page
+    assert "vendor/dagre.min.js" in page
     assert "cdn" not in page.lower()
 
     data = client.get(f"/visual/data.json?vpc={VPC}").get_json()
-    assert set(data) == {"snapshot_id", "vpcs", "vpc", "icons"}
+    assert set(data) == {
+        "snapshot_id",
+        "vpcs",
+        "vpc",
+        "icons",
+        "edges",
+        "edge_types",
+        "edges_truncated",
+    }
     assert data["vpcs"] == [{"vpc_id": VPC, "name": "example-vpc"}]
     vpc = data["vpc"]
-    assert set(vpc) == {"vpc_id", "name", "cidrs", "subnets"}
+    assert set(vpc) == {"vpc_id", "name", "label_name", "label_cidrs", "cidrs", "subnets"}
     (subnet,) = vpc["subnets"]
     assert subnet["subnet_id"] == SA and subnet["cidr"] == "10.0.1.0/24"
     assert (subnet["used"], subnet["idle"], subnet["free"]) == (3, 1, 256 - 5 - 4)
@@ -440,6 +449,59 @@ def test_visual_assets_are_vendored(client):
     resp = client.get("/static/vendor/cytoscape.min.js")
     assert resp.status_code == 200 and b"Cytoscape" in resp.data
     resp.close()
+    resp = client.get("/static/vendor/dagre.min.js")
+    assert resp.status_code == 200 and b"graphlib" in resp.data
+    resp.close()
+
+
+def _seed_edges(app, snapshot_builder):
+    b = snapshot_builder(_db(app))
+    b.vpc(VPC, "10.0.0.0/16").subnet(SA, VPC, "10.0.1.0/24")
+    b.eni(
+        "eni-00000alb0a",
+        SA,
+        ["10.0.1.5"],
+        owner_type="elb",
+        owner_ref="example-alb",
+        sgs=("sg-0000alb",),
+    )
+    b.eni(
+        "eni-00000web01",
+        SA,
+        ["10.0.1.10"],
+        owner_ref="i-0example0001",
+        instance_id="i-0example0001",
+        sgs=("sg-0000web",),
+    )
+    b.lb_target("example-alb", "example-tg", "instance", "i-0example0001", 80)
+    b.sg_ref("sg-0000web", "ingress", "sg-0000alb", "tcp/80")
+    return b
+
+
+def test_visual_data_edges_filter(app, client, snapshot_builder):
+    _seed_edges(app, snapshot_builder)
+    every = client.get("/visual/data.json").get_json()
+    assert sorted(e["type"] for e in every["edges"]) == ["sg", "targets"]
+    only_sg = client.get("/visual/data.json?edges=&edges=sg").get_json()
+    assert [e["type"] for e in only_sg["edges"]] == ["sg"]
+    assert {t["type"]: t["count"] for t in only_sg["edge_types"]} == {
+        "targets": 1,
+        "ecs_lb": 0,
+        "sg": 1,
+    }
+    assert client.get("/visual/data.json?edges=").get_json()["edges"] == []
+
+
+def test_visual_page_edge_toggles(app, client, snapshot_builder):
+    _seed_edges(app, snapshot_builder)
+    page = client.get("/visual").data.decode()
+    for etype in ("targets", "ecs_lb", "sg"):
+        assert f'name="edges" value="{etype}" checked' in page
+    assert '<input type="hidden" name="edges" value="">' in page
+    assert 'id="layout"' in page and 'value="dagre"' in page
+    page = client.get(f"/visual?vpc={VPC}&edges=&edges=sg").data.decode()
+    assert 'name="edges" value="sg" checked' in page
+    assert 'name="edges" value="targets" >' in page  # unticked
 
 
 # -- account identity ----------------------------------------------------------

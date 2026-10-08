@@ -112,6 +112,7 @@ class SnapshotBuilder:
         description: str = "",
         requester_managed: bool = False,
         name: str = "",
+        instance_id: str | None = None,
     ) -> SnapshotBuilder:
         vpc_id = self._subnet_vpc[subnet_id]
         with closing(self.db_path) as conn:
@@ -119,7 +120,7 @@ class SnapshotBuilder:
                 "INSERT INTO enis(snapshot_id, eni_id, subnet_id, vpc_id, az, status, "
                 "interface_type, requester_id, requester_managed, description, instance_id, "
                 "security_groups, owner_type, owner_ref, name) "
-                "VALUES(?,?,?,?,?,?,'interface',NULL,?,?,NULL,?,?,?,?)",
+                "VALUES(?,?,?,?,?,?,'interface',NULL,?,?,?,?,?,?,?)",
                 (
                     self.id,
                     eni_id,
@@ -129,6 +130,7 @@ class SnapshotBuilder:
                     status,
                     int(requester_managed),
                     description,
+                    instance_id,
                     json.dumps(sorted(sgs)),
                     owner_type,
                     owner_ref,
@@ -225,6 +227,39 @@ class SnapshotBuilder:
                     "VALUES(?,?,?,?,?)",
                     (self.id, eni_id, cluster, service, f"0example{i:04d}"),
                 )
+        return self
+
+    def lb_target(
+        self, lb_name: str, target_group: str, target_type: str, target_id: str, port: int = 0
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO lb_targets(snapshot_id, lb_name, target_group, target_type, "
+                "target_id, port) VALUES(?,?,?,?,?,?)",
+                (self.id, lb_name, target_group, target_type, target_id, port),
+            )
+        return self
+
+    def ecs_service_lb(
+        self, cluster: str, service: str, lb_name: str, target_group: str = ""
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO ecs_service_lbs(snapshot_id, cluster, service, lb_name, "
+                "target_group) VALUES(?,?,?,?,?)",
+                (self.id, cluster, service, lb_name, target_group),
+            )
+        return self
+
+    def sg_ref(
+        self, group_id: str, direction: str, ref_group_id: str, ports: str = "tcp/443"
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO sg_refs(snapshot_id, group_id, direction, ref_group_id, ports) "
+                "VALUES(?,?,?,?,?)",
+                (self.id, group_id, direction, ref_group_id, ports),
+            )
         return self
 
 

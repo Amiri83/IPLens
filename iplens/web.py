@@ -38,6 +38,7 @@ from .db import closing, connect, init_db
 from .export import XLSX_MIMETYPE, ips_to_xlsx
 from .logging_setup import LEVELS, configure_logging, read_log
 from .settings import AUTH_MODES, REGIONS, Settings, SettingsStore
+from .visual import EDGE_TYPE_LABELS, EDGE_TYPES, parse_edge_types
 
 log = logging.getLogger(__name__)
 
@@ -345,6 +346,11 @@ def _register(app: Flask) -> None:
 
     # -- visual --------------------------------------------------------------------
 
+    def _edge_types() -> tuple[str, ...]:
+        # Absent means every edge type; the page form always sends an empty
+        # "edges" value so that unticking every box is distinguishable.
+        return parse_edge_types(request.args.getlist("edges") if "edges" in request.args else None)
+
     @app.get("/visual")
     def visual():
         snap = _snapshot_or_none()
@@ -352,7 +358,15 @@ def _register(app: Flask) -> None:
         vpc = request.args.get("vpc", "")
         if tree and vpc not in {v.vpc_id for v in tree}:
             vpc = tree[0].vpc_id
-        return render_template("visual.html", snap=snap, tree=tree, vpc=vpc)
+        return render_template(
+            "visual.html",
+            snap=snap,
+            tree=tree,
+            vpc=vpc,
+            edge_types=EDGE_TYPES,
+            edge_labels=EDGE_TYPE_LABELS,
+            edges_on=_edge_types(),
+        )
 
     @app.get("/visual/data.json")
     def visual_data():
@@ -360,7 +374,7 @@ def _register(app: Flask) -> None:
         if not snap:
             return jsonify({"snapshot_id": None, "vpcs": [], "vpc": None})
         data = queries.visual_data(
-            _db(), snap["id"], request.args.get("vpc", "").strip(), OWNER_LABELS
+            _db(), snap["id"], request.args.get("vpc", "").strip(), OWNER_LABELS, _edge_types()
         )
         if data is None:
             abort(404)

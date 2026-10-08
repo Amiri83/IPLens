@@ -125,6 +125,38 @@ CREATE TABLE IF NOT EXISTS ecs_task_enis (
     PRIMARY KEY (snapshot_id, eni_id)
 );
 
+-- Registered load balancer targets. target_id is an instance id, an IP, a Lambda
+-- function name or an ALB name (never a full ARN).
+CREATE TABLE IF NOT EXISTS lb_targets (
+    snapshot_id  INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    lb_name      TEXT NOT NULL,
+    target_group TEXT NOT NULL,
+    target_type  TEXT NOT NULL,     -- instance | ip | lambda | alb
+    target_id    TEXT NOT NULL,
+    port         INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (snapshot_id, lb_name, target_group, target_id, port)
+);
+
+-- Load balancers an ECS service forwards through (from the service's loadBalancers).
+CREATE TABLE IF NOT EXISTS ecs_service_lbs (
+    snapshot_id  INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    cluster      TEXT NOT NULL,
+    service      TEXT NOT NULL,
+    lb_name      TEXT NOT NULL,
+    target_group TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (snapshot_id, cluster, service, lb_name, target_group)
+);
+
+-- Security group rules that reference another security group.
+CREATE TABLE IF NOT EXISTS sg_refs (
+    snapshot_id  INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    group_id     TEXT NOT NULL,
+    direction    TEXT NOT NULL,     -- ingress | egress
+    ref_group_id TEXT NOT NULL,
+    ports        TEXT NOT NULL,     -- e.g. "tcp/443", "tcp/8000-8100", "all"
+    PRIMARY KEY (snapshot_id, group_id, direction, ref_group_id, ports)
+);
+
 CREATE TABLE IF NOT EXISTS rules (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,

@@ -100,6 +100,22 @@ table.ip-list td .muted { font-size: 12px; }
 /* visual diagram */
 #cy { height: 72vh; min-height: 420px; padding: 0; overflow: hidden; }
 .visual-controls { align-items: center; }
+.cy-wrap { position: relative; }
+.cy-tip { position: absolute; z-index: 5; max-width: 420px; pointer-events: none;
+          background: var(--nav-bg); color: var(--nav-fg-active); border-radius: 4px;
+          padding: .35rem .55rem; font-size: 12px; white-space: pre-wrap; word-break: break-word;
+          box-shadow: 0 2px 8px rgba(0, 0, 0, .2); }
+.cy-tip[hidden] { display: none; }
+fieldset.edge-filters { border: 1px solid var(--line); border-radius: 5px; margin: 0;
+                        padding: .2rem .7rem .4rem; display: flex; flex-wrap: wrap; gap: .2rem 1rem; }
+fieldset.edge-filters legend { font-weight: 600; padding: 0 .3rem; }
+label.edge-filter { display: inline-flex; align-items: center; gap: .35rem; margin: 0;
+                    font-weight: 400; cursor: pointer; }
+/* Line samples matching the diagram edge styles in visual.js. */
+.edge-swatch { display: inline-block; width: 26px; height: 0; border-top: 2px solid; }
+.edge-swatch.edge-targets { border-color: #2457c5; }
+.edge-swatch.edge-ecs_lb { border-color: #2f8f4e; }
+.edge-swatch.edge-sg { border-top: 2px dashed #8a94a3; }
 
 .log-ERROR td, .log-CRITICAL td { background: #fdf0ee; }
 .log-WARNING td { background: #fdf8ec; }

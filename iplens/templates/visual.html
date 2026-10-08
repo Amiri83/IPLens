@@ -7,10 +7,15 @@
 {% elif not tree %}
   <div class="card muted">No VPCs found in this snapshot.</div>
 {% else %}
-<form method="get" action="{{ url_for('visual') }}" class="card row visual-controls">
+<form method="get" action="{{ url_for('visual') }}" class="card row visual-controls" id="visual-form">
   <div><label for="vpc">VPC</label>
     <select id="vpc" name="vpc" onchange="this.form.submit()">
       {% for v in tree %}<option value="{{ v.vpc_id }}" {{ 'selected' if v.vpc_id == vpc }}>{{ v.vpc_id }}{% if v.name %} · {{ v.name }}{% endif %} ({{ v.cidrs | join(', ') }})</option>{% endfor %}
+    </select></div>
+  <div><label for="layout">Layout</label>
+    <select id="layout">
+      <option value="dagre" selected>Hierarchy (dagre)</option>
+      <option value="grid">Grid</option>
     </select></div>
   <div class="row" style="gap: .4rem">
     <button type="button" class="secondary" id="zoom-in" title="Zoom in">+</button>
@@ -19,18 +24,33 @@
     <button type="button" class="secondary" id="expand-all">Expand groups</button>
     <button type="button" class="secondary" id="collapse-all">Collapse groups</button>
   </div>
-  <div class="muted" style="flex: 1">
-    Scroll to zoom, drag to pan. Click a resource to open its ENI; click a group
-    (more than 10 resources of one type in a subnet) to expand or collapse it.
+  <fieldset class="edge-filters">
+    <legend>Connections</legend>
+    {# Always sent, so "no box ticked" survives a VPC change instead of meaning "all". #}
+    <input type="hidden" name="edges" value="">
+    {% for t in edge_types %}
+    <label class="edge-filter"><input type="checkbox" name="edges" value="{{ t }}" {{ 'checked' if t in edges_on }}>
+      <i class="edge-swatch edge-{{ t }}"></i> {{ edge_labels[t] }} <span class="muted" data-edge-count="{{ t }}"></span></label>
+    {% endfor %}
+  </fieldset>
+  <div class="muted" style="flex: 1 1 100%">
+    Scroll to zoom, drag to pan, hover for full names. Click a resource to open its ENI; click a
+    group (more than 10 resources of one type in a subnet) to expand or collapse it. Solid lines are
+    load balancer targets and ECS services; dashed lines are security group references.
   </div>
 </form>
-<div id="cy" class="card"
-     data-src="{{ url_for('visual_data', vpc=vpc) }}"
-     data-icons="{{ url_for('static', filename='icons/aws/') }}"
-     data-eni-url="{{ url_for('eni', eni_id='__ENI__') }}"></div>
+<div class="cy-wrap">
+  <div id="cy" class="card"
+       data-src="{{ url_for('visual_data', vpc=vpc) }}"
+       data-icons="{{ url_for('static', filename='icons/aws/') }}"
+       data-eni-url="{{ url_for('eni', eni_id='__ENI__') }}"></div>
+  <div id="cy-tip" class="cy-tip" role="tooltip" hidden></div>
+</div>
 <p class="muted" id="cy-status"></p>
-<p class="muted small">Icons: AWS Architecture Icons, © Amazon Web Services, Inc. or its affiliates.</p>
+<p class="muted small">Icons: AWS Architecture Icons, © Amazon Web Services, Inc. or its affiliates.
+  Layout: dagre (MIT).</p>
 <script src="{{ url_for('static', filename='vendor/cytoscape.min.js') }}"></script>
+<script src="{{ url_for('static', filename='vendor/dagre.min.js') }}"></script>
 <script src="{{ url_for('static', filename='visual.js') }}"></script>
 {% endif %}
 {% endblock %}

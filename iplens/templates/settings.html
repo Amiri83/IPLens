@@ -61,7 +61,9 @@
   IPLens only performs read-only AWS calls (Describe*/List*/Get*). Minimal IAM permissions:
   <span class="mono">ec2:DescribeVpcs, ec2:DescribeSubnets, ec2:DescribeNetworkInterfaces,
   ec2:DescribeVpcEndpoints, lambda:ListFunctions, elasticloadbalancing:DescribeLoadBalancers</span>.
-  Optional: <span class="mono">iam:ListAccountAliases</span> (account name in the header).
+  Optional: <span class="mono">iam:ListAccountAliases</span> (account name in the header);
+  <span class="mono">elasticloadbalancing:DescribeTargetGroups, elasticloadbalancing:DescribeTargetHealth,
+  ec2:DescribeSecurityGroups</span> (connections on the Visual page).
 </div>
 <script>
 function showAuth() {
