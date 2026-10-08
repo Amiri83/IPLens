@@ -76,6 +76,10 @@ class AwsGateway:
         ident = self.client("sts").get_caller_identity()
         return {"account": ident.get("Account", ""), "arn": ident.get("Arn", "")}
 
+    def account_aliases(self) -> list[str]:
+        """IAM account alias (at most one per account). Needs iam:ListAccountAliases."""
+        return list(self.client("iam").list_account_aliases().get("AccountAliases", []))
+
 
 def check_connection(
     settings: Settings, factory: Callable[[Settings], AwsGateway] | None = None

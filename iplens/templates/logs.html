@@ -18,7 +18,7 @@
   <tbody>
   {% for e in entries %}
     <tr class="log-{{ e.level }}">
-      <td class="mono" style="white-space: nowrap">{{ e.ts }}</td>
+      <td class="mono" style="white-space: nowrap">{{ e.ts | localtime }}</td>
       <td>{{ e.level }}</td>
       <td class="mono">{{ e.logger }}</td>
       <td><pre class="logmsg mono">{{ e.msg }}</pre></td>

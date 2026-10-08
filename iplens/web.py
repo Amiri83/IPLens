@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from flask import (
     session,
     url_for,
 )
+from markupsafe import Markup
 
 from . import queries
 from . import rules as rules_mod
@@ -36,6 +38,7 @@ from .db import closing, connect, init_db
 from .export import XLSX_MIMETYPE, ips_to_xlsx
 from .logging_setup import LEVELS, configure_logging, read_log
 from .settings import AUTH_MODES, REGIONS, Settings, SettingsStore
+from .visual import EDGE_TYPE_LABELS, EDGE_TYPES, parse_edge_types
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +59,46 @@ def host_allowed(host: str, port: int | None) -> bool:
     if port is None:
         return not sep or host_port.isdigit()
     return host_port == str(port) if sep else port == 80
+
+
+def account_label(account_id: str | None, alias: str | None, display_name: str = "") -> str:
+    """``"<name> (<account id>)"``; the configured display name beats the IAM alias,
+    and without either only the account id is shown."""
+    name = display_name or alias or ""
+    if name and account_id:
+        return f"{name} ({account_id})"
+    return name or account_id or "unknown account"
+
+
+def utc_iso(value: Any) -> str | None:
+    """Normalise a stored timestamp to ``YYYY-MM-DDTHH:MM:SSZ``.
+
+    Snapshot times are stored timezone-aware (UTC); naive values (log file lines)
+    are in the server's local time. Returns None for empty/unparseable input.
+    """
+    if not value:
+        return None
+    try:
+        ts = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.astimezone()
+    return ts.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def local_time(value: Any) -> Markup | str:
+    """``<time>`` element that static/localtime.js re-renders in the browser's time zone.
+
+    The UTC text is only the no-JavaScript fallback; the ISO value stays in the tooltip.
+    """
+    iso = utc_iso(value)
+    if iso is None:
+        return value or ""
+    fallback = iso.replace("T", " ").removesuffix("Z") + " UTC"
+    return Markup('<time class="localtime" datetime="{0}" title="{0}">{1}</time>').format(
+        iso, fallback
+    )
 
 
 def _flask_secret(paths: AppPaths) -> bytes:
@@ -168,15 +211,26 @@ def _register(app: Flask) -> None:
 
     @app.context_processor
     def _globals() -> dict[str, Any]:
+        settings = _store().load()
+
+        def snap_label(snap: Any) -> str:
+            return account_label(
+                snap["account_id"], snap["account_alias"], settings.account_display_name
+            )
+
         return {
             "csrf_token": session.get("csrf", ""),
             "owner_labels": OWNER_LABELS,
-            "current_settings": _store().load().public_dict(),
+            "current_settings": settings.public_dict(),
+            "header_snap": _snapshot_or_none(),
+            "account_label": snap_label,
         }
 
     @app.template_filter("pct")
     def _pct(v: float) -> str:
         return f"{v:.1f}%"
+
+    app.add_template_filter(local_time, "localtime")
 
     # -- overview / collection ---------------------------------------------
 
@@ -209,8 +263,11 @@ def _register(app: Flask) -> None:
             log.exception("refresh failed")
             flash("Refresh failed. See the log for details.", "error")
             return redirect(url_for("overview"))
+        label = account_label(
+            result.account_id, result.account_alias, settings.account_display_name
+        )
         msg = (
-            f"Snapshot #{result.snapshot_id}: {result.vpcs} VPCs, {result.subnets} subnets, "
+            f"Refreshed {label} · {gw.region}: {result.vpcs} VPCs, {result.subnets} subnets, "
             f"{result.enis} ENIs, {result.ips} IPs"
         )
         flash(msg, "ok")
@@ -289,6 +346,11 @@ def _register(app: Flask) -> None:
 
     # -- visual --------------------------------------------------------------------
 
+    def _edge_types() -> tuple[str, ...]:
+        # Absent means every edge type; the page form always sends an empty
+        # "edges" value so that unticking every box is distinguishable.
+        return parse_edge_types(request.args.getlist("edges") if "edges" in request.args else None)
+
     @app.get("/visual")
     def visual():
         snap = _snapshot_or_none()
@@ -296,7 +358,15 @@ def _register(app: Flask) -> None:
         vpc = request.args.get("vpc", "")
         if tree and vpc not in {v.vpc_id for v in tree}:
             vpc = tree[0].vpc_id
-        return render_template("visual.html", snap=snap, tree=tree, vpc=vpc)
+        return render_template(
+            "visual.html",
+            snap=snap,
+            tree=tree,
+            vpc=vpc,
+            edge_types=EDGE_TYPES,
+            edge_labels=EDGE_TYPE_LABELS,
+            edges_on=_edge_types(),
+        )
 
     @app.get("/visual/data.json")
     def visual_data():
@@ -304,7 +374,7 @@ def _register(app: Flask) -> None:
         if not snap:
             return jsonify({"snapshot_id": None, "vpcs": [], "vpc": None})
         data = queries.visual_data(
-            _db(), snap["id"], request.args.get("vpc", "").strip(), OWNER_LABELS
+            _db(), snap["id"], request.args.get("vpc", "").strip(), OWNER_LABELS, _edge_types()
         )
         if data is None:
             abort(404)
@@ -481,6 +551,7 @@ def _register(app: Flask) -> None:
                 secret_access_key=f.get("secret_access_key") or None,
                 clear_secret=clear,
                 log_dir=f.get("log_dir", ""),
+                account_display_name=f.get("account_display_name", ""),
             )
         except ValueError as exc:
             flash(str(exc), "error")

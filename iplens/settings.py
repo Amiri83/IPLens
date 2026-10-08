@@ -47,6 +47,7 @@ REGIONS = (
 )
 
 _ENCRYPTED_ROW = "aws_secret_access_key_enc"
+MAX_DISPLAY_NAME = 64
 
 
 @dataclass
@@ -56,6 +57,8 @@ class Settings:
     access_key_id: str = ""
     region: str = "us-east-1"
     log_dir: str = ""
+    # Optional label for the account; overrides the IAM account alias in the UI.
+    account_display_name: str = ""
     has_secret: bool = False
     # Decrypted secret; populated only by SettingsStore.load(with_secret=True).
     secret_access_key: str = field(default="", repr=False)
@@ -68,6 +71,7 @@ class Settings:
             "access_key_id": mask_key_id(self.access_key_id),
             "region": self.region,
             "log_dir": self.log_dir,
+            "account_display_name": self.account_display_name,
             "has_secret": self.has_secret,
         }
 
@@ -98,6 +102,7 @@ class SettingsStore:
             access_key_id=raw.get("access_key_id") or "",
             region=raw.get("region") or "us-east-1",
             log_dir=raw.get("log_dir") or "",
+            account_display_name=raw.get("account_display_name") or "",
             has_secret=bool(raw.get(_ENCRYPTED_ROW)),
         )
         if with_secret and raw.get(_ENCRYPTED_ROW):
@@ -114,6 +119,7 @@ class SettingsStore:
         secret_access_key: str | None = None,
         clear_secret: bool = False,
         log_dir: str = "",
+        account_display_name: str = "",
     ) -> None:
         """Persist settings.
 
@@ -133,12 +139,16 @@ class SettingsStore:
             )
             if not access_key_id.strip() or not will_have_secret:
                 raise ValueError("access key id and secret are required for key auth")
+        account_display_name = " ".join(account_display_name.split())
+        if len(account_display_name) > MAX_DISPLAY_NAME:
+            raise ValueError(f"account display name must be at most {MAX_DISPLAY_NAME} characters")
         values = {
             "auth_mode": auth_mode,
             "region": region,
             "profile": profile.strip(),
             "access_key_id": access_key_id.strip(),
             "log_dir": log_dir.strip(),
+            "account_display_name": account_display_name,
         }
         with closing(self.db_path) as conn:
             for k, v in values.items():

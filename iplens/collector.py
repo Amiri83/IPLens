@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 @dataclass
 class CollectResult:
     snapshot_id: int
+    account_id: str = ""
+    account_alias: str = ""
     vpcs: int = 0
     subnets: int = 0
     enis: int = 0
@@ -75,6 +77,56 @@ _ECS_SERVICE_BATCH = 10
 _ECS_TASK_BATCH = 100
 
 
+@dataclass
+class TargetGroupInfo:
+    name: str
+    target_type: str
+    lb_names: list[str]
+
+
+@dataclass
+class LbTargetData:
+    groups: dict[str, TargetGroupInfo] = field(default_factory=dict)  # by target group ARN
+    # (lb_name, target_group, target_type, target_id, port)
+    targets: list[tuple[str, str, str, str, int]] = field(default_factory=list)
+
+
+def target_ref(target_type: str, target_id: str) -> str:
+    """Short, ARN-free reference for a registered target.
+
+    Lambda targets are function ARNs and ALB targets are load balancer ARNs; only
+    the function / load balancer name is kept.
+    """
+    if target_type == "lambda" and ":function:" in target_id:
+        return target_id.split(":function:", 1)[1].split(":", 1)[0]
+    if target_type == "alb" and target_id.count("/") >= 2:
+        return target_id.rsplit("/", 2)[-2]
+    return target_id
+
+
+def _sg_ports(perm: dict[str, Any]) -> str:
+    proto = str(perm.get("IpProtocol", "-1"))
+    if proto in ("-1", "all"):
+        return "all"
+    lo, hi = perm.get("FromPort"), perm.get("ToPort")
+    if lo is None or lo == -1:
+        return proto
+    return f"{proto}/{lo}" if lo == hi else f"{proto}/{lo}-{hi}"
+
+
+def sg_ref_rows(groups: Iterable[dict[str, Any]]) -> list[tuple[str, str, str, str]]:
+    """``(group_id, direction, ref_group_id, ports)`` for every rule naming another SG."""
+    out: set[tuple[str, str, str, str]] = set()
+    for g in groups:
+        for direction, key in (("ingress", "IpPermissions"), ("egress", "IpPermissionsEgress")):
+            for perm in g.get(key, []):
+                ports = _sg_ports(perm)
+                for pair in perm.get("UserIdGroupPairs", []):
+                    if pair.get("GroupId"):
+                        out.add((g["GroupId"], direction, pair["GroupId"], ports))
+    return sorted(out)
+
+
 def _ecs_service_row(cluster: str, svc: dict[str, Any]) -> dict[str, Any]:
     stamps = [
         d.get("updatedAt") or d.get("createdAt")
@@ -90,6 +142,11 @@ def _ecs_service_row(cluster: str, svc: dict[str, Any]) -> dict[str, Any]:
         "desired_count": svc.get("desiredCount"),
         "running_count": svc.get("runningCount"),
         "last_deployment": last,
+        # (target group ARN, classic load balancer name); either may be "".
+        "load_balancers": [
+            (lb.get("targetGroupArn") or "", lb.get("loadBalancerName") or "")
+            for lb in svc.get("loadBalancers", [])
+        ],
     }
 
 
@@ -155,6 +212,9 @@ class Collector:
             account_id = self.gw.caller_identity()["account"]
         except (BotoCoreError, ClientError) as exc:
             result.warnings.append(f"sts:GetCallerIdentity unavailable ({type(exc).__name__})")
+        # Display-only: without the permission the UI falls back to the account id.
+        aliases = self._optional(result, "iam:ListAccountAliases", self.gw.account_aliases)
+        account_alias = aliases[0] if aliases else ""
 
         vpcs = _paginate(ec2, "describe_vpcs", "Vpcs")
         subnets = _paginate(ec2, "describe_subnets", "Subnets")
@@ -173,6 +233,12 @@ class Collector:
             result,
             "elasticloadbalancing:DescribeLoadBalancers",
             lambda: _paginate(self.gw.client("elbv2"), "describe_load_balancers", "LoadBalancers"),
+        )
+        lb_targets = self._collect_lb_targets(result, lbs)
+        security_groups = self._optional(
+            result,
+            "ec2:DescribeSecurityGroups",
+            lambda: _paginate(ec2, "describe_security_groups", "SecurityGroups"),
         )
         ecs = self._collect_ecs(result)
 
@@ -348,11 +414,37 @@ class Collector:
                     "task_id) VALUES(?,?,?,?,?)",
                     (snap_id, eni_id, task.cluster, task.service, task.task_id),
                 )
+            for row in lb_targets.targets:
+                conn.execute(
+                    "INSERT OR IGNORE INTO lb_targets(snapshot_id, lb_name, target_group, "
+                    "target_type, target_id, port) VALUES(?,?,?,?,?,?)",
+                    (snap_id, *row),
+                )
+            for svc in ecs.services:
+                for tg_arn, classic_name in svc["load_balancers"]:
+                    tg = lb_targets.groups.get(tg_arn)
+                    pairs = [(n, tg.name) for n in tg.lb_names] if tg else []
+                    if not pairs and classic_name:
+                        pairs = [(classic_name, "")]
+                    for lb_name, tg_name in pairs:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO ecs_service_lbs(snapshot_id, cluster, "
+                            "service, lb_name, target_group) VALUES(?,?,?,?,?)",
+                            (snap_id, svc["cluster"], svc["service"], lb_name, tg_name),
+                        )
+            for row in sg_ref_rows(security_groups):
+                conn.execute(
+                    "INSERT OR IGNORE INTO sg_refs(snapshot_id, group_id, direction, "
+                    "ref_group_id, ports) VALUES(?,?,?,?,?)",
+                    (snap_id, *row),
+                )
             conn.execute(
-                "UPDATE snapshots SET status='ok', account_id=?, warnings=? WHERE id=?",
-                (account_id, json.dumps(result.warnings), snap_id),
+                "UPDATE snapshots SET status='ok', account_id=?, account_alias=?, warnings=? "
+                "WHERE id=?",
+                (account_id, account_alias, json.dumps(result.warnings), snap_id),
             )
 
+        result.account_id, result.account_alias = account_id, account_alias
         result.vpcs, result.subnets, result.enis, result.ips = (
             len(vpcs),
             len(subnets),
@@ -360,6 +452,50 @@ class Collector:
             ip_count,
         )
         return result
+
+    def _collect_lb_targets(self, result: CollectResult, lbs: list[Any]) -> LbTargetData:
+        """Optional enrichment: target groups of each load balancer and their targets.
+
+        Uses only DescribeTargetGroups and DescribeTargetHealth; a missing
+        permission records a warning and leaves the diagram without LB edges.
+        """
+        data = LbTargetData()
+        lb_names = {lb["LoadBalancerArn"]: lb["LoadBalancerName"] for lb in lbs}
+        if not lb_names:
+            return data
+        elbv2 = self.gw.client("elbv2")
+        groups = self._optional(
+            result,
+            "elasticloadbalancing:DescribeTargetGroups",
+            lambda: _paginate(elbv2, "describe_target_groups", "TargetGroups"),
+        )
+        for tg in groups:
+            names = sorted({lb_names[a] for a in tg.get("LoadBalancerArns", []) if a in lb_names})
+            if names:
+                data.groups[tg["TargetGroupArn"]] = TargetGroupInfo(
+                    name=tg.get("TargetGroupName", ""),
+                    target_type=tg.get("TargetType", "instance"),
+                    lb_names=names,
+                )
+
+        def targets() -> list[tuple[str, str, str, str, int]]:
+            rows = []
+            for arn, tg in data.groups.items():
+                resp = elbv2.describe_target_health(TargetGroupArn=arn)
+                for desc in resp.get("TargetHealthDescriptions", []):
+                    target = desc.get("Target") or {}
+                    if not target.get("Id"):
+                        continue
+                    ref = target_ref(tg.target_type, target["Id"])
+                    port = int(target.get("Port") or 0)
+                    rows.extend((lb, tg.name, tg.target_type, ref, port) for lb in tg.lb_names)
+            return rows
+
+        data.targets = self._optional(result, "elasticloadbalancing:DescribeTargetHealth", targets)
+        log.info(
+            "LB enrichment: %d target group(s), %d target(s)", len(data.groups), len(data.targets)
+        )
+        return data
 
     def _collect_ecs(self, result: CollectResult) -> EcsData:
         """Optional ECS enrichment: map awsvpc task ENIs to cluster + service.
@@ -408,7 +544,7 @@ class Collector:
         return data
 
     @staticmethod
-    def _optional(result: CollectResult, what: str, fn: Any) -> list[dict[str, Any]]:
+    def _optional(result: CollectResult, what: str, fn: Any) -> list[Any]:
         """Optional enrichment calls: missing permissions downgrade to a warning."""
         try:
             return fn()

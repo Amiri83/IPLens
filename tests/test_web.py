@@ -1,15 +1,17 @@
 import io
+from datetime import UTC, datetime
 
 import boto3
 import pytest
 from botocore.exceptions import ClientError
+from markupsafe import Markup
 from moto import mock_aws
 from openpyxl import load_workbook
 
 from iplens import queries
 from iplens.db import closing
 from iplens.rules import list_rules
-from iplens.web import create_app, host_allowed
+from iplens.web import account_label, create_app, host_allowed, local_time, utc_iso
 
 FAKE_KEY_ID = "AKIAEXAMPLEEXAMPLE00"
 FAKE_SECRET = "example/secret/value/for/tests/only/0000"
@@ -167,7 +169,10 @@ def test_test_connection_and_refresh(client):
 
     resp = _post(client, "/refresh", follow_redirects=True)
     page = resp.data.decode()
-    assert "Snapshot #1" in page and vpc_id in page and subnet_id in page
+    assert "Refreshed 123456789012 · us-east-1:" in page
+    assert vpc_id in page and subnet_id in page
+    # moto has no alias and no override is set: header shows the account id only
+    assert "<b>123456789012</b> · us-east-1" in page
 
     page = client.get("/suggestions").data.decode()
     assert "Delete detached ENI" in page
@@ -399,13 +404,22 @@ def test_visual_data_endpoint(client, seeded):
     assert client.get("/visual/data.json").get_json()["vpc"]["vpc_id"] == VPC
     page = client.get("/visual").data.decode()
     assert "vendor/cytoscape.min.js" in page and "/visual/data.json?vpc=" in page
+    assert "vendor/dagre.min.js" in page
     assert "cdn" not in page.lower()
 
     data = client.get(f"/visual/data.json?vpc={VPC}").get_json()
-    assert set(data) == {"snapshot_id", "vpcs", "vpc", "icons"}
+    assert set(data) == {
+        "snapshot_id",
+        "vpcs",
+        "vpc",
+        "icons",
+        "edges",
+        "edge_types",
+        "edges_truncated",
+    }
     assert data["vpcs"] == [{"vpc_id": VPC, "name": "example-vpc"}]
     vpc = data["vpc"]
-    assert set(vpc) == {"vpc_id", "name", "cidrs", "subnets"}
+    assert set(vpc) == {"vpc_id", "name", "label_name", "label_cidrs", "cidrs", "subnets"}
     (subnet,) = vpc["subnets"]
     assert subnet["subnet_id"] == SA and subnet["cidr"] == "10.0.1.0/24"
     assert (subnet["used"], subnet["idle"], subnet["free"]) == (3, 1, 256 - 5 - 4)
@@ -435,3 +449,180 @@ def test_visual_assets_are_vendored(client):
     resp = client.get("/static/vendor/cytoscape.min.js")
     assert resp.status_code == 200 and b"Cytoscape" in resp.data
     resp.close()
+    resp = client.get("/static/vendor/dagre.min.js")
+    assert resp.status_code == 200 and b"graphlib" in resp.data
+    resp.close()
+
+
+def _seed_edges(app, snapshot_builder):
+    b = snapshot_builder(_db(app))
+    b.vpc(VPC, "10.0.0.0/16").subnet(SA, VPC, "10.0.1.0/24")
+    b.eni(
+        "eni-00000alb0a",
+        SA,
+        ["10.0.1.5"],
+        owner_type="elb",
+        owner_ref="example-alb",
+        sgs=("sg-0000alb",),
+    )
+    b.eni(
+        "eni-00000web01",
+        SA,
+        ["10.0.1.10"],
+        owner_ref="i-0example0001",
+        instance_id="i-0example0001",
+        sgs=("sg-0000web",),
+    )
+    b.lb_target("example-alb", "example-tg", "instance", "i-0example0001", 80)
+    b.sg_ref("sg-0000web", "ingress", "sg-0000alb", "tcp/80")
+    return b
+
+
+def test_visual_data_edges_filter(app, client, snapshot_builder):
+    _seed_edges(app, snapshot_builder)
+    every = client.get("/visual/data.json").get_json()
+    assert sorted(e["type"] for e in every["edges"]) == ["sg", "targets"]
+    only_sg = client.get("/visual/data.json?edges=&edges=sg").get_json()
+    assert [e["type"] for e in only_sg["edges"]] == ["sg"]
+    assert {t["type"]: t["count"] for t in only_sg["edge_types"]} == {
+        "targets": 1,
+        "ecs_lb": 0,
+        "sg": 1,
+    }
+    assert client.get("/visual/data.json?edges=").get_json()["edges"] == []
+
+
+def test_visual_page_edge_toggles(app, client, snapshot_builder):
+    _seed_edges(app, snapshot_builder)
+    page = client.get("/visual").data.decode()
+    for etype in ("targets", "ecs_lb", "sg"):
+        assert f'name="edges" value="{etype}" checked' in page
+    assert '<input type="hidden" name="edges" value="">' in page
+    assert 'id="layout"' in page and 'value="dagre"' in page
+    page = client.get(f"/visual?vpc={VPC}&edges=&edges=sg").data.decode()
+    assert 'name="edges" value="sg" checked' in page
+    assert 'name="edges" value="targets" >' in page  # unticked
+
+
+# -- account identity ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "account_id, alias, display, expected",
+    [
+        ("123456789012", "example-alias", "", "example-alias (123456789012)"),
+        ("123456789012", "example-alias", "Example Prod", "Example Prod (123456789012)"),
+        ("123456789012", "", "", "123456789012"),
+        ("123456789012", None, "", "123456789012"),
+        ("", "", "", "unknown account"),
+    ],
+)
+def test_account_label(account_id, alias, display, expected):
+    assert account_label(account_id, alias, display) == expected
+
+
+def test_header_shows_account_id_only_without_alias(app, client, snapshot_builder):
+    snapshot_builder(_db(app), account_alias="")
+    for url in ("/", "/ips", "/settings"):
+        page = client.get(url).data.decode()
+        assert "<b>123456789012</b> · us-east-1" in page, url
+        assert "(123456789012)" not in page
+
+
+def test_header_shows_alias_and_display_name_override_wins(app, client, snapshot_builder):
+    snapshot_builder(_db(app), account_alias="example-alias")
+    page = client.get("/rules").data.decode()
+    assert "<b>example-alias (123456789012)</b> · us-east-1" in page
+
+    _post(
+        client,
+        "/settings",
+        {"auth_mode": "env", "region": "us-east-1", "account_display_name": "Example Prod"},
+    )
+    page = client.get("/").data.decode()
+    assert "<b>Example Prod (123456789012)</b> · us-east-1" in page
+    assert "example-alias" not in page
+    assert 'value="Example Prod"' in client.get("/settings").data.decode()
+
+    # clearing the override falls back to the alias again
+    _post(client, "/settings", {"auth_mode": "env", "region": "us-east-1"})
+    assert "<b>example-alias (123456789012)</b>" in client.get("/").data.decode()
+
+
+def test_recent_snapshots_table_shows_account_not_snapshot_id(app, client, snapshot_builder):
+    snapshot_builder(_db(app), account_alias="example-alias")
+    b = snapshot_builder(_db(app), "eu-west-1")
+    page = client.get("/").data.decode()
+    table = page.split("Recent snapshots", 1)[1]
+    assert "<th>#</th>" not in table and "Taken (UTC)" not in table
+    assert "<th>Account</th><th>Region</th><th>Taken</th>" in table
+    assert "<td>example-alias (123456789012)</td>" in table
+    assert '<td class="mono">eu-west-1</td>' in table
+    # the snapshot id survives only as a tooltip
+    assert f'<tr title="Snapshot #{b.id}">' in table
+    assert f"<td>{b.id}</td>" not in table
+
+
+# -- local time ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("2026-01-02T03:04:05+00:00", "2026-01-02T03:04:05Z"),
+        ("2026-01-02T05:04:05+02:00", "2026-01-02T03:04:05Z"),
+        (datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC), "2026-01-02T03:04:05Z"),
+        ("", None),
+        (None, None),
+        ("not a date", None),
+    ],
+)
+def test_utc_iso(value, expected):
+    assert utc_iso(value) == expected
+
+
+def test_utc_iso_naive_log_timestamp_is_server_local_time():
+    # Log lines carry the server's local time without an offset.
+    naive = datetime(2026, 1, 2, 3, 4, 5)
+    expected = naive.astimezone().astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert utc_iso("2026-01-02 03:04:05,123") == expected
+
+
+def test_local_time_markup_and_fallback():
+    html = str(local_time("2026-01-02T03:04:05+00:00"))
+    assert html == (
+        '<time class="localtime" datetime="2026-01-02T03:04:05Z" title="2026-01-02T03:04:05Z">'
+        "2026-01-02 03:04:05 UTC</time>"
+    )
+    # unparseable input stays a plain str, so Jinja autoescapes it
+    out = local_time("<b>bogus</b>")
+    assert out == "<b>bogus</b>" and not isinstance(out, Markup)
+
+
+def test_timestamps_rendered_for_browser_local_time(app, client, snapshot_builder):
+    snapshot_builder(_db(app), taken_at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC))
+    page = client.get("/").data.decode()
+    stamp = '<time class="localtime" datetime="2026-01-02T03:04:05Z"'
+    # header, overview card and recent-snapshots table
+    assert page.count(stamp) == 3
+    assert "updated " + stamp in page
+    assert "2026-01-02T03:04:05+00:00" not in page  # no raw stored value
+    assert '<script src="/static/localtime.js" defer></script>' in page
+
+    logs = client.get("/logs").data.decode()
+    assert '<time class="localtime" datetime="' in logs
+
+
+def test_localtime_script_formats_in_browser_time_zone(client):
+    js = client.get("/static/localtime.js").data.decode()
+    # undefined locale and no timeZone option: the browser's locale and local time zone
+    assert "new Intl.DateTimeFormat(undefined," in js
+    assert "timeZone:" not in js
+    assert 'querySelectorAll("time.localtime[datetime]")' in js
+    assert 'new Date(el.getAttribute("datetime"))' in js
+
+
+def test_nav_marks_active_page(client):
+    page = client.get("/ips").data.decode()
+    assert '<a href="/ips" class="active" aria-current="page">IP List</a>' in page
+    assert '<a href="/logs">Logs</a>' in page

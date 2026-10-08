@@ -9,7 +9,7 @@ from moto import mock_aws
 
 from iplens import queries
 from iplens.aws import AwsGateway
-from iplens.collector import Collector
+from iplens.collector import Collector, sg_ref_rows, target_ref
 from iplens.db import closing
 
 REGION = "us-east-1"
@@ -198,6 +198,52 @@ def test_optional_permissions_become_warnings(aws_env, db_path, monkeypatch):
         assert queries.latest_snapshot(conn)["id"] == result.snapshot_id
 
 
+def test_account_alias_persisted_per_snapshot(aws_env, db_path):
+    first = Collector(_gateway(), db_path).run()
+    # Setup only, outside the read-only gateway.
+    boto3.client("iam", region_name=REGION).create_account_alias(AccountAlias="example-alias")
+    second = Collector(_gateway(), db_path).run()
+
+    assert (first.account_alias, second.account_alias) == ("", "example-alias")
+    assert second.warnings == []
+    with closing(db_path) as conn:
+        rows = dict(conn.execute("SELECT id, account_alias FROM snapshots").fetchall())
+    assert rows == {first.snapshot_id: "", second.snapshot_id: "example-alias"}
+
+
+def test_account_alias_permission_denied_falls_back_to_account_id(
+    aws_env, db_path, monkeypatch, caplog
+):
+    boto3.client("iam", region_name=REGION).create_account_alias(AccountAlias="example-alias")
+    gw = _gateway()
+    real_client = gw.client
+
+    def client(service):
+        c = real_client(service)
+        if service == "iam":
+
+            def deny(**_):
+                raise ClientError(
+                    {"Error": {"Code": "AccessDenied", "Message": "no"}}, "ListAccountAliases"
+                )
+
+            c.meta.events.register("before-call.iam.ListAccountAliases", deny)
+        return c
+
+    monkeypatch.setattr(gw, "client", client)
+    with caplog.at_level("WARNING", logger="iplens"):
+        result = Collector(gw, db_path).run()
+
+    assert result.warnings == ["iam:ListAccountAliases skipped (AccessDenied)"]
+    assert "iam:ListAccountAliases skipped" in caplog.text
+    with closing(db_path) as conn:
+        snap = queries.latest_snapshot(conn)
+    assert snap["id"] == result.snapshot_id and snap["status"] == "ok"
+    assert snap["account_id"] == "123456789012"
+    assert snap["account_alias"] == ""
+    assert result.enis >= 4  # the rest of the snapshot is unaffected
+
+
 @pytest.fixture
 def moto_ecs_awsvpc(monkeypatch):
     """moto 5.2.x: ECS awsvpc run_task reads NetworkInterface.private_dns_name, which the
@@ -213,7 +259,9 @@ def moto_ecs_awsvpc(monkeypatch):
         )
 
 
-def _ecs_service_with_tasks(subnet_id: str, count: int = 2) -> None:
+def _ecs_service_with_tasks(
+    subnet_id: str, count: int = 2, load_balancers: list[dict] | None = None
+) -> None:
     ecs = boto3.client("ecs", region_name=REGION)
     ecs.create_cluster(clusterName="example-cluster")
     ecs.register_task_definition(
@@ -230,6 +278,7 @@ def _ecs_service_with_tasks(subnet_id: str, count: int = 2) -> None:
         taskDefinition="example-task",
         desiredCount=count,
         launchType="FARGATE",
+        loadBalancers=load_balancers or [],
     )
     net = {"awsvpcConfiguration": {"subnets": [subnet_id], "securityGroups": []}}
     ecs.run_task(
@@ -317,6 +366,174 @@ def test_ecs_permission_denied_is_a_warning(
         for table in ("ecs_services", "ecs_task_enis"):
             assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0  # noqa: S608
         assert conn.execute("SELECT COUNT(*) FROM enis WHERE owner_type='ecs'").fetchone()[0] == 0
+
+
+def _alb_target_groups(aws_env) -> dict[str, str]:
+    """Setup only: an instance and an IP target group behind example-alb's listener."""
+    elbv2 = boto3.client("elbv2", region_name=REGION)
+    lbs = elbv2.describe_load_balancers(Names=["example-alb"])["LoadBalancers"]
+    lb_arn = lbs[0]["LoadBalancerArn"]
+    arns = {}
+    for name, ttype in (("example-web-tg", "instance"), ("example-svc-tg", "ip")):
+        arns[name] = elbv2.create_target_group(
+            Name=name, Protocol="HTTP", Port=80, VpcId=aws_env["vpc_id"], TargetType=ttype
+        )["TargetGroups"][0]["TargetGroupArn"]
+    for port, name in ((80, "example-web-tg"), (8080, "example-svc-tg")):
+        elbv2.create_listener(
+            LoadBalancerArn=lb_arn,
+            Protocol="HTTP",
+            Port=port,
+            DefaultActions=[{"Type": "forward", "TargetGroupArn": arns[name]}],
+        )
+    elbv2.register_targets(
+        TargetGroupArn=arns["example-web-tg"], Targets=[{"Id": aws_env["instance_id"], "Port": 80}]
+    )
+    elbv2.register_targets(
+        TargetGroupArn=arns["example-svc-tg"], Targets=[{"Id": "10.0.1.99", "Port": 8080}]
+    )
+    return arns
+
+
+def test_lb_targets_and_ecs_service_lbs(aws_env, db_path, moto_ecs_awsvpc):
+    arns = _alb_target_groups(aws_env)
+    _ecs_service_with_tasks(
+        aws_env["sa"],
+        load_balancers=[
+            {"targetGroupArn": arns["example-svc-tg"], "containerName": "app", "containerPort": 80}
+        ],
+    )
+    result = Collector(_gateway(), db_path).run()
+    assert result.warnings == []
+    with closing(db_path) as conn:
+        targets = {
+            tuple(r)
+            for r in conn.execute(
+                "SELECT lb_name, target_group, target_type, target_id, port FROM lb_targets "
+                "WHERE snapshot_id=?",
+                (result.snapshot_id,),
+            )
+        }
+        assert targets == {
+            ("example-alb", "example-web-tg", "instance", aws_env["instance_id"], 80),
+            ("example-alb", "example-svc-tg", "ip", "10.0.1.99", 8080),
+        }
+        svc_lbs = [
+            tuple(r)
+            for r in conn.execute(
+                "SELECT cluster, service, lb_name, target_group FROM ecs_service_lbs "
+                "WHERE snapshot_id=?",
+                (result.snapshot_id,),
+            )
+        ]
+        assert svc_lbs == [("example-cluster", "example-svc", "example-alb", "example-svc-tg")]
+
+
+def test_sg_refs_collected(aws_env, db_path):
+    ec2 = boto3.client("ec2", region_name=REGION)
+    alb_sg = ec2.create_security_group(
+        GroupName="example-alb-sg", Description="example", VpcId=aws_env["vpc_id"]
+    )["GroupId"]
+    web_sg = ec2.create_security_group(
+        GroupName="example-web-sg", Description="example", VpcId=aws_env["vpc_id"]
+    )["GroupId"]
+    ec2.authorize_security_group_ingress(
+        GroupId=web_sg,
+        IpPermissions=[
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 80,
+                "ToPort": 80,
+                "UserIdGroupPairs": [{"GroupId": alb_sg}],
+            }
+        ],
+    )
+    result = Collector(_gateway(), db_path).run()
+    assert result.warnings == []
+    with closing(db_path) as conn:
+        refs = {
+            tuple(r)
+            for r in conn.execute(
+                "SELECT group_id, direction, ref_group_id, ports FROM sg_refs WHERE snapshot_id=?",
+                (result.snapshot_id,),
+            )
+        }
+    assert (web_sg, "ingress", alb_sg, "tcp/80") in refs
+
+
+def test_lb_target_permission_denied_is_a_warning(aws_env, db_path, monkeypatch):
+    _alb_target_groups(aws_env)
+    gw = _gateway()
+    real_client = gw.client
+
+    def client(service):
+        c = real_client(service)
+        if service == "elbv2":
+
+            def deny(event_name=None, **_):
+                if event_name.endswith(".DescribeTargetHealth"):
+                    raise ClientError(
+                        {"Error": {"Code": "AccessDenied", "Message": "no"}},
+                        "DescribeTargetHealth",
+                    )
+
+            c.meta.events.register("before-call", deny)
+        return c
+
+    monkeypatch.setattr(gw, "client", client)
+    result = Collector(gw, db_path).run()
+    assert any("elasticloadbalancing:DescribeTargetHealth" in w for w in result.warnings)
+    with closing(db_path) as conn:
+        assert queries.latest_snapshot(conn)["id"] == result.snapshot_id
+        assert conn.execute("SELECT COUNT(*) FROM lb_targets").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "target_type, target_id, expected",
+    [
+        ("instance", "i-0example0001", "i-0example0001"),
+        ("ip", "10.0.1.20", "10.0.1.20"),
+        ("lambda", "arn:aws:lambda:us-east-1:123456789012:function:example-fn", "example-fn"),
+        ("lambda", "arn:aws:lambda:us-east-1:123456789012:function:example-fn:live", "example-fn"),
+        (
+            "alb",
+            "arn:aws:elasticloadbalancing:us-east-1:123456789012:loadbalancer/app/example-alb/0abc",
+            "example-alb",
+        ),
+    ],
+)
+def test_target_ref(target_type, target_id, expected):
+    assert target_ref(target_type, target_id) == expected
+
+
+def test_sg_ref_rows():
+    groups = [
+        {
+            "GroupId": "sg-0000web",
+            "IpPermissions": [
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 8000,
+                    "ToPort": 8100,
+                    "UserIdGroupPairs": [{"GroupId": "sg-0000alb"}],
+                },
+                {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": []},
+            ],
+            "IpPermissionsEgress": [
+                {"IpProtocol": "-1", "UserIdGroupPairs": [{"GroupId": "sg-000vpce"}]},
+                {
+                    "IpProtocol": "icmp",
+                    "FromPort": -1,
+                    "ToPort": -1,
+                    "UserIdGroupPairs": [{"GroupId": "sg-000vpce"}],
+                },
+            ],
+        }
+    ]
+    assert sg_ref_rows(groups) == [
+        ("sg-0000web", "egress", "sg-000vpce", "all"),
+        ("sg-0000web", "egress", "sg-000vpce", "icmp"),
+        ("sg-0000web", "ingress", "sg-0000alb", "tcp/8000-8100"),
+    ]
 
 
 def test_failed_collection_is_recorded(aws_env, db_path, monkeypatch):

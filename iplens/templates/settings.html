@@ -37,6 +37,13 @@
     <div><input name="region_custom" placeholder="or type a region code" size="20"></div>
   </div>
 
+  <h2>Display</h2>
+  <label for="account_display_name">Account display name <span class="muted">(optional)</span></label>
+  <input id="account_display_name" name="account_display_name" value="{{ s.account_display_name }}"
+         size="40" maxlength="64" placeholder="e.g. example-prod">
+  <div class="muted">Shown in the header as <i>name (account id)</i>; overrides the IAM account
+    alias. Leave blank to use the alias, or just the account id if there is none.</div>
+
   <h2>Logging</h2>
   <label for="log_dir">Log directory</label>
   <input id="log_dir" name="log_dir" value="{{ s.log_dir }}" size="60" class="mono" placeholder="{{ default_log_dir }}">
@@ -54,6 +61,9 @@
   IPLens only performs read-only AWS calls (Describe*/List*/Get*). Minimal IAM permissions:
   <span class="mono">ec2:DescribeVpcs, ec2:DescribeSubnets, ec2:DescribeNetworkInterfaces,
   ec2:DescribeVpcEndpoints, lambda:ListFunctions, elasticloadbalancing:DescribeLoadBalancers</span>.
+  Optional: <span class="mono">iam:ListAccountAliases</span> (account name in the header);
+  <span class="mono">elasticloadbalancing:DescribeTargetGroups, elasticloadbalancing:DescribeTargetHealth,
+  ec2:DescribeSecurityGroups</span> (connections on the Visual page).
 </div>
 <script>
 function showAuth() {

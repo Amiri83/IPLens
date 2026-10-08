@@ -74,11 +74,25 @@ def test_public_dict_never_contains_secret(store):
         ({"auth_mode": "env", "region": " "}, "region"),
         ({"auth_mode": "profile", "region": "us-east-1"}, "profile"),
         ({"auth_mode": "keys", "region": "us-east-1", "access_key_id": FAKE_KEY_ID}, "secret"),
+        (
+            {"auth_mode": "env", "region": "us-east-1", "account_display_name": "x" * 65},
+            "display name",
+        ),
     ],
 )
 def test_validation(store, kwargs, msg):
     with pytest.raises(ValueError, match=msg):
         store.save(**kwargs)
+
+
+def test_account_display_name_round_trip(store):
+    assert store.load().account_display_name == ""
+    store.save(auth_mode="env", region="us-east-1", account_display_name="  Example   Prod ")
+    s = store.load()
+    assert s.account_display_name == "Example Prod"
+    assert s.public_dict()["account_display_name"] == "Example Prod"
+    store.save(auth_mode="env", region="us-east-1", account_display_name="")
+    assert store.load().account_display_name == ""
 
 
 def test_invalid_keys_save_does_not_persist(store):

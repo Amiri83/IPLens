@@ -8,6 +8,8 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
+from .visual import EDGE_TYPES, LABEL_MAX, ellipsize, visual_edges
+
 # AWS reserves the first four addresses and the last address of every subnet.
 AWS_RESERVED_HEAD = 4
 AWS_RESERVED_TAIL = 1
@@ -446,6 +448,7 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
     for r in rows:
         node = nodes.get(r["eni_id"])
         if node is None:
+            name = r["resource_name"] or r["eni_id"]
             node = nodes[r["eni_id"]] = {
                 "kind": "resource",
                 "id": r["eni_id"],
@@ -453,7 +456,8 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
                 "subnet_id": r["subnet_id"],
                 "type": r["owner_type"],
                 "type_label": resource_type_label(r, labels),
-                "name": r["resource_name"] or r["eni_id"],
+                "name": name,
+                "label_name": ellipsize(name, LABEL_MAX["name"]),
                 "ref": r["owner_ref"] or "",
                 "status": r["status"] or "",
                 "icon": _icon_for(r),
@@ -498,11 +502,16 @@ def _group_items(
 
 
 def visual_data(
-    conn: sqlite3.Connection, snap_id: int, vpc_id: str = "", labels: dict[str, str] | None = None
+    conn: sqlite3.Connection,
+    snap_id: int,
+    vpc_id: str = "",
+    labels: dict[str, str] | None = None,
+    edge_types: tuple[str, ...] = EDGE_TYPES,
 ) -> dict[str, Any] | None:
-    """Nested VPC -> subnets -> resource nodes for the Visual page.
+    """Nested VPC -> subnets -> resource nodes, plus resource edges, for the Visual page.
 
     ``vpc_id`` defaults to the first VPC. Returns None if ``vpc_id`` is unknown.
+    Only edges of ``edge_types`` are returned (see :mod:`iplens.visual`).
     """
     labels = labels or {}
     tree = vpc_tree(conn, snap_id)
@@ -514,16 +523,22 @@ def visual_data(
         return None
 
     by_subnet: dict[str, list[dict[str, Any]]] = {}
+    by_ip: dict[str, str] = {}
     for r in ip_list(conn, snap_id, IpFilter(vpc=vpc.vpc_id)):
         by_subnet.setdefault(r["subnet_id"], []).append(r)
+        by_ip[r["ip"]] = r["eni_id"]
 
     subnets = []
+    resources: dict[str, dict[str, Any]] = {}
     for s in vpc.subnets:
         nodes = _resource_nodes(by_subnet.get(s.subnet_id, []), labels)
+        resources.update((n["eni_id"], n) for n in nodes)
         subnets.append(
             {
                 "subnet_id": s.subnet_id,
                 "name": s.name,
+                "label_name": ellipsize(s.name or s.subnet_id, LABEL_MAX["subnet"]),
+                "label_meta": ellipsize(f"{s.subnet_id} · {s.cidr} · {s.az}", LABEL_MAX["cidr"]),
                 "cidr": s.cidr,
                 "az": s.az,
                 "size": s.size,
@@ -541,8 +556,11 @@ def visual_data(
         "vpc": {
             "vpc_id": vpc.vpc_id,
             "name": vpc.name,
+            "label_name": ellipsize(vpc.name or vpc.vpc_id, LABEL_MAX["subnet"]),
+            "label_cidrs": ellipsize(", ".join(vpc.cidrs), LABEL_MAX["cidr"]),
             "cidrs": vpc.cidrs,
             "subnets": subnets,
         },
         "icons": {"vpc": VPC_ICON},
+        **visual_edges(conn, snap_id, vpc.vpc_id, resources, by_ip, edge_types),
     }
