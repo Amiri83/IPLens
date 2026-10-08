@@ -26,7 +26,7 @@ from flask import (
 )
 from markupsafe import Markup
 
-from . import diagram, queries, terraform, viewstate
+from . import diagram, extgraph, flowlogs, queries, terraform, viewstate
 from . import rules as rules_mod
 from . import scope as scope_mod
 from . import suggestions as sugg_mod
@@ -47,6 +47,7 @@ from .config import AppPaths, default_paths
 from .crypto import SecretBox
 from .db import closing, connect, init_db
 from .export import XLSX_MIMETYPE, ips_to_xlsx
+from .extended import EVIDENCE_HELP, EVIDENCE_LABELS, EVIDENCE_LEVELS, ExtendedCrawler, latest_crawl
 from .logging_setup import LEVELS, configure_logging, read_log
 from .queries import LB_ICONS, TYPE_ICONS
 from .settings import MAX_DISPLAY_NAME, REGIONS, Settings, SettingsStore
@@ -70,6 +71,9 @@ ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 # Visual page "Group by" choices (kept in the URL like the edge filter).
 GROUP_BY = {"": "nothing", "sg": "security group", "tag": "tag", "tf": "Terraform root"}
+# Visual page modes: the IP view is the default; "extended" adds regional services.
+VIEW_MODES = {"ip": "IP view", "extended": "Extended view"}
+MAX_CRAWL_WARNINGS_FLASHED = 8
 
 
 def host_allowed(host: str, port: int | None) -> bool:
@@ -568,11 +572,20 @@ def _register(app: Flask) -> None:
         ref = _active_ref()
         prefs = viewstate.get_prefs(_db(), ref) if ref is not None else viewstate.DEFAULT_PREFS
         group_by = request.args.get("group", "")
+        mode = _view_mode()
         return render_template(
             "visual.html",
             snap=snap,
             tree=tree,
             vpc=vpc,
+            view_mode=mode,
+            view_modes=VIEW_MODES,
+            crawl=latest_crawl(_db(), snap["id"]) if snap and mode == "extended" else None,
+            evidence_levels=EVIDENCE_LEVELS,
+            evidence_labels=EVIDENCE_LABELS,
+            evidence_help=EVIDENCE_HELP,
+            flow_windows=flowlogs.WINDOW_LABELS,
+            flow_default=flowlogs.DEFAULT_WINDOW,
             edge_types=EDGE_TYPES,
             edge_labels=EDGE_TYPE_LABELS,
             # The data endpoint still returns every type; the browser filters, so
@@ -586,6 +599,10 @@ def _register(app: Flask) -> None:
             positions=viewstate.get_layout(_db(), ref, vpc) if ref is not None and vpc else {},
             legend_icons=_legend_icons(),
         )
+
+    def _view_mode() -> str:
+        mode = request.values.get("view", "ip")
+        return mode if mode in VIEW_MODES else "ip"
 
     def _legend_icons() -> list[tuple[str, str]]:
         icons = [(OWNER_LABELS.get(t, t), f) for t, f in TYPE_ICONS.items() if t != "elb"]
@@ -672,7 +689,129 @@ def _register(app: Flask) -> None:
         )
         if data is None:
             abort(404)
+        if _view_mode() == "extended" and data.get("vpc"):
+            data["extended"] = extgraph.extended_data(_db(), snap["id"], data)
         return jsonify(data)
+
+    # -- extended view: service crawl and flow logs -------------------------------
+
+    def _gateway_or_flash(prefix: str) -> tuple[Account, AwsGateway] | None:
+        """The active account's gateway; on failure flash a safe message and return None."""
+        active = _active()
+        if active is None:
+            flash("Add an AWS account in Settings first.", "error")
+            return None
+        try:
+            account = _accounts().get(active.id, with_secret=True)
+            return account, _ext()["gateway_factory"](account)
+        except Exception as exc:
+            log.exception("%s: could not build AWS session (account=%s)", prefix, active.id)
+            if is_credential_failure(exc):
+                msg = str(exc) if isinstance(exc, CredentialError) else EXPIRED_MESSAGE
+                _credential_flash(prefix, msg, active.id)
+            else:
+                flash(f"{prefix}. See the log for details.", "error")
+            return None
+
+    def _extended_url(vpc: str = "") -> str:
+        return url_for("visual", view="extended", vpc=vpc or None)
+
+    @app.post("/visual/extended/crawl")
+    def visual_extended_crawl():
+        vpc = request.form.get("vpc", "")[:64]
+        snap = _snapshot_or_none()
+        if not snap:
+            flash(
+                "Refresh the account first: the service crawl extends its latest snapshot.", "error"
+            )
+            return redirect(_extended_url(vpc))
+        got = _gateway_or_flash("Service crawl failed")
+        if got is None:
+            return redirect(_extended_url(vpc))
+        account, gw = got
+        try:
+            result = ExtendedCrawler(gw, _paths().db_path, snap["id"]).run()
+        except Exception as exc:
+            log.exception("service crawl failed (account=%s)", account.id)
+            if is_credential_failure(exc):
+                msg = str(exc) if isinstance(exc, CredentialError) else EXPIRED_MESSAGE
+                _credential_flash("Service crawl failed", msg, account.id)
+            else:
+                flash("Service crawl failed. See the log for details.", "error")
+            return redirect(_extended_url(vpc))
+        flash(
+            f"Crawled services for snapshot #{snap['id']}: {result.nodes} node(s), "
+            f"{result.edges} evidence line(s), {len(result.warnings)} warning(s).",
+            "ok",
+        )
+        for w in result.warnings[:MAX_CRAWL_WARNINGS_FLASHED]:
+            flash(w, "warn")
+        if len(result.warnings) > MAX_CRAWL_WARNINGS_FLASHED:
+            more = len(result.warnings) - MAX_CRAWL_WARNINGS_FLASHED
+            flash(f"… and {more} more warning(s), listed on the Extended view.", "warn")
+        return redirect(_extended_url(vpc))
+
+    def _flow_target() -> tuple[Any, str, list[str]]:
+        """Latest snapshot, VPC id and its subnet ids for the flow log endpoints."""
+        snap = _snapshot_or_none()
+        if not snap:
+            abort(400, "no snapshot")
+        vpc = _visual_vpc()
+        tree = queries.vpc_tree(_db(), snap["id"], _scope())
+        node = next((v for v in tree if v.vpc_id == vpc), None)
+        if node is None:
+            abort(400, "unknown VPC")
+        return snap, vpc, [s.subnet_id for s in node.subnets]
+
+    def _flow_error(exc: Exception, what: str) -> Response:
+        log.warning("%s failed: %s", what, type(exc).__name__)
+        if isinstance(exc, flowlogs.FlowLogError):
+            message = str(exc)
+        elif is_credential_failure(exc):
+            message = str(exc) if isinstance(exc, CredentialError) else EXPIRED_MESSAGE
+        else:
+            message = f"{what} failed. See the log for details."
+            log.exception("%s failed", what)
+        return jsonify({"ok": False, "error": message})
+
+    def _flow_gateway() -> AwsGateway:
+        active = _active()
+        if active is None:
+            abort(400, "no active account")
+        return _ext()["gateway_factory"](_accounts().get(active.id, with_secret=True))
+
+    @app.post("/visual/flowlogs/estimate")
+    def visual_flowlogs_estimate():
+        snap, vpc, subnets = _flow_target()
+        window = flowlogs.parse_window(request.form.get("window"))
+        try:
+            est = flowlogs.estimate(_flow_gateway(), vpc, subnets, window)
+        except Exception as exc:
+            return _flow_error(exc, "Flow log estimate")
+        return jsonify({"ok": True, **est.as_dict()})
+
+    @app.post("/visual/flowlogs/run")
+    def visual_flowlogs_run():
+        snap, vpc, subnets = _flow_target()
+        # The page shows the estimate first; the query only runs once it is confirmed.
+        if request.form.get("confirm") != "1":
+            abort(400, "confirm the estimated scan size first")
+        window = flowlogs.parse_window(request.form.get("window"))
+        try:
+            res = flowlogs.run(_flow_gateway(), _paths().db_path, snap["id"], vpc, subnets, window)
+        except Exception as exc:
+            return _flow_error(exc, "Flow log query")
+        return jsonify(
+            {
+                "ok": True,
+                "window": res.window,
+                "log_groups": res.log_groups,
+                "bytes_scanned": res.bytes_scanned,
+                "bytes_label": flowlogs.human_bytes(res.bytes_scanned),
+                "pairs": res.pairs,
+                "skipped": res.skipped,
+            }
+        )
 
     # -- rules -----------------------------------------------------------------
 

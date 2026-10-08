@@ -19,7 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "moto[ec2,ecs,lambda,elbv2,sts,iam]>=5.0",
+    "moto[ec2,ecs,lambda,elbv2,sts,iam,sns,sqs,dynamodb,s3,stepfunctions,secretsmanager,events,logs]>=5.0",
     "ruff>=0.5",
 ]
 
@@ -36,6 +36,7 @@ iplens = [
     "static/*.js",
     "static/vendor/*",
     "static/icons/aws/*.svg",
+    "static/icons/ext/*.svg",
 ]
 
 [tool.pytest.ini_options]

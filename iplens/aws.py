@@ -2,7 +2,9 @@
 
 Every client created through :class:`AwsGateway` has a botocore ``before-call``
 hook that rejects any API operation whose name does not start with
-``Describe``, ``List`` or ``Get``.  IPLens never mutates AWS.
+``Describe``, ``List`` or ``Get``, except for the explicit read-only
+:data:`READ_ONLY_ALLOWLIST` (CloudWatch Logs queries used by the opt-in flow log
+analysis). IPLens never mutates AWS.
 """
 
 from __future__ import annotations
@@ -20,6 +22,17 @@ from .accounts import EXPIRED_MESSAGE, Account, CredentialError
 log = logging.getLogger(__name__)
 
 READ_ONLY_PREFIXES = ("Describe", "List", "Get")
+# Read-only operations whose names do not carry one of the prefixes above, as
+# (botocore service name, operation name). Matched exactly: an Athena "StartQuery"
+# or a Logs "StartLiveTail" stays blocked.
+READ_ONLY_ALLOWLIST = frozenset(
+    {
+        ("logs", "FilterLogEvents"),
+        ("logs", "StartQuery"),
+        ("logs", "GetQueryResults"),
+        ("logs", "StopQuery"),
+    }
+)
 
 # AWS error codes meaning "these credentials are no longer valid".
 EXPIRED_CREDENTIAL_CODES = frozenset(
@@ -33,9 +46,33 @@ class ReadOnlyViolation(RuntimeError):
     """Raised when code attempts a non read-only AWS API call."""
 
 
+# "Get" calls that return secret values or credentials. IPLens only ever reads secret
+# *names*, so these are refused even though their names carry a read-only prefix.
+SECRET_VALUE_OPERATIONS = frozenset(
+    {
+        ("secretsmanager", "GetSecretValue"),
+        ("secretsmanager", "BatchGetSecretValue"),
+        ("ssm", "GetParameter"),
+        ("ssm", "GetParameters"),
+        ("ssm", "GetParametersByPath"),
+        ("ssm", "GetParameterHistory"),
+        ("sts", "GetSessionToken"),
+        ("sts", "GetFederationToken"),
+        ("ecr", "GetAuthorizationToken"),
+    }
+)
+
+
+def is_read_only_operation(service: str, op_name: str) -> bool:
+    if (service, op_name) in SECRET_VALUE_OPERATIONS:
+        return False
+    return op_name.startswith(READ_ONLY_PREFIXES) or (service, op_name) in READ_ONLY_ALLOWLIST
+
+
 def _guard_read_only(model: Any = None, **_: Any) -> None:
     op_name = getattr(model, "name", "")
-    if not op_name.startswith(READ_ONLY_PREFIXES):
+    service = getattr(getattr(model, "service_model", None), "service_name", "")
+    if not is_read_only_operation(service, op_name):
         raise ReadOnlyViolation(f"IPLens is read-only; refusing AWS operation {op_name!r}")
 
 

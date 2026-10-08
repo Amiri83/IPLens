@@ -122,6 +122,29 @@ label.edge-filter { display: inline-flex; align-items: center; gap: .35rem; marg
 .edge-swatch.edge-ecs_lb { border-color: #2f8f4e; }
 .edge-swatch.edge-reach { border-top: 2px dashed #b0469b; }
 .edge-swatch.edge-sg { border-top: 2px dashed #8a94a3; }
+/* Extended view evidence levels (mirrors the ev-* edge styles in visual.js). */
+.edge-swatch.ev-observed { border-top: 3px solid #1a7f37; }
+.edge-swatch.ev-configured { border-top: 2px solid #2457c5; }
+.edge-swatch.ev-permitted { border-top: 2px dashed #c2410c; }
+.edge-swatch.ev-referenced { border-top: 2px dotted #6b7280; }
+.box-swatch.box-area { border: 2px dashed #5b6573; background: #f6f7f9; }
+.view-tabs { display: flex; gap: .3rem; margin: 0 0 .7rem; border-bottom: 1px solid var(--line); }
+.view-tab { padding: .35rem .8rem; border: 1px solid transparent; border-bottom: 0;
+            border-radius: 5px 5px 0 0; text-decoration: none; }
+.view-tab.active { border-color: var(--line); background: var(--card); font-weight: 700;
+                   margin-bottom: -1px; }
+.extended-panel h2 { margin-top: 0; }
+.extended-panel .row { align-items: center; }
+.crawl-warnings ul { margin: .3rem 0 0; font-size: 12px; }
+.flow-logs { align-items: center; margin-top: .6rem; }
+.edge-detail h2 { margin-top: 0; font-size: 1rem; }
+.edge-detail ul { margin: 0; padding-left: 1.1rem; font-size: 13px; }
+.edge-detail li { margin: .15rem 0; }
+/* Evidence badges: text colours via the contrast-checked variables, level colour as a border. */
+.badge.ev-observed { background: var(--ok-bg); color: var(--ok-fg); border-left: 3px solid #1a7f37; }
+.badge.ev-configured { border-left: 3px solid #2457c5; }
+.badge.ev-permitted { background: var(--warn-bg); color: var(--warn-fg); border-left: 3px dashed #c2410c; }
+.badge.ev-referenced { border-left: 3px dotted #6b7280; }
 .export-buttons { align-items: center; }
 .visual-legend h2 { margin-top: 0; }
 .legend-grid { display: flex; flex-wrap: wrap; gap: .4rem 1.2rem; margin-bottom: .5rem; }
