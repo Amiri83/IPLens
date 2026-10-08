@@ -3,7 +3,7 @@
 {% block content %}
 <h1>Suggestions</h1>
 {% if not snap %}
-  <div class="card">No snapshot yet — refresh from the <a href="{{ url_for('overview') }}">Overview</a>.</div>
+  <div class="card">No snapshot yet — refresh from the <a href="{{ url_for('overview') }}">Discovery</a>.</div>
 {% else %}
 <div class="card">
   <b>{{ totals.allowed }}</b> IPs could be freed by allowed suggestions ·

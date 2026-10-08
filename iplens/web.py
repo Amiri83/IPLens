@@ -16,6 +16,7 @@ from flask import (
     current_app,
     flash,
     g,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -32,13 +33,13 @@ from .collector import Collector
 from .config import AppPaths, default_paths
 from .crypto import SecretBox
 from .db import closing, connect, init_db
+from .export import XLSX_MIMETYPE, ips_to_xlsx
 from .logging_setup import LEVELS, configure_logging, read_log
 from .settings import AUTH_MODES, REGIONS, Settings, SettingsStore
 
 log = logging.getLogger(__name__)
 
 GatewayFactory = Callable[[Settings], AwsGateway]
-IP_PAGE_SIZE = 200
 # DNS-rebinding protection: only these Host header names are served.
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 
@@ -242,37 +243,72 @@ def _register(app: Flask) -> None:
             abort(404)
         return render_template("eni.html", snap=snap, e=detail)
 
+    def _ip_filter() -> queries.IpFilter:
+        a = request.args
+        owner = a.get("owner", "")
+        state = a.get("state", "")
+        return queries.IpFilter(
+            vpc=a.get("vpc", "").strip(),
+            subnet=a.get("subnet", "").strip(),
+            owner=owner if owner in OWNER_TYPES else "",
+            state=state if state in ("used", "idle") else "",
+            q=a.get("q", "").strip(),
+        )
+
     @app.get("/ips")
     def ips():
         snap = _snapshot_or_none()
-        q = request.args.get("q", "").strip()
-        owner = request.args.get("owner", "")
-        state = request.args.get("state", "")
-        page = max(request.args.get("page", 0, type=int), 0)
-        rows, total = [], 0
+        flt = _ip_filter()
+        rows, tree = [], []
         if snap:
-            rows, total = queries.search_ips(
-                _db(),
-                snap["id"],
-                q=q,
-                owner=owner if owner in OWNER_TYPES else "",
-                state=state,
-                limit=IP_PAGE_SIZE,
-                offset=page * IP_PAGE_SIZE,
-            )
-        pages = max((total + IP_PAGE_SIZE - 1) // IP_PAGE_SIZE, 1)
+            rows = queries.ip_list(_db(), snap["id"], flt)
+            tree = queries.vpc_tree(_db(), snap["id"])
         return render_template(
             "ips.html",
             snap=snap,
             rows=rows,
-            total=total,
-            q=q,
-            owner=owner,
-            state=state,
-            page=page,
-            pages=pages,
+            f=flt,
+            tree=tree,
             owner_types=OWNER_TYPES,
+            type_label=lambda r: queries.resource_type_label(r, OWNER_LABELS),
         )
+
+    @app.get("/ips/export.xlsx")
+    def ips_export():
+        snap = _snapshot_or_none()
+        flt = _ip_filter()
+        rows = queries.ip_list(_db(), snap["id"], flt) if snap else []
+        body = ips_to_xlsx(rows, OWNER_LABELS)
+        log.info("exported %d IP row(s) to xlsx", len(rows))
+        name = f"iplens-ips-snapshot-{snap['id']}.xlsx" if snap else "iplens-ips.xlsx"
+        return Response(
+            body,
+            mimetype=XLSX_MIMETYPE,
+            headers={"Content-Disposition": f"attachment; filename={name}"},
+        )
+
+    # -- visual --------------------------------------------------------------------
+
+    @app.get("/visual")
+    def visual():
+        snap = _snapshot_or_none()
+        tree = queries.vpc_tree(_db(), snap["id"]) if snap else []
+        vpc = request.args.get("vpc", "")
+        if tree and vpc not in {v.vpc_id for v in tree}:
+            vpc = tree[0].vpc_id
+        return render_template("visual.html", snap=snap, tree=tree, vpc=vpc)
+
+    @app.get("/visual/data.json")
+    def visual_data():
+        snap = _snapshot_or_none()
+        if not snap:
+            return jsonify({"snapshot_id": None, "vpcs": [], "vpc": None})
+        data = queries.visual_data(
+            _db(), snap["id"], request.args.get("vpc", "").strip(), OWNER_LABELS
+        )
+        if data is None:
+            abort(404)
+        return jsonify(data)
 
     # -- rules -----------------------------------------------------------------
 

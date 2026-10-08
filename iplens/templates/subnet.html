@@ -2,7 +2,7 @@
 {% from "_macros.html" import usage_bar, legend %}
 {% block title %}{{ s.subnet_id }}{% endblock %}
 {% block content %}
-<p><a href="{{ url_for('overview') }}">← Overview</a></p>
+<p><a href="{{ url_for('overview') }}">← Discovery</a></p>
 <h1><span class="mono">{{ s.subnet_id }}</span> {{ s.name }}</h1>
 <div class="card">
   <span class="mono">{{ s.cidr }}</span> · {{ s.az }} · VPC <span class="mono">{{ s.vpc_id }}</span><br>

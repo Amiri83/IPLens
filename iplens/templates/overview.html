@@ -1,9 +1,9 @@
 {% extends "base.html" %}
 {% from "_macros.html" import usage_bar, legend %}
-{% block title %}Overview{% endblock %}
+{% block title %}Discovery{% endblock %}
 {% block content %}
 <div class="row" style="justify-content: space-between">
-  <h1>Overview</h1>
+  <h1>Discovery</h1>
   <form method="post" action="{{ url_for('refresh') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <button type="submit">Refresh from AWS</button>

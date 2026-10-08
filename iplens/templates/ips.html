@@ -1,51 +1,65 @@
 {% extends "base.html" %}
-{% block title %}IPs{% endblock %}
+{% block title %}IP List{% endblock %}
 {% block content %}
-<h1>Private IPs</h1>
+<h1>IP List</h1>
 {% if not snap %}
-  <div class="card">No snapshot yet — refresh from the <a href="{{ url_for('overview') }}">Overview</a>.</div>
+  <div class="card">No snapshot yet — refresh from <a href="{{ url_for('overview') }}">Discovery</a>.</div>
 {% else %}
-<form method="get" class="card row">
-  <div><label for="q">Search</label>
-    <input id="q" name="q" value="{{ q }}" placeholder="IP, ENI, owner, description, subnet…" size="40"></div>
-  <div><label for="owner">Owner</label>
+<form method="get" action="{{ url_for('ips') }}" class="card row" id="ip-filter">
+  <div><label for="vpc">VPC</label>
+    <select id="vpc" name="vpc" onchange="this.form.subnet.value=''; this.form.submit()">
+      <option value="">all</option>
+      {% for v in tree %}<option value="{{ v.vpc_id }}" {{ 'selected' if v.vpc_id == f.vpc }}>{{ v.vpc_id }}{% if v.name %} · {{ v.name }}{% endif %}</option>{% endfor %}
+    </select></div>
+  <div><label for="subnet">Subnet</label>
+    <select id="subnet" name="subnet">
+      <option value="">all</option>
+      {% for v in tree if not f.vpc or v.vpc_id == f.vpc %}
+        <optgroup label="{{ v.vpc_id }}{% if v.name %} · {{ v.name }}{% endif %}">
+        {% for s in v.subnets %}<option value="{{ s.subnet_id }}" {{ 'selected' if s.subnet_id == f.subnet }}>{{ s.subnet_id }}{% if s.name %} · {{ s.name }}{% endif %} ({{ s.cidr }})</option>{% endfor %}
+        </optgroup>
+      {% endfor %}
+    </select></div>
+  <div><label for="owner">Resource type</label>
     <select id="owner" name="owner">
       <option value="">all</option>
-      {% for o in owner_types %}<option value="{{ o }}" {{ 'selected' if o == owner }}>{{ owner_labels[o] }}</option>{% endfor %}
+      {% for o in owner_types %}<option value="{{ o }}" {{ 'selected' if o == f.owner }}>{{ owner_labels[o] }}</option>{% endfor %}
     </select></div>
-  <div><label for="state">State</label>
+  <div><label for="state">Status</label>
     <select id="state" name="state">
       <option value="">all</option>
-      <option value="used" {{ 'selected' if state == 'used' }}>attached</option>
-      <option value="idle" {{ 'selected' if state == 'idle' }}>idle ENI</option>
+      <option value="used" {{ 'selected' if f.state == 'used' }}>attached</option>
+      <option value="idle" {{ 'selected' if f.state == 'idle' }}>idle ENI</option>
     </select></div>
-  <div><button type="submit">Search</button></div>
+  <div><label for="q">Search</label>
+    <input id="q" name="q" value="{{ f.q }}" placeholder="IP, name, ENI, subnet, VPC, description…" size="36"></div>
+  <div class="row" style="gap: .5rem">
+    <button type="submit">Filter</button>
+    <a class="btn secondary" href="{{ url_for('ips') }}">Reset</a>
+    <button type="submit" class="secondary" formaction="{{ url_for('ips_export') }}">Export to Excel</button>
+  </div>
 </form>
-<p class="muted">{{ total }} match(es){% if pages > 1 %} · page {{ page + 1 }} / {{ pages }}{% endif %}</p>
-<table>
-  <thead><tr><th>IP</th><th>Owner</th><th>Ref</th><th>ENI</th><th>Status</th><th>Subnet</th><th>AZ</th><th>Description</th></tr></thead>
+<p class="muted">{{ rows | length }} IP(s) · snapshot #{{ snap.id }} · sorted by address</p>
+<table class="ip-list">
+  <thead><tr><th>IP</th><th>Subnet</th><th>VPC</th><th>Resource type</th><th>Resource name / ref</th><th>ENI</th><th>Status</th></tr></thead>
   <tbody>
   {% for r in rows %}
     <tr>
       <td class="mono">{{ r.ip }}{% if r.is_primary %} <span class="badge">primary</span>{% endif %}</td>
-      <td>{{ owner_labels.get(r.owner_type, r.owner_type) }}</td>
-      <td class="mono">{{ r.owner_ref or '' }}</td>
+      <td><a class="mono" href="{{ url_for('subnet', subnet_id=r.subnet_id) }}">{{ r.subnet_id }}</a>
+        {% if r.subnet_name %}<div class="muted">{{ r.subnet_name }}</div>{% endif %}</td>
+      <td><span class="mono">{{ r.vpc_id }}</span>
+        {% if r.vpc_name %}<div class="muted">{{ r.vpc_name }}</div>{% endif %}</td>
+      <td>{{ type_label(r) }}</td>
+      <td>{{ r.resource_name }}
+        {% if r.owner_ref and r.owner_ref != r.resource_name %}<div class="muted mono">{{ r.owner_ref }}</div>{% endif %}</td>
       <td class="mono"><a href="{{ url_for('eni', eni_id=r.eni_id) }}">{{ r.eni_id }}</a></td>
       <td><span class="badge {{ 'warn' if r.status == 'available' else '' }}">{{ r.status }}</span></td>
-      <td class="mono"><a href="{{ url_for('subnet', subnet_id=r.subnet_id) }}">{{ r.subnet_id }}</a></td>
-      <td>{{ r.az }}</td>
-      <td class="muted">{{ r.description }}</td>
     </tr>
   {% else %}
-    <tr><td colspan="8" class="muted">No matches</td></tr>
+    <tr><td colspan="7" class="muted">No matches</td></tr>
   {% endfor %}
   </tbody>
 </table>
-{% if pages > 1 %}
-  <p>
-    {% if page > 0 %}<a href="{{ url_for('ips', q=q, owner=owner, state=state, page=page - 1) }}">← previous</a>{% endif %}
-    {% if page + 1 < pages %}<a href="{{ url_for('ips', q=q, owner=owner, state=state, page=page + 1) }}">next →</a>{% endif %}
-  </p>
-{% endif %}
 {% endif %}
 {% endblock %}

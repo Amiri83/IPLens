@@ -258,42 +258,291 @@ def eni_detail(conn: sqlite3.Connection, snap_id: int, eni_id: str) -> dict[str,
     return d
 
 
-def search_ips(
-    conn: sqlite3.Connection,
-    snap_id: int,
-    q: str = "",
-    owner: str = "",
-    state: str = "",
-    limit: int = 200,
-    offset: int = 0,
-) -> tuple[list[dict[str, Any]], int]:
+# -- flat IP list ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class IpFilter:
+    """Filters for :func:`ip_list`; empty strings mean "no filter"."""
+
+    vpc: str = ""
+    subnet: str = ""
+    owner: str = ""  # an attribution OWNER_TYPES value
+    state: str = ""  # "used" | "idle"
+    q: str = ""
+
+
+_IP_FROM = """
+FROM ips i
+JOIN enis e ON e.snapshot_id = i.snapshot_id AND e.eni_id = i.eni_id
+LEFT JOIN subnets s ON s.snapshot_id = i.snapshot_id AND s.subnet_id = i.subnet_id
+LEFT JOIN vpcs v ON v.snapshot_id = i.snapshot_id AND v.vpc_id = i.vpc_id
+LEFT JOIN load_balancers lb
+       ON lb.snapshot_id = i.snapshot_id AND i.owner_type = 'elb' AND lb.name = e.owner_ref
+LEFT JOIN endpoints ep
+       ON ep.snapshot_id = i.snapshot_id AND i.owner_type = 'vpc_endpoint'
+      AND ep.endpoint_id = e.owner_ref
+"""
+_IP_COLUMNS = (
+    "i.ip, i.ip_int, i.eni_id, i.subnet_id, i.vpc_id, i.is_primary, i.public_ip, i.owner_type, "
+    "e.owner_ref, e.status, e.description, e.az, e.instance_id, e.interface_type, "
+    "e.name AS eni_name, s.name AS subnet_name, s.cidr AS subnet_cidr, v.name AS vpc_name, "
+    "lb.lb_type, ep.service_name"
+)
+_IP_SEARCH_COLUMNS = (
+    "i.ip",
+    "i.eni_id",
+    "i.subnet_id",
+    "s.name",
+    "i.vpc_id",
+    "v.name",
+    "i.public_ip",
+    "e.owner_ref",
+    "e.description",
+    "e.instance_id",
+    "e.name",
+    "ep.service_name",
+)
+
+_LB_KIND_BY_INTERFACE = {
+    "network_load_balancer": "network",
+    "gateway_load_balancer": "gateway",
+}
+_LB_LABELS = {"application": "ALB", "network": "NLB", "gateway": "GWLB"}
+
+
+def _like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def lb_kind(row: dict[str, Any]) -> str:
+    """``application`` / ``network`` / ``gateway`` for a load-balancer ENI row, else ''."""
+    if row.get("owner_type") != "elb":
+        return ""
+    return row.get("lb_type") or _LB_KIND_BY_INTERFACE.get(
+        (row.get("interface_type") or "").lower(), ""
+    )
+
+
+def resource_type_label(row: dict[str, Any], labels: dict[str, str]) -> str:
+    """Human label for the owning resource type, refining load balancers to ALB/NLB/GWLB."""
+    kind = lb_kind(row)
+    if kind:
+        return _LB_LABELS.get(kind, labels.get("elb", "elb"))
+    return labels.get(row["owner_type"], row["owner_type"])
+
+
+def endpoint_service_short(service_name: str) -> str:
+    """``com.amazonaws.<region>.s3`` -> ``s3``; other names are returned unchanged."""
+    parts = service_name.split(".")
+    if len(parts) >= 4 and parts[0] == "com" and parts[1] == "amazonaws":
+        return ".".join(parts[3:])
+    return service_name
+
+
+def resource_name(row: dict[str, Any]) -> str:
+    """Best display name for the owning resource: Name tag, endpoint service, then ref."""
+    if row.get("eni_name"):
+        return row["eni_name"]
+    if row.get("service_name"):
+        return endpoint_service_short(row["service_name"])
+    return row.get("owner_ref") or ""
+
+
+def ip_list(
+    conn: sqlite3.Connection, snap_id: int, flt: IpFilter | None = None
+) -> list[dict[str, Any]]:
+    """Every private IP of a snapshot matching ``flt``, ordered numerically by address.
+
+    Each row carries the IP/ENI columns plus subnet/VPC names, ``lb_type`` and
+    endpoint ``service_name`` (when applicable) and a derived ``resource_name``.
+    """
+    flt = flt or IpFilter()
     where = ["i.snapshot_id = ?"]
     args: list[Any] = [snap_id]
-    if q:
-        like = f"%{q.strip()}%"
-        where.append(
-            "(i.ip LIKE ? OR i.eni_id LIKE ? OR e.owner_ref LIKE ? OR e.description LIKE ? "
-            "OR i.subnet_id LIKE ? OR i.vpc_id LIKE ? OR e.instance_id LIKE ? OR e.name LIKE ? "
-            "OR i.public_ip LIKE ?)"
-        )
-        args.extend([like] * 9)
-    if owner:
+    if flt.vpc:
+        where.append("i.vpc_id = ?")
+        args.append(flt.vpc)
+    if flt.subnet:
+        where.append("i.subnet_id = ?")
+        args.append(flt.subnet)
+    if flt.owner:
         where.append("i.owner_type = ?")
-        args.append(owner)
-    if state == "idle":
+        args.append(flt.owner)
+    if flt.state == "idle":
         where.append("e.status = 'available'")
-    elif state == "used":
+    elif flt.state == "used":
         where.append("e.status != 'available'")
-    # The WHERE clause is assembled from the fixed fragments above; all values are bound.
-    base = f"{_IP_JOIN} WHERE {' AND '.join(where)}"
-    total = conn.execute(f"SELECT COUNT(*) {base}", args).fetchone()[0]  # noqa: S608
-    sql = f"SELECT {_IP_COLUMNS} {base} ORDER BY i.ip_int LIMIT ? OFFSET ?"  # noqa: S608
-    rows = conn.execute(sql, [*args, limit, offset]).fetchall()
-    return [dict(r) for r in rows], total
+    q = flt.q.strip()
+    if q:
+        like = f"%{_like_escape(q)}%"
+        where.append("(" + " OR ".join(f"{c} LIKE ? ESCAPE '\\'" for c in _IP_SEARCH_COLUMNS) + ")")
+        args.extend([like] * len(_IP_SEARCH_COLUMNS))
+    # The SQL is assembled from the fixed fragments above; all values are bound.
+    sql = (
+        f"SELECT {_IP_COLUMNS} {_IP_FROM} WHERE {' AND '.join(where)} "  # noqa: S608
+        "ORDER BY i.ip_int, i.eni_id"
+    )
+    rows = [dict(r) for r in conn.execute(sql, args)]
+    for r in rows:
+        r["resource_name"] = resource_name(r)
+    return rows
 
 
-_IP_JOIN = "FROM ips i JOIN enis e ON e.snapshot_id = i.snapshot_id AND e.eni_id = i.eni_id"
-_IP_COLUMNS = (
-    "i.ip, i.eni_id, i.subnet_id, i.vpc_id, i.is_primary, i.public_ip, i.owner_type, "
-    "e.owner_ref, e.status, e.description, e.az, e.instance_id"
+# -- visual diagram ---------------------------------------------------------------
+
+# More than this many nodes of one type in a subnet are collapsed into a group node.
+VISUAL_GROUP_THRESHOLD = 10
+
+# Display order of resource types inside a subnet box.
+VISUAL_TYPE_ORDER = (
+    "vpc_endpoint",
+    "elb",
+    "nat",
+    "lambda",
+    "ecs",
+    "ec2",
+    "rds",
+    "elasticache",
+    "opensearch",
+    "other",
 )
+
+# Files under static/icons/aws/ (official AWS Architecture Icons).
+VPC_ICON = "Virtual-private-cloud-VPC_32.svg"
+TYPE_ICONS = {
+    "vpc_endpoint": "Res_Amazon-VPC_Endpoints_48.svg",
+    "elb": "Arch_Elastic-Load-Balancing_48.svg",
+    "nat": "Res_Amazon-VPC_NAT-Gateway_48.svg",
+    "lambda": "Arch_AWS-Lambda_48.svg",
+    "ecs": "Arch_Amazon-Elastic-Container-Service_48.svg",
+    "ec2": "Arch_Amazon-EC2_48.svg",
+    "rds": "Arch_Amazon-RDS_48.svg",
+    "elasticache": "Arch_Amazon-ElastiCache_48.svg",
+    "opensearch": "Arch_Amazon-OpenSearch-Service_48.svg",
+    "other": "Res_Amazon-VPC_Elastic-Network-Interface_48.svg",
+}
+LB_ICONS = {
+    "application": "Res_Elastic-Load-Balancing_Application-Load-Balancer_48.svg",
+    "network": "Res_Elastic-Load-Balancing_Network-Load-Balancer_48.svg",
+    "gateway": "Res_Elastic-Load-Balancing_Gateway-Load-Balancer_48.svg",
+}
+
+
+def _icon_for(row: dict[str, Any]) -> str:
+    return LB_ICONS.get(lb_kind(row)) or TYPE_ICONS.get(row["owner_type"], TYPE_ICONS["other"])
+
+
+def _type_rank(owner_type: str) -> int:
+    try:
+        return VISUAL_TYPE_ORDER.index(owner_type)
+    except ValueError:
+        return len(VISUAL_TYPE_ORDER)
+
+
+def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[dict[str, Any]]:
+    """One node per ENI (rows are already ordered by IP)."""
+    nodes: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        node = nodes.get(r["eni_id"])
+        if node is None:
+            node = nodes[r["eni_id"]] = {
+                "kind": "resource",
+                "id": r["eni_id"],
+                "eni_id": r["eni_id"],
+                "subnet_id": r["subnet_id"],
+                "type": r["owner_type"],
+                "type_label": resource_type_label(r, labels),
+                "name": r["resource_name"] or r["eni_id"],
+                "ref": r["owner_ref"] or "",
+                "status": r["status"] or "",
+                "icon": _icon_for(r),
+                "ips": [],
+                "_first_ip": r["ip_int"],
+            }
+        node["ips"].append(r["ip"])
+    out = sorted(
+        nodes.values(), key=lambda n: (_type_rank(n["type"]), n["name"].lower(), n["_first_ip"])
+    )
+    for n in out:
+        del n["_first_ip"]
+    return out
+
+
+def _group_items(
+    subnet_id: str, nodes: list[dict[str, Any]], labels: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Collapse runs of more than VISUAL_GROUP_THRESHOLD same-type nodes into a group node."""
+    by_type: dict[str, list[dict[str, Any]]] = {}
+    for n in nodes:
+        by_type.setdefault(n["type"], []).append(n)
+    items: list[dict[str, Any]] = []
+    for owner_type, members in by_type.items():  # insertion order == display order
+        if len(members) <= VISUAL_GROUP_THRESHOLD:
+            items.extend(members)
+            continue
+        items.append(
+            {
+                "kind": "group",
+                "id": f"group:{subnet_id}:{owner_type}",
+                "type": owner_type,
+                "type_label": labels.get(owner_type, owner_type),
+                "name": f"{len(members)} × {labels.get(owner_type, owner_type)}",
+                "count": len(members),
+                "ip_count": sum(len(m["ips"]) for m in members),
+                "icon": TYPE_ICONS.get(owner_type, TYPE_ICONS["other"]),
+                "members": members,
+            }
+        )
+    return items
+
+
+def visual_data(
+    conn: sqlite3.Connection, snap_id: int, vpc_id: str = "", labels: dict[str, str] | None = None
+) -> dict[str, Any] | None:
+    """Nested VPC -> subnets -> resource nodes for the Visual page.
+
+    ``vpc_id`` defaults to the first VPC. Returns None if ``vpc_id`` is unknown.
+    """
+    labels = labels or {}
+    tree = vpc_tree(conn, snap_id)
+    vpcs = [{"vpc_id": v.vpc_id, "name": v.name} for v in tree]
+    if not tree:
+        return {"snapshot_id": snap_id, "vpcs": [], "vpc": None, "icons": {"vpc": VPC_ICON}}
+    vpc = next((v for v in tree if v.vpc_id == vpc_id), None) if vpc_id else tree[0]
+    if vpc is None:
+        return None
+
+    by_subnet: dict[str, list[dict[str, Any]]] = {}
+    for r in ip_list(conn, snap_id, IpFilter(vpc=vpc.vpc_id)):
+        by_subnet.setdefault(r["subnet_id"], []).append(r)
+
+    subnets = []
+    for s in vpc.subnets:
+        nodes = _resource_nodes(by_subnet.get(s.subnet_id, []), labels)
+        subnets.append(
+            {
+                "subnet_id": s.subnet_id,
+                "name": s.name,
+                "cidr": s.cidr,
+                "az": s.az,
+                "size": s.size,
+                "reserved": s.reserved,
+                "used": s.used,
+                "idle": s.idle,
+                "free": s.free,
+                "resource_count": len(nodes),
+                "items": _group_items(s.subnet_id, nodes, labels),
+            }
+        )
+    return {
+        "snapshot_id": snap_id,
+        "vpcs": vpcs,
+        "vpc": {
+            "vpc_id": vpc.vpc_id,
+            "name": vpc.name,
+            "cidrs": vpc.cidrs,
+            "subnets": subnets,
+        },
+        "icons": {"vpc": VPC_ICON},
+    }
