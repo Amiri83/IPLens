@@ -51,6 +51,7 @@ def test_init_db_adds_shorten_names_to_existing_visual_prefs(tmp_path):
             "show_vpc": False,
             "show_subnets": True,
             "shorten_names": False,
+            "show_legend": True,
         }
 
 

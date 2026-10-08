@@ -68,10 +68,9 @@
     <select id="vpc" name="vpc" onchange="this.form.submit()">
       {% for v in tree %}<option value="{{ v.vpc_id }}" {{ 'selected' if v.vpc_id == vpc }}>{{ v.vpc_id }}{% if v.name %} · {{ v.name }}{% endif %} ({{ v.cidrs | join(', ') }})</option>{% endfor %}
     </select></div>
-  <div {{ 'hidden' if extended }}><label for="layout">Layout</label>
-    <select id="layout">
-      <option value="dagre" selected>Hierarchy (dagre)</option>
-      <option value="grid">Grid</option>
+  <div><label for="layout">Layout</label>
+    <select id="layout" title="Remembered per account for the {{ view_modes[view_mode] }}">
+      {% for value, label in layouts.items() %}<option value="{{ value }}" {{ 'selected' if value == layout }}>{{ label }}</option>{% endfor %}
     </select></div>
   {% if extended %}
   <fieldset class="edge-filters focus-controls">
@@ -91,12 +90,13 @@
     <button type="button" class="secondary" id="zoom-fit" title="Fit to screen">Fit</button>
     <button type="button" class="secondary" id="expand-all">Expand groups</button>
     <button type="button" class="secondary" id="collapse-all">Collapse groups</button>
-    <button type="button" class="secondary" id="reset-layout" title="Forget dragged positions for this VPC">Reset layout</button>
+    <button type="button" class="secondary" id="reset-layout" title="Forget dragged positions for this VPC{{ ' and show every node again' if extended }}">Reset layout</button>
   </div>
   <fieldset class="edge-filters">
     <legend>Borders</legend>
     <label class="edge-filter"><input type="checkbox" id="show-vpc" {{ 'checked' if prefs.show_vpc }}> VPC</label>
     <label class="edge-filter"><input type="checkbox" id="show-subnets" {{ 'checked' if prefs.show_subnets }}> Subnets</label>
+    <label class="edge-filter"><input type="checkbox" id="show-legend" {{ 'checked' if prefs.show_legend }}> Legend</label>
   </fieldset>
   <fieldset class="edge-filters">
     <legend>Labels</legend>
@@ -144,10 +144,11 @@
     (more than 10 resources of one type in a subnet) to expand or collapse it. Solid lines are
     load balancer targets and ECS services; dashed lines are security group based: endpoint reach
     (the endpoint's security group allows tcp/443 from the resource) and SG references.
-    Drag resources to rearrange them: positions are saved for this account and VPC and override
-    the automatic layout until you press <b>Reset layout</b>. Full names are shown, wrapped at
-    <code>- _ . /</code>; <b>Shorten long names</b> cuts them in the middle instead. Border and
-    label toggles are remembered per account. Endpoint reach lines are labelled with the endpoint's
+    Drag resources to rearrange them: positions are saved for this account, VPC and view and
+    override the automatic layout until you press <b>Reset layout</b>. <b>Layout</b> (Grid by
+    default) and the expanded groups are remembered per account and view. Full names are shown,
+    wrapped at <code>- _ . /</code>; <b>Shorten long names</b> cuts them in the middle instead.
+    Border, legend and label toggles are remembered per account. Endpoint reach lines are labelled with the endpoint's
     security group name. <b>Group by</b> draws a dashed box (and a coloured outline) around the
     resources sharing a security group, a tag value or a Terraform root (loaded under Settings).
     Exports contain the diagram as currently shown; with <b>Expand all groups</b> (default) every
@@ -159,8 +160,10 @@
     services of one type and Lambda / ECS ENIs of a subnet are groups: click to expand or collapse;
     lines between collapsed groups merge into one, labelled <b>×count</b> and drawn wider. Click a
     node (double-click a group), or search by name, ARN or IP, to show only it and its 1- or 2-hop
-    neighbourhood; <b>Show all</b> or Esc returns to the full diagram. The layout runs left to
-    right: sources (EventBridge, SNS, API Gateway, S3) → compute (Lambda, ECS) → targets. Group by
+    neighbourhood; <b>Show all</b>, Esc or <b>Reset layout</b> returns to the full diagram. The
+    Hierarchy layout runs left to right: sources (EventBridge, SNS, API Gateway, S3) → compute
+    (Lambda, ECS) → targets; the other layouts keep every box (VPC, subnet, expanded service
+    group, swimlane) together as one block. Group by
     tag or Terraform root draws one swimlane per app. Exports contain exactly what is shown
     (focus, groups and filters).{% endif %}
   </div>
@@ -190,9 +193,10 @@
 </aside>
 {% endif %}
 <script type="application/json" id="visual-positions">{{ positions | tojson }}</script>
+<script type="application/json" id="visual-expanded">{{ expanded | tojson }}</script>
 <p class="muted" id="cy-status"></p>
 <p class="muted small" id="cy-note" aria-live="polite"></p>
-<section class="card visual-legend" aria-labelledby="legend-title">
+<section class="card visual-legend" id="visual-legend" aria-labelledby="legend-title" {{ 'hidden' if not prefs.show_legend }}>
   <h2 id="legend-title">Legend</h2>
   <div class="legend-grid">
     {% for label, icon in legend_icons %}

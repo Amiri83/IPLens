@@ -33,8 +33,12 @@ Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (defau
 4. **Visual** – nested diagram per VPC: VPC box → subnet boxes (CIDR, used/idle/free) → one node
    per resource ENI with its AWS icon, name and IPs. More than 10 nodes of one type in a subnet are
    collapsed into a group node (click to expand). Scroll/drag to zoom and pan; double-click a node
-   to open its ENI. VPC/subnet borders can be toggled (remembered per account); dragged node
-   positions are saved per account + VPC until **Reset layout**. **Export SVG** / **Export
+   to open its ENI. VPC/subnet borders and the legend can be toggled (remembered per account).
+   Both views share one toolbar (zoom, Fit, Expand / Collapse groups, Reset layout) and a
+   **Layout** choice – Grid (default), Hierarchy (dagre), Circle, Concentric, Breadthfirst – that
+   keeps every box (VPC, subnet, expanded service group, swimlane) together; the layout and the
+   expanded groups are remembered per account and view, dragged node positions per account + VPC
+   + view until **Reset layout** (which also leaves focus mode). **Export SVG** / **Export
    draw.io** download the view exactly as shown (draw.io: `mxgraph.aws4` shapes, VPC and subnets
    as containers, edges kept). Data comes from `GET /visual/data.json?vpc=<vpc-id>`.
    The **IP view** is the default; the **Extended view** tab adds regional services (SNS, SQS,
@@ -53,7 +57,7 @@ Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (defau
    *configured* are shown by default; *permitted* / *referenced* are opt-in, and the selection is
    remembered per account. Regional services of one type ("SQS queue ×18") and Lambda / ECS ENIs
    of a subnet are collapsible groups; lines between collapsed groups merge into one labelled
-   *×count*, drawn wider the more connections it stands for. One left-to-right dagre layout runs
+   *×count*, drawn wider the more connections it stands for. The Hierarchy layout runs left to right:
    sources (EventBridge, SNS, API Gateway, S3) → compute (Lambda, ECS) → targets, with edges routed
    along dagre's paths. Click a node or search by name / ARN / IP to see only its 1- or 2-hop
    neighbourhood (**Show all** or Esc to return). Group by tag or Terraform root draws one

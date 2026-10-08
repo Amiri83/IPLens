@@ -73,9 +73,7 @@ MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 # Visual page "Group by" choices (kept in the URL like the edge filter).
 GROUP_BY = {"": "nothing", "sg": "security group", "tag": "tag", "tf": "Terraform root"}
 # Visual page modes: the IP view is the default; "extended" adds regional services.
-VIEW_MODES = {"ip": "IP view", "extended": "Extended view"}
-# Saved Extended view positions are stored under "<vpc id>:extended".
-EXT_LAYOUT_SUFFIX = ":extended"
+VIEW_MODES = {"ip": "IP view", "extended": "Extended view"}  # keys: viewstate.VIEWS
 MAX_CRAWL_WARNINGS_FLASHED = 8
 
 
@@ -577,8 +575,9 @@ def _register(app: Flask) -> None:
         group_by = request.args.get("group", "")
         mode = _view_mode()
         evidence_on = viewstate.get_evidence(_db(), ref) if ref is not None else DEFAULT_EVIDENCE
-        # The Extended view's left-to-right layout keeps its own dragged positions.
-        layout_key = f"{vpc}{EXT_LAYOUT_SUFFIX}" if vpc and mode == "extended" else vpc
+        # Each view keeps its own layout choice, expanded groups and dragged positions.
+        layout_key = viewstate.layout_key(vpc, mode)
+        has_state = ref is not None and bool(vpc)
         return render_template(
             "visual.html",
             snap=snap,
@@ -604,10 +603,13 @@ def _register(app: Flask) -> None:
             group_by_choices=GROUP_BY,
             group_by=group_by if group_by in GROUP_BY else "",
             group_tag=request.args.get("tag", "")[:128],
+            layouts=viewstate.LAYOUTS,
+            layout=viewstate.get_view_layout(_db(), ref, mode)
+            if ref is not None
+            else viewstate.DEFAULT_LAYOUT,
             layout_key=layout_key,
-            positions=viewstate.get_layout(_db(), ref, layout_key)
-            if ref is not None and vpc
-            else {},
+            positions=viewstate.get_layout(_db(), ref, layout_key) if has_state else {},
+            expanded=viewstate.get_expanded(_db(), ref, mode, vpc) if has_state else [],
             legend_icons=_legend_icons(),
         )
 
@@ -644,11 +646,29 @@ def _register(app: Flask) -> None:
                 evidence = parse_evidence(request.form["evidence"][:200])
             except ValueError as exc:
                 abort(400, str(exc))
+        # Per view: the layout choice and (per VPC) the expanded groups.
+        view = request.form.get("view", "")
+        layout = request.form.get("layout")
+        expanded = None
+        if (layout is not None or "expanded" in request.form) and view not in VIEW_MODES:
+            abort(400, "invalid view")
+        if layout is not None and layout not in viewstate.LAYOUTS:
+            abort(400, "invalid layout")
+        if "expanded" in request.form:
+            vpc = _visual_vpc()
+            try:
+                expanded = viewstate.parse_expanded(request.form["expanded"])
+            except ValueError as exc:
+                abort(400, str(exc))
         with closing(_paths().db_path) as conn:
             if changes:
                 viewstate.save_prefs(conn, ref, **changes)
             if evidence is not None:
                 viewstate.save_evidence(conn, ref, evidence)
+            if layout is not None:
+                viewstate.save_view_layout(conn, ref, view, layout)
+            if expanded is not None:
+                viewstate.save_expanded(conn, ref, view, vpc, expanded)
         return "", 204
 
     @app.post("/visual/layout")
