@@ -68,8 +68,10 @@ class SnapshotBuilder:
         account_ref: int | None = None,
         account_id: str = "123456789012",
         status: str = "ok",
+        account_name: str | None = None,
     ):
-        """``account_ref`` defaults to the first IPLens account (the migrated default)."""
+        """``account_ref`` defaults to the first IPLens account (the migrated default);
+        ``account_name`` to that record's display name, frozen like the collector does."""
         self.db_path = db_path
         self._subnet_vpc: dict[str, str] = {}
         self._subnet_az: dict[str, str] = {}
@@ -78,9 +80,14 @@ class SnapshotBuilder:
             if account_ref is None:
                 row = conn.execute("SELECT MIN(id) FROM accounts").fetchone()
                 account_ref = row[0]
+            if account_name is None:
+                row = conn.execute(
+                    "SELECT display_name FROM accounts WHERE id=?", (account_ref,)
+                ).fetchone()
+                account_name = row[0] if row else ""
             cur = conn.execute(
                 "INSERT INTO snapshots(taken_at, region, account_id, account_alias, status, "
-                "account_ref) VALUES(?, ?, ?, ?, ?, ?)",
+                "account_ref, account_name) VALUES(?, ?, ?, ?, ?, ?, ?)",
                 (
                     taken_at.isoformat(timespec="seconds"),
                     region,
@@ -88,6 +95,7 @@ class SnapshotBuilder:
                     account_alias,
                     status,
                     account_ref,
+                    account_name,
                 ),
             )
             self.id = int(cur.lastrowid)

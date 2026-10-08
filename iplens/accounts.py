@@ -67,6 +67,16 @@ def expires_in_text(expires_at: datetime | None, now: datetime | None = None) ->
     return f"expires in {hours}h {minutes}m"
 
 
+def identity_mismatch_message(expected: str, seen: str) -> str:
+    """Warning text when credentials resolved to ``seen`` instead of ``expected`` ('' if same)."""
+    if not expected or not seen or expected == seen:
+        return ""
+    return (
+        f"credentials now resolve to AWS account {seen}, but this account was first "
+        f"connected to {expected}"
+    )
+
+
 @dataclass
 class Account:
     id: int | None = None
@@ -82,10 +92,18 @@ class Account:
     # Decrypted secrets; populated only by AccountStore.get(..., with_secret=True).
     secret_access_key: str = field(default="", repr=False)
     session_token: str = field(default="", repr=False)
+    # AWS account id of the first successful connect, and of the latest one.
+    aws_account_id: str = ""
+    last_seen_account_id: str = ""
 
     @property
     def mode_label(self) -> str:
         return AUTH_MODE_LABELS.get(self.auth_mode, self.auth_mode)
+
+    @property
+    def identity_warning(self) -> str:
+        """Set when the credentials now resolve to another AWS account than at first."""
+        return identity_mismatch_message(self.aws_account_id, self.last_seen_account_id)
 
     def is_expired(self, now: datetime | None = None) -> bool:
         return (
@@ -133,6 +151,9 @@ class Account:
             "expired": self.is_expired(now),
             "problem": self.credential_problem(now),
             "status": self.status_text(now),
+            "aws_account_id": self.aws_account_id,
+            "last_seen_account_id": self.last_seen_account_id,
+            "identity_warning": self.identity_warning,
         }
 
 
@@ -181,6 +202,8 @@ class AccountStore:
             access_key_id=r["access_key_id"] or "",
             expires_at=_parse_ts(r["expires_at"]),
             memory_only=bool(r["memory_only"]),
+            aws_account_id=r["aws_account_id"] or "",
+            last_seen_account_id=r["last_seen_account_id"] or "",
         )
         if acct.memory_only:
             secret, token = self.vault.get(acct.id) or ("", "")
@@ -302,6 +325,25 @@ class AccountStore:
         else:
             self.vault.drop(account_id)
         return account_id
+
+    def record_identity(self, account_id: int, aws_account_id: str) -> str:
+        """Remember the AWS account id a successful connect resolved to.
+
+        The first one is kept as the account's identity; returns a warning ('' if
+        none) when a later connect resolves to a different AWS account.
+        """
+        if not aws_account_id:
+            return ""
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "UPDATE accounts SET aws_account_id = COALESCE(NULLIF(aws_account_id, ''), ?), "
+                "last_seen_account_id = ? WHERE id=?",
+                (aws_account_id, aws_account_id, account_id),
+            )
+            row = conn.execute(
+                "SELECT aws_account_id FROM accounts WHERE id=?", (account_id,)
+            ).fetchone()
+        return identity_mismatch_message(row["aws_account_id"] if row else "", aws_account_id)
 
     def delete(self, account_id: int) -> bool:
         """Delete an account with its snapshots and Visual state."""

@@ -322,7 +322,8 @@ def test_ecs_enrichment_maps_task_enis(aws_env, db_path, moto_ecs_awsvpc):
         ).fetchall()
         assert len(mapped) == 3
         assert all(r["owner_type"] == "ecs" for r in mapped)
-        assert [r["owner_ref"] for r in mapped[1:]] == ["example-cluster/example-svc"] * 2
+        assert all(r["owner_ref"].startswith("example-cluster/example-svc/") for r in mapped[1:])
+        assert len({r["owner_ref"] for r in mapped[1:]}) == 2  # one per task
         assert mapped[0]["service"] == "" and mapped[0]["owner_ref"].startswith("example-cluster/")
         assert (
             conn.execute(

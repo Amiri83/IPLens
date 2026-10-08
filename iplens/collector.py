@@ -13,7 +13,7 @@ from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from .attribution import Attribution, attribute_eni
+from .attribution import Attribution, attribute_eni, lambda_eni_index, lambda_owners
 from .aws import AwsGateway
 from .db import closing
 
@@ -63,7 +63,10 @@ class EcsTaskEni:
 
     @property
     def owner_ref(self) -> str:
-        return f"{self.cluster}/{self.service or self.task_id}"
+        """``cluster/service/task`` (``cluster/task`` for a standalone task)."""
+        if self.service:
+            return f"{self.cluster}/{self.service}/{self.task_id}"
+        return f"{self.cluster}/{self.task_id}"
 
 
 @dataclass
@@ -174,6 +177,11 @@ def _task_service(task: dict[str, Any]) -> str:
 
 
 def _task_eni_ids(task: dict[str, Any]) -> list[str]:
+    """ENI ids from the task's ElasticNetworkInterface attachments (``networkInterfaceId``).
+
+    This is the only source of ECS task attribution: an ENI is mapped to the task
+    whose attachment names exactly its id, never to a service by subnet or SG.
+    """
     out = []
     for att in task.get("attachments", []):
         if att.get("type") != "ElasticNetworkInterface":
@@ -185,19 +193,27 @@ def _task_eni_ids(task: dict[str, Any]) -> list[str]:
 
 
 class Collector:
-    def __init__(self, gateway: AwsGateway, db_path: Path, account_ref: int | None = None):
+    def __init__(
+        self,
+        gateway: AwsGateway,
+        db_path: Path,
+        account_ref: int | None = None,
+        account_name: str = "",
+    ):
         self.gw = gateway
         self.db_path = db_path
         self.account_ref = account_ref  # IPLens account record the snapshot belongs to
+        # The record's display name, frozen on the snapshot (later renames do not apply).
+        self.account_name = account_name
 
     def run(self) -> CollectResult:
         region = self.gw.region or ""
         started = datetime.now(UTC).isoformat(timespec="seconds")
         with closing(self.db_path) as conn:
             cur = conn.execute(
-                "INSERT INTO snapshots(taken_at, region, status, account_ref) "
-                "VALUES(?, ?, 'running', ?)",
-                (started, region, self.account_ref),
+                "INSERT INTO snapshots(taken_at, region, status, account_ref, account_name) "
+                "VALUES(?, ?, 'running', ?, ?)",
+                (started, region, self.account_ref, self.account_name),
             )
             snap_id = int(cur.lastrowid or 0)
         log.info(
@@ -263,6 +279,8 @@ class Collector:
         )
         ecs = self._collect_ecs(result)
 
+        lambda_index = lambda_eni_index(lambdas)
+
         with closing(self.db_path) as conn:
             for v in vpcs:
                 cidrs = [
@@ -302,11 +320,17 @@ class Collector:
                 if task:
                     attr = Attribution("ecs", task.owner_ref)
                 groups = [g["GroupId"] for g in e.get("Groups", [])]
+                owner_names = [attr.owner_ref] if attr.owner_ref else []
+                if attr.owner_type == "lambda":
+                    shared = lambda_owners(lambda_index, e.get("SubnetId"), groups)
+                    if shared:
+                        owner_names = shared
+                        attr = Attribution("lambda", shared[0])
                 conn.execute(
                     "INSERT INTO enis(snapshot_id, eni_id, subnet_id, vpc_id, az, status, "
                     "interface_type, requester_id, requester_managed, description, instance_id, "
-                    "security_groups, owner_type, owner_ref, name) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "security_groups, owner_type, owner_ref, name, owner_names) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         snap_id,
                         e["NetworkInterfaceId"],
@@ -323,6 +347,7 @@ class Collector:
                         attr.owner_type,
                         attr.owner_ref,
                         _name_tag(e.get("TagSet")),
+                        json.dumps(owner_names),
                     ),
                 )
                 for p in e.get("PrivateIpAddresses", []) or [

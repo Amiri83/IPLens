@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +29,11 @@ RULE_KINDS: dict[str, str] = {
 }
 
 INTERNAL_SCOPES = ("load_balancer", "vpc_endpoint", "both")
+INTERNAL_SCOPE_LABELS = {
+    "load_balancer": "load balancers",
+    "vpc_endpoint": "VPC endpoints",
+    "both": "load balancers and VPC endpoints",
+}
 # deny:  block scale-down suggestions for services matching the pattern (blank = all)
 # allow: block scale-down suggestions for every service NOT matching the pattern
 ECS_MODES = ("deny", "allow")
@@ -52,15 +57,77 @@ class Rule:
     def applies_to(self, account_ref: int | None) -> bool:
         return self.account_ref is None or self.account_ref == account_ref
 
+    def describe(self, names: Mapping[str, str] | None = None) -> str:
+        """Plain-English statement of the rule. ``names`` maps resource ids to Name tags."""
+        names = names or {}
+        p = self.params
+
+        def ids(values: Iterable[str]) -> str:
+            return ", ".join(f"{v} ({names[v]})" if names.get(v) else v for v in values)
+
+        if self.kind == "lambda_vpc_required":
+            return (
+                "Every Lambda function must be attached to a VPC. Functions outside a VPC "
+                "are reported, and suggestions to move functions out of the VPC are blocked."
+            )
+        if self.kind == "internal_only":
+            scope = p.get("scope", "both")
+            what = INTERNAL_SCOPE_LABELS.get(scope, scope)
+            text = f"{what[0].upper()}{what[1:]} must stay internal-only."
+            if scope != "vpc_endpoint":
+                lbs = p.get("lb_names") or []
+                if lbs:
+                    text += f" Load balancers {ids(lbs)} are reported if internet-facing."
+                else:
+                    text += " Internet-facing load balancers are reported."
+            return text + " Suggestions that would send traffic over public paths are blocked."
+        if self.kind == "subnet_reserved":
+            subnets = p.get("subnet_ids") or []
+            noun = "Subnet" if len(subnets) == 1 else "Subnets"
+            verb = "is" if len(subnets) == 1 else "are"
+            return (
+                f"{noun} {ids(subnets)} {verb} reserved: no suggestion may change "
+                f"{'it' if len(subnets) == 1 else 'them'} or place new resources there."
+            )
+        if self.kind == "min_free_pct":
+            where = []
+            if p.get("subnet_ids"):
+                where.append(f"subnets {ids(p['subnet_ids'])}")
+            if p.get("vpc_ids"):
+                where.append(f"every subnet of VPC {ids(p['vpc_ids'])}")
+            target = " and ".join(where) if where else "every subnet"
+            return (
+                f"Keep at least {float(p.get('percent', 0)):g}% of the usable IPs free in "
+                f"{target}. Subnets below are reported, and suggestions that would drop a "
+                "subnet below it are blocked."
+            )
+        if self.kind == "protected_eni":
+            return (
+                f"ENIs whose id, description, Name or owner matches “{p.get('pattern', '')}” "
+                "must never be removed: suggestions that delete them are blocked."
+            )
+        if self.kind == "ecs_scale_down":
+            pattern = p.get("pattern") or ""
+            if p.get("mode", "deny") == "allow":
+                return (
+                    f"Only ECS services matching “{pattern}” may be scaled down or deleted; "
+                    "such suggestions for any other service are blocked."
+                )
+            target = f"ECS services matching “{pattern}”" if pattern else "No ECS service"
+            verb = "must not" if pattern else "may"
+            return f"{target} {verb} be scaled down or deleted by suggestions."
+        return self.kind_label
+
     def summary(self) -> str:
         p = self.params
         if self.kind == "min_free_pct":
-            scope = ", ".join(p.get("subnet_ids") or []) or "all subnets"
-            return f">= {p.get('percent')}% free ({scope})"
+            scope = ", ".join((p.get("subnet_ids") or []) + (p.get("vpc_ids") or []))
+            return f">= {p.get('percent')}% free ({scope or 'all subnets'})"
         if self.kind == "subnet_reserved":
             return ", ".join(p.get("subnet_ids") or [])
         if self.kind == "internal_only":
-            return f"scope: {p.get('scope', 'both')}"
+            lbs = ", ".join(p.get("lb_names") or [])
+            return f"scope: {p.get('scope', 'both')}" + (f" ({lbs})" if lbs else "")
         if self.kind == "protected_eni":
             return f"pattern: {p.get('pattern', '')}"
         if self.kind == "ecs_scale_down":
@@ -89,12 +156,9 @@ class Rule:
                 return f"reserved subnet(s): {', '.join(sorted(touched))}"
         elif self.kind == "min_free_pct":
             pct = float(p.get("percent", 0))
-            scope = set(p.get("subnet_ids") or [])
             for subnet_id, added in s.target_subnets.items():
-                if scope and subnet_id not in scope:
-                    continue
                 st = ctx.subnets.get(subnet_id)
-                if st is None or not st.usable:
+                if st is None or not st.usable or not self._free_scope(st):
                     continue
                 after = 100.0 * (st.free - added) / st.usable
                 if after < pct:
@@ -111,6 +175,7 @@ class Rule:
                         eni.get("description") or "",
                         eni.get("name") or "",
                         eni.get("owner_ref") or "",
+                        *json.loads(eni.get("owner_names") or "[]"),
                     ]
                 if any(rx.search(h) for h in hay):
                     return f"{eni_id} is protected"
@@ -141,29 +206,37 @@ class Rule:
                 if not fn.get("vpc_id")
             ]
         elif self.kind == "internal_only" and p.get("scope", "both") in ("load_balancer", "both"):
+            only = set(p.get("lb_names") or [])
             out += [
                 f"Load balancer {lb['name']} is {lb['scheme']}"
                 for lb in ctx.load_balancers
-                if lb.get("scheme") == "internet-facing"
+                if lb.get("scheme") == "internet-facing" and (not only or lb["name"] in only)
             ]
         elif self.kind == "min_free_pct":
             pct = float(p.get("percent", 0))
-            scope = set(p.get("subnet_ids") or [])
             for st in ctx.subnets.values():
-                if scope and st.subnet_id not in scope:
+                if not self._free_scope(st):
                     continue
                 if st.free_pct < pct:
                     out.append(
                         f"{st.subnet_id} ({st.cidr}) has {st.free_pct:.1f}% free (< {pct:g}%)"
                     )
         elif self.kind == "subnet_reserved":
-            known = set(ctx.subnets)
+            known = ctx.all_subnet_ids or set(ctx.subnets)
             out += [
                 f"reserved subnet {sid} not found in snapshot"
                 for sid in p.get("subnet_ids") or []
                 if known and sid not in known
             ]
         return out
+
+    def _free_scope(self, st: Any) -> bool:
+        """min_free_pct: does the rule cover subnet ``st`` (all subnets when unscoped)?"""
+        subnets = set(self.params.get("subnet_ids") or [])
+        vpcs = set(self.params.get("vpc_ids") or [])
+        if not subnets and not vpcs:
+            return True
+        return st.subnet_id in subnets or st.vpc_id in vpcs
 
 
 def _compile(pattern: str) -> re.Pattern[str] | None:
@@ -178,14 +251,29 @@ def _compile(pattern: str) -> re.Pattern[str] | None:
 # -- validation -------------------------------------------------------------
 
 _SUBNET_RX = re.compile(r"^subnet-[0-9a-f]{8,17}$")
+_VPC_RX = re.compile(r"^vpc-[0-9a-z]{1,32}$")
+_LB_NAME_RX = re.compile(r"^[A-Za-z0-9-]{1,32}$")
 
 
 def _id_list(value: Any) -> list[str]:
+    """Ids from a list (multi-select), a comma/space separated string, or both."""
     if value is None or value == "":
         return []
     if isinstance(value, str):
-        value = re.split(r"[\s,]+", value)
-    return [str(v).strip() for v in value if str(v).strip()]
+        value = [value]
+    out: list[str] = []
+    for v in value:
+        for part in re.split(r"[\s,]+", str(v)):
+            if part and part not in out:
+                out.append(part)
+    return out
+
+
+def _checked(ids: list[str], rx: re.Pattern[str], what: str) -> list[str]:
+    bad = [i for i in ids if not rx.match(i)]
+    if bad:
+        raise ValueError(f"invalid {what}: {', '.join(bad)}")
+    return ids
 
 
 def normalize_params(kind: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -199,7 +287,10 @@ def normalize_params(kind: str, params: dict[str, Any]) -> dict[str, Any]:
         scope = params.get("scope") or "both"
         if scope not in INTERNAL_SCOPES:
             raise ValueError(f"scope must be one of {INTERNAL_SCOPES}")
-        return {"scope": scope}
+        lbs = _checked(_id_list(params.get("lb_names")), _LB_NAME_RX, "load balancer name(s)")
+        if lbs and scope == "vpc_endpoint":
+            lbs = []  # only meaningful when load balancers are covered
+        return {"scope": scope, **({"lb_names": lbs} if lbs else {})}
     if kind == "subnet_reserved":
         ids = _id_list(params.get("subnet_ids"))
         if not ids:
@@ -215,11 +306,9 @@ def normalize_params(kind: str, params: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("percent must be a number") from exc
         if not 0 <= pct <= 100:
             raise ValueError("percent must be between 0 and 100")
-        ids = _id_list(params.get("subnet_ids"))
-        bad = [i for i in ids if not _SUBNET_RX.match(i)]
-        if bad:
-            raise ValueError(f"invalid subnet id(s): {', '.join(bad)}")
-        return {"percent": pct, "subnet_ids": ids}
+        ids = _checked(_id_list(params.get("subnet_ids")), _SUBNET_RX, "subnet id(s)")
+        vpcs = _checked(_id_list(params.get("vpc_ids")), _VPC_RX, "VPC id(s)")
+        return {"percent": pct, "subnet_ids": ids, **({"vpc_ids": vpcs} if vpcs else {})}
     if kind == "protected_eni":
         pattern = str(params.get("pattern") or "").strip()
         if not pattern:

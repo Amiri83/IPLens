@@ -4,60 +4,104 @@
 <p><a href="{{ url_for('rules_list') }}">← Rules</a></p>
 <h1>{{ 'Edit rule' if rule.id else 'New rule' }}</h1>
 {% set p = rule.params or {} %}
-{% set ids = p.get('subnet_ids') %}
-<form class="card" method="post">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <label for="name">Name</label>
-  <input id="name" name="name" value="{{ rule.name }}" required size="40">
+{% set sel_subnets = (p.get('subnet_ids') or []) if p.get('subnet_ids') is not string else p.get('subnet_ids').replace(',', ' ').split() %}
+{% set sel_vpcs = (p.get('vpc_ids') or []) if p.get('vpc_ids') is not string else p.get('vpc_ids').replace(',', ' ').split() %}
+{% set sel_lbs = (p.get('lb_names') or []) if p.get('lb_names') is not string else p.get('lb_names').replace(',', ' ').split() %}
+{% set known_subnets = [] %}{% for v in options.tree %}{% for s in v.subnets %}{% set _ = known_subnets.append(s.subnet_id) %}{% endfor %}{% endfor %}
+{% set known_vpcs = options.tree | map(attribute='vpc_id') | list %}
+{% set known_lbs = options.lbs | map(attribute='name') | list %}
 
-  <label for="kind">Kind</label>
+{% if rule.id and rule.kind in kinds %}
+  <div class="card rule-summary"><b>This rule says:</b> {{ rule.describe(options.names) }}</div>
+{% endif %}
+{% if not options.tree %}
+  <div class="card muted">No snapshot for the active account yet: the lists below fill in from
+    its latest snapshot after a refresh on <a href="{{ url_for('overview') }}">Discovery</a>.</div>
+{% endif %}
+
+<form class="card rule-form" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <label for="kind">Rule type</label>
   <select id="kind" name="kind" onchange="showParams()">
     {% for k, label in kinds.items() %}<option value="{{ k }}" {{ 'selected' if k == rule.kind }}>{{ label }}</option>{% endfor %}
   </select>
 
-  <label for="description">Description</label>
+  <label for="name">Name</label>
+  <input id="name" name="name" value="{{ rule.name }}" required size="40">
+
+  <fieldset data-kinds="min_free_pct">
+    <legend>Minimum free IPs</legend>
+    <label for="percent">Keep at least this % of usable IPs free</label>
+    <input id="percent" name="percent" type="number" min="0" max="100" step="0.1" value="{{ p.get('percent', '') }}">
+    <label for="vpc_ids">In every subnet of these VPCs (none selected = all subnets)</label>
+    <select id="vpc_ids" name="vpc_ids" multiple size="{{ [[known_vpcs | length + 1, 3] | max, 8] | min }}">
+      {% for v in options.tree %}<option value="{{ v.vpc_id }}" {{ 'selected' if v.vpc_id in sel_vpcs }}>{{ v.vpc_id }}{% if v.name %} · {{ v.name }}{% endif %} ({{ v.cidrs | join(', ') }})</option>{% endfor %}
+      {% for id in sel_vpcs if id not in known_vpcs %}<option value="{{ id }}" selected>{{ id }} (not in the latest snapshot)</option>{% endfor %}
+    </select>
+  </fieldset>
+
+  <fieldset data-kinds="min_free_pct subnet_reserved">
+    <legend>Subnets</legend>
+    <label for="subnet_ids">Subnets <span class="muted" data-kinds="min_free_pct">(and/or individual subnets; none selected = all)</span><span class="muted" data-kinds="subnet_reserved">(at least one)</span></label>
+    <select id="subnet_ids" name="subnet_ids" multiple size="{{ [[known_subnets | length + 1, 3] | max, 12] | min }}">
+      {% for v in options.tree %}
+        <optgroup label="{{ v.vpc_id }}{% if v.name %} · {{ v.name }}{% endif %}">
+        {% for s in v.subnets %}<option value="{{ s.subnet_id }}" {{ 'selected' if s.subnet_id in sel_subnets }}>{{ s.subnet_id }}{% if s.name %} · {{ s.name }}{% endif %} ({{ s.cidr }}, {{ s.az }}, {{ s.free_pct | pct }} free)</option>{% endfor %}
+        </optgroup>
+      {% endfor %}
+      {% for id in sel_subnets if id not in known_subnets %}<option value="{{ id }}" selected>{{ id }} (not in the latest snapshot)</option>{% endfor %}
+    </select>
+  </fieldset>
+
+  <fieldset data-kinds="internal_only">
+    <legend>Internal-only</legend>
+    <label for="scope">Applies to</label>
+    <select id="scope" name="scope">
+      {% for sc in scopes %}<option value="{{ sc }}" {{ 'selected' if sc == p.get('scope', 'both') }}>{{ scope_labels[sc] }}</option>{% endfor %}
+    </select>
+    <label for="lb_names">Only these load balancers (none selected = all)</label>
+    <select id="lb_names" name="lb_names" multiple size="{{ [[known_lbs | length + 1, 3] | max, 8] | min }}">
+      {% for lb in options.lbs %}<option value="{{ lb.name }}" {{ 'selected' if lb.name in sel_lbs }}>{{ lb.name }} ({{ lb.lb_type or 'lb' }}, {{ lb.scheme or '?' }})</option>{% endfor %}
+      {% for n in sel_lbs if n not in known_lbs %}<option value="{{ n }}" selected>{{ n }} (not in the latest snapshot)</option>{% endfor %}
+    </select>
+  </fieldset>
+
+  <fieldset data-kinds="ecs_scale_down">
+    <legend>ECS scale-down</legend>
+    <label for="mode">Mode</label>
+    <select id="mode" name="mode">
+      {% for m in ecs_modes %}<option value="{{ m }}" {{ 'selected' if m == p.get('mode', 'deny') }}>{{ 'deny: block scale-down of matching services (blank = all)' if m == 'deny' else 'allow: only matching services may be scaled down' }}</option>{% endfor %}
+    </select>
+  </fieldset>
+
+  <fieldset data-kinds="protected_eni ecs_scale_down">
+    <legend>Pattern</legend>
+    <label for="pattern"><span data-kinds="protected_eni">ENI id, description, Name or owner</span><span data-kinds="ecs_scale_down">cluster/service</span> (regular expression)</label>
+    <input id="pattern" name="pattern" class="mono" size="60" value="{{ p.get('pattern', '') }}" list="pattern-choices">
+    <datalist id="pattern-choices">{% for svc in options.ecs %}<option value="{{ svc }}">{% endfor %}</datalist>
+  </fieldset>
+
+  <label for="description">Description (optional)</label>
   <input id="description" name="description" value="{{ rule.description }}" size="80">
 
-  <label for="account_ref">Applies to</label>
+  <label for="account_ref">Applies to account</label>
   <select id="account_ref" name="account_ref">
     <option value="">All accounts</option>
     {% for id, label in account_names.items() %}<option value="{{ id }}" {{ 'selected' if rule.account_ref == id }}>{{ label }}</option>{% endfor %}
   </select>
 
   <label><input type="checkbox" name="enabled" {{ 'checked' if rule.enabled }}> Enabled</label>
-
-  <fieldset data-kinds="min_free_pct">
-    <label for="percent">Minimum free %</label>
-    <input id="percent" name="percent" type="number" min="0" max="100" step="0.1" value="{{ p.get('percent', '') }}">
-  </fieldset>
-  <fieldset data-kinds="min_free_pct subnet_reserved">
-    <label for="subnet_ids">Subnet IDs (comma or space separated; blank = all for min free %)</label>
-    <input id="subnet_ids" name="subnet_ids" class="mono" size="80"
-           value="{{ ids | join(', ') if ids is not string and ids else (ids or '') }}">
-  </fieldset>
-  <fieldset data-kinds="internal_only">
-    <label for="scope">Scope</label>
-    <select id="scope" name="scope">
-      {% for sc in scopes %}<option value="{{ sc }}" {{ 'selected' if sc == p.get('scope', 'both') }}>{{ sc }}</option>{% endfor %}
-    </select>
-  </fieldset>
-  <fieldset data-kinds="ecs_scale_down">
-    <label for="mode">Mode (deny: block matching services, blank pattern = all; allow: only matching services may be scaled down)</label>
-    <select id="mode" name="mode">
-      {% for m in ecs_modes %}<option value="{{ m }}" {{ 'selected' if m == p.get('mode', 'deny') }}>{{ m }}</option>{% endfor %}
-    </select>
-  </fieldset>
-  <fieldset data-kinds="protected_eni ecs_scale_down">
-    <label for="pattern">Pattern (regex; protected ENI: ENI id / description / name / owner; ECS: cluster/service)</label>
-    <input id="pattern" name="pattern" class="mono" size="60" value="{{ p.get('pattern', '') }}">
-  </fieldset>
   <p><button type="submit">Save</button></p>
 </form>
 <script>
 function showParams() {
   const kind = document.getElementById('kind').value;
-  document.querySelectorAll('fieldset[data-kinds]').forEach(fs => {
-    fs.style.display = fs.dataset.kinds.split(' ').includes(kind) ? '' : 'none';
+  document.querySelectorAll('.rule-form [data-kinds]').forEach(el => {
+    const on = el.dataset.kinds.split(' ').includes(kind);
+    el.style.display = on ? '' : 'none';
+    // Hidden inputs must not be submitted for another rule type.
+    el.querySelectorAll('input, select').forEach(i => { i.disabled = !on; });
   });
 }
 showParams();

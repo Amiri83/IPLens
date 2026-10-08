@@ -2,5 +2,6 @@
 {% block title %}Error{% endblock %}
 {% block content %}
 <h1>{{ message }}</h1>
+{% if out_of_scope %}<p>Change it on the <a href="{{ url_for('scope_page') }}">Scope</a> page or clear the scope in the top bar.</p>{% endif %}
 <p><a href="{{ url_for('overview') }}">Back to overview</a></p>
 {% endblock %}

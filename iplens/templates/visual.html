@@ -1,11 +1,12 @@
 {% extends "base.html" %}
+{% from "_macros.html" import no_data with context %}
 {% block title %}Visual{% endblock %}
 {% block content %}
 <h1>Visual</h1>
 {% if not snap %}
-  <div class="card">No snapshot yet — refresh from <a href="{{ url_for('overview') }}">Discovery</a>.</div>
+  {{ no_data() }}
 {% elif not tree %}
-  <div class="card muted">No VPCs found in this snapshot.</div>
+  <div class="card muted">No VPCs {{ 'in the active scope' if scope_count else 'found in this snapshot' }}.</div>
 {% else %}
 <form method="get" action="{{ url_for('visual') }}" class="card row visual-controls" id="visual-form">
   <div><label for="vpc">VPC</label>

@@ -8,6 +8,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Any
 
+from .scope import UNSCOPED, ResolvedScope
 from .visual import EDGE_TYPES, LABEL_MAX, ellipsize, visual_edges
 
 # AWS reserves the first four addresses and the last address of every subnet.
@@ -195,7 +196,10 @@ def subnet_stats(conn: sqlite3.Connection, snap_id: int) -> list[SubnetStats]:
     return [_subnet_stats(r, *counts.get(r["subnet_id"], (0, 0))) for r in rows]
 
 
-def vpc_tree(conn: sqlite3.Connection, snap_id: int) -> list[VpcNode]:
+def vpc_tree(
+    conn: sqlite3.Connection, snap_id: int, scope: ResolvedScope = UNSCOPED
+) -> list[VpcNode]:
+    """VPCs with their subnets, limited to ``scope``."""
     nodes = {
         r["vpc_id"]: VpcNode(
             vpc_id=r["vpc_id"],
@@ -204,20 +208,25 @@ def vpc_tree(conn: sqlite3.Connection, snap_id: int) -> list[VpcNode]:
             is_default=bool(r["is_default"]),
         )
         for r in conn.execute("SELECT * FROM vpcs WHERE snapshot_id=? ORDER BY vpc_id", (snap_id,))
+        if scope.vpc_ok(r["vpc_id"])
     }
     for s in subnet_stats(conn, snap_id):
-        if s.vpc_id in nodes:
+        if s.vpc_id in nodes and scope.subnet_ok(s.subnet_id):
             nodes[s.vpc_id].subnets.append(s)
     for n in nodes.values():
         n.subnets.sort(key=lambda s: int(ipaddress.IPv4Network(s.cidr).network_address))
     return list(nodes.values())
 
 
-def owner_breakdown(conn: sqlite3.Connection, snap_id: int) -> dict[str, int]:
+def owner_breakdown(
+    conn: sqlite3.Connection, snap_id: int, scope: ResolvedScope = UNSCOPED
+) -> dict[str, int]:
+    where, args = scope.sql("i")
+    cond = "".join(f" AND {w}" for w in where)
     rows = conn.execute(
-        "SELECT owner_type, COUNT(DISTINCT ip) AS n FROM ips WHERE snapshot_id=? "
-        "GROUP BY owner_type ORDER BY n DESC",
-        (snap_id,),
+        "SELECT i.owner_type, COUNT(DISTINCT i.ip) AS n FROM ips i "  # noqa: S608 - fixed SQL
+        f"WHERE i.snapshot_id=?{cond} GROUP BY i.owner_type ORDER BY n DESC",
+        (snap_id, *args),
     ).fetchall()
     return {r["owner_type"]: r["n"] for r in rows}
 
@@ -296,9 +305,18 @@ def subnet_enis(conn: sqlite3.Connection, snap_id: int, subnet_id: str) -> list[
     return [_eni_dict(r) for r in rows]
 
 
+def owner_names(row: dict[str, Any]) -> list[str]:
+    """Every owning resource of an ENI row (several functions can share a Lambda ENI)."""
+    names = json.loads(row.get("owner_names") or "[]")
+    if not names and row.get("owner_ref"):
+        names = [row["owner_ref"]]
+    return names
+
+
 def _eni_dict(row: sqlite3.Row) -> dict[str, Any]:
     d = dict(row)
     d["security_groups"] = json.loads(d.get("security_groups") or "[]")
+    d["owner_names"] = owner_names(d)
     return d
 
 
@@ -347,7 +365,8 @@ LEFT JOIN endpoints ep
 """
 _IP_COLUMNS = (
     "i.ip, i.ip_int, i.eni_id, i.subnet_id, i.vpc_id, i.is_primary, i.public_ip, i.owner_type, "
-    "e.owner_ref, e.status, e.description, e.az, e.instance_id, e.interface_type, "
+    "e.owner_ref, e.owner_names, e.status, e.description, e.az, e.instance_id, "
+    "e.interface_type, "
     "e.name AS eni_name, s.name AS subnet_name, s.cidr AS subnet_cidr, v.name AS vpc_name, "
     "lb.lb_type, ep.service_name"
 )
@@ -360,6 +379,7 @@ _IP_SEARCH_COLUMNS = (
     "v.name",
     "i.public_ip",
     "e.owner_ref",
+    "e.owner_names",
     "e.description",
     "e.instance_id",
     "e.name",
@@ -403,18 +423,30 @@ def endpoint_service_short(service_name: str) -> str:
 
 
 def resource_name(row: dict[str, Any]) -> str:
-    """Best display name for the owning resource: Name tag, endpoint service, then ref."""
+    """Best display name for the owning resource: Name tag, endpoint service, then the
+    owner(s) - every function of a shared Lambda ENI, comma-separated."""
     if row.get("eni_name"):
         return row["eni_name"]
     if row.get("service_name"):
         return endpoint_service_short(row["service_name"])
-    return row.get("owner_ref") or ""
+    names = row["owner_names"] if isinstance(row.get("owner_names"), list) else owner_names(row)
+    return ", ".join(names) if len(names) > 1 else row.get("owner_ref") or ""
+
+
+def short_owner_label(names: list[str]) -> str:
+    """``"fn-a +2 more"`` for a shared ENI, else the single name."""
+    if len(names) > 1:
+        return f"{names[0]} +{len(names) - 1} more"
+    return names[0] if names else ""
 
 
 def ip_list(
-    conn: sqlite3.Connection, snap_id: int, flt: IpFilter | None = None
+    conn: sqlite3.Connection,
+    snap_id: int,
+    flt: IpFilter | None = None,
+    scope: ResolvedScope = UNSCOPED,
 ) -> list[dict[str, Any]]:
-    """Every private IP of a snapshot matching ``flt``, ordered numerically by address.
+    """Every private IP of a snapshot in ``scope`` matching ``flt``, ordered by address.
 
     Each row carries the IP/ENI columns plus subnet/VPC names, ``lb_type`` and
     endpoint ``service_name`` (when applicable) and a derived ``resource_name``.
@@ -422,6 +454,9 @@ def ip_list(
     flt = flt or IpFilter()
     where = ["i.snapshot_id = ?"]
     args: list[Any] = [snap_id]
+    scope_where, scope_args = scope.sql("i")
+    where += scope_where
+    args += scope_args
     if flt.vpc:
         where.append("i.vpc_id = ?")
         args.append(flt.vpc)
@@ -447,6 +482,7 @@ def ip_list(
     )
     rows = [dict(r) for r in conn.execute(sql, args)]
     for r in rows:
+        r["owner_names"] = owner_names(r)
         r["resource_name"] = resource_name(r)
     return rows
 
@@ -508,7 +544,11 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
     for r in rows:
         node = nodes.get(r["eni_id"])
         if node is None:
-            name = r["resource_name"] or r["eni_id"]
+            owners = r["owner_names"]
+            if len(owners) > 1 and not r.get("eni_name"):
+                name = short_owner_label(owners)
+            else:
+                name = r["resource_name"] or r["eni_id"]
             node = nodes[r["eni_id"]] = {
                 "kind": "resource",
                 "id": r["eni_id"],
@@ -519,6 +559,7 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
                 "name": name,
                 "label_name": ellipsize(name, LABEL_MAX["name"]),
                 "ref": r["owner_ref"] or "",
+                "owners": owners,
                 "status": r["status"] or "",
                 "icon": _icon_for(r),
                 "ips": [],
@@ -567,6 +608,7 @@ def visual_data(
     vpc_id: str = "",
     labels: dict[str, str] | None = None,
     edge_types: tuple[str, ...] = EDGE_TYPES,
+    scope: ResolvedScope = UNSCOPED,
 ) -> dict[str, Any] | None:
     """Nested VPC -> subnets -> resource nodes, plus resource edges, for the Visual page.
 
@@ -574,7 +616,7 @@ def visual_data(
     Only edges of ``edge_types`` are returned (see :mod:`iplens.visual`).
     """
     labels = labels or {}
-    tree = vpc_tree(conn, snap_id)
+    tree = vpc_tree(conn, snap_id, scope)
     vpcs = [{"vpc_id": v.vpc_id, "name": v.name} for v in tree]
     if not tree:
         return {"snapshot_id": snap_id, "vpcs": [], "vpc": None, "icons": {"vpc": VPC_ICON}}
@@ -584,7 +626,7 @@ def visual_data(
 
     by_subnet: dict[str, list[dict[str, Any]]] = {}
     by_ip: dict[str, str] = {}
-    for r in ip_list(conn, snap_id, IpFilter(vpc=vpc.vpc_id)):
+    for r in ip_list(conn, snap_id, IpFilter(vpc=vpc.vpc_id), scope):
         by_subnet.setdefault(r["subnet_id"], []).append(r)
         by_ip[r["ip"]] = r["eni_id"]
 

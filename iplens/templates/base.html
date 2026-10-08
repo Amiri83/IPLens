@@ -17,6 +17,7 @@
     {{ nav_link('overview', 'Discovery', ep in ('overview', 'subnet', 'eni')) }}
     {{ nav_link('ips', 'IP List', ep.startswith('ips')) }}
     {{ nav_link('visual', 'Visual', ep.startswith('visual')) }}
+    {{ nav_link('scope_page', 'Scope', ep.startswith('scope')) }}
     {{ nav_link('rules_list', 'Rules', ep.startswith('rule')) }}
     {{ nav_link('suggestions', 'Suggestions', ep == 'suggestions') }}
     {{ nav_link('settings_page', 'Settings', ep.startswith('settings')) }}
@@ -24,10 +25,13 @@
   </nav>
   <span class="ctx"{% if active_account %} title="auth: {{ active_account.mode_label }}"{% endif %}>
     {% if header_snap %}
-      <b>{{ account_label(header_snap) }}</b> · {{ header_snap.region }} ·
+      viewing <b>{{ account_label(header_snap) }}</b> · {{ header_snap.region }} ·
       updated {{ header_snap.taken_at | localtime }}
     {% elif active_account %}
-      no snapshot yet · {{ active_account.region }}
+      viewing <b>{{ active_label }}</b> · no data yet · {{ active_account.region }}
+    {% endif %}
+    {% if active_account and active_account.identity_warning %}
+      · <a class="ctx-warn" href="{{ url_for('settings_page') }}" title="{{ active_account.identity_warning }}">AWS account changed</a>
     {% endif %}
     {% if active_account and active_account.problem %}
       · <a class="ctx-warn" href="{{ url_for('account_edit', account_id=active_account.id) }}">{{ active_account.problem }}</a>
@@ -35,6 +39,14 @@
       · {{ active_account.status }}
     {% endif %}
   </span>
+  {% if scope_count %}
+  <form class="scope-indicator" method="post" action="{{ url_for('scope_clear') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="next" value="{{ request.full_path.rstrip('?') }}">
+    <a href="{{ url_for('scope_page') }}" title="Only part of this account is shown">scope: {{ scope_count }} filter{{ '' if scope_count == 1 else 's' }}</a>
+    <button type="submit" class="secondary" title="Clear the scope and show everything">clear</button>
+  </form>
+  {% endif %}
   {% if account_choices %}
   <form class="account-switch" method="post" action="{{ url_for('account_activate') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

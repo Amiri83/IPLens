@@ -45,7 +45,11 @@
   function resourceTitle(r) {
     const lines = [r.name];
     if (r.type_label !== r.name) lines.push(r.type_label);
-    if (r.ref && r.ref !== r.name) lines.push(r.ref);
+    if (r.owners && r.owners.length > 1) {
+      lines.push(`Shared by ${r.owners.length}:`, ...r.owners.map((o) => "  " + o));
+    } else if (r.ref && r.ref !== r.name) {
+      lines.push(r.ref);
+    }
     lines.push(r.eni_id, ...r.ips);
     return lines.join("\n");
   }

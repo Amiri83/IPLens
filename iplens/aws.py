@@ -105,6 +105,7 @@ class ConnectionCheck(NamedTuple):
     ok: bool
     message: str
     credentials_problem: bool = False
+    account_id: str = ""  # AWS account the credentials resolved to (on success)
 
 
 def check_connection(
@@ -122,7 +123,11 @@ def check_connection(
             return ConnectionCheck(False, f"Connection failed: {msg}", True)
         return ConnectionCheck(False, f"Connection failed: {_safe_error(exc)}")
     log.info("connection test succeeded (region=%s)", gw.region)
-    return ConnectionCheck(True, f"Connected to account {ident['account']} in {gw.region}")
+    return ConnectionCheck(
+        True,
+        f"Connected to account {ident['account']} in {gw.region}",
+        account_id=ident["account"],
+    )
 
 
 def _safe_error(exc: Exception) -> str:
