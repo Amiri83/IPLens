@@ -231,6 +231,25 @@ def test_svg_hidden_borders_keep_labels():
             assert g.find(f"{SVG_NS}text") is not None
 
 
+def test_exports_keep_full_wrapped_and_shortened_labels():
+    # As visual.js sends them: a full name wrapped after "-", and a middle-ellipsized one.
+    wrapped = "team-app-dev-platform-shared-\nlambda-worker-1\nLambda\n10.0.1.11"
+    short = "team-app-…-lambda-worker-2 +1 more\nLambda\n10.0.1.12"
+    view = _view()
+    view["nodes"][3]["label"] = wrapped
+    view["nodes"][4]["label"] = short
+    parsed = parse_view(json.dumps(view))
+
+    svg = _parse(view_to_svg(parsed))
+    lines = [t.text for t in svg.iter(f"{SVG_NS}tspan")] or list(svg.itertext())
+    for line in (*wrapped.split("\n"), *short.split("\n")):
+        assert line in lines
+
+    values = {c.get("value") for c in _parse(view_to_drawio(parsed)).iter("mxCell")}
+    assert wrapped.replace("\n", "<br>") in values
+    assert short.replace("\n", "<br>") in values
+
+
 def test_empty_view_exports():
     view = parse_view(json.dumps({"vpc_id": "", "nodes": [], "edges": []}))
     assert _parse(view_to_svg(view)).tag == f"{SVG_NS}svg"

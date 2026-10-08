@@ -14,6 +14,14 @@
   const SUBNET_LABEL_H = 48;   // three 11px lines above each subnet box
   const MAX_IPS_IN_LABEL = 3;
   const MAX_TITLE_LINES = 12;  // tooltip lines listed for an edge merged into a group node
+  const CELL_GAP = 24;         // grid layout: space between two wrapped resource labels
+  // Label line widths in px; full names are wrapped after "- _ . /" to fit.
+  const TEXT_W = { res: 180, subnet: 300, vpc: 420 };
+  const FONTS = {
+    res: "normal normal 10px system-ui, sans-serif",
+    subnet: "normal normal 11px system-ui, sans-serif",
+    vpc: "normal bold 14px system-ui, sans-serif",
+  };
 
   const container = document.getElementById("cy");
   if (!container || typeof cytoscape === "undefined") return;
@@ -28,14 +36,82 @@
   const vpcId = container.dataset.vpc;
   const showVpcBox = document.getElementById("show-vpc");
   const showSubnetsBox = document.getElementById("show-subnets");
+  const shortenBox = document.getElementById("shorten-names");
+  const SHORT_MAX = parseInt(container.dataset.shortMax, 10) || 32;
   const SAVE_DELAY_MS = 400;
   // Dragged positions for this account + VPC: {node id: {x, y}}.
   let saved = JSON.parse(document.getElementById("visual-positions").textContent || "{}");
 
-  // -- labels (names arrive pre-truncated as label_*; tooltips show the full text) ----
+  // -- labels (full names arrive as label_*; the page wraps or shortens them) ---------
+
+  const SEPARATORS = "-_./";
+
+  // Mirrors iplens.visual.middle_ellipsize: keep the start and the (longer) end so
+  // names sharing a prefix stay distinguishable, e.g. "datalab-…-kafka-producer".
+  function middleEllipsize(text, limit) {
+    text = text || "";
+    if (text.length <= limit) return text;
+    if (limit <= 2) return "…".slice(0, limit);
+    const budget = limit - 1;
+    const headN = Math.floor(budget * 2 / 5);
+    const tailN = budget - headN;
+    let head = text.slice(0, headN);
+    let tail = text.slice(-tailN);
+    const cut = Math.max(...Array.from(SEPARATORS, (c) => head.lastIndexOf(c)));
+    if (cut >= Math.floor(headN / 2)) head = head.slice(0, cut + 1);
+    const starts = Array.from(SEPARATORS, (c) => tail.indexOf(c)).filter((i) => i >= 0);
+    if (starts.length && Math.min(...starts) <= Math.floor(tailN / 2)) tail = tail.slice(Math.min(...starts));
+    return head + "…" + tail;
+  }
+
+  function shortName(text) {
+    return shortenBox && shortenBox.checked ? middleEllipsize(text, SHORT_MAX) : text;
+  }
+
+  // "<first owner> +N more" for a shared ENI: only the first name is shortened.
+  function resourceName(r) {
+    const owners = r.owners || [];
+    const more = owners.length > 1 ? ` +${owners.length - 1} more` : "";
+    if (more && r.label_name === owners[0] + more) return shortName(owners[0]) + more;
+    return shortName(r.label_name);
+  }
+
+  const measureCtx = document.createElement("canvas").getContext("2d");
+  function textWidth(text, font) {
+    measureCtx.font = font;
+    return measureCtx.measureText(text).width;
+  }
+
+  /* One label line broken into lines no wider than TEXT_W[kind], after "- _ . /" or
+     whitespace (a part too wide on its own is broken anywhere). Explicit line breaks
+     make cytoscape's label box, and so the layout spacing, fit the wrapped text, and
+     carry over unchanged into the SVG / draw.io exports. */
+  function wrapLine(text, kind) {
+    const maxW = TEXT_W[kind];
+    const font = FONTS[kind];
+    if (!text || textWidth(text, font) <= maxW) return text || "";
+    const lines = [];
+    let line = "";
+    const push = (part) => {
+      if (line && textWidth(line + part, font) > maxW) {
+        lines.push(line.trimEnd());
+        line = "";
+      }
+      line += line ? part : part.trimStart();
+    };
+    (text.match(/[^\-_./\s]+[\-_./\s]*|[\-_./\s]+/g) || [text]).forEach((part) => {
+      if (textWidth(part, font) <= maxW) {
+        push(part);
+        return;
+      }
+      Array.from(part).forEach((ch) => push(ch));
+    });
+    if (line.trim()) lines.push(line.trimEnd());
+    return lines.join("\n");
+  }
 
   function resourceLabel(r) {
-    const lines = [r.label_name];
+    const lines = [wrapLine(resourceName(r), "res")];
     if (r.name !== r.type_label) lines.push(r.type_label);
     lines.push(...r.ips.slice(0, MAX_IPS_IN_LABEL));
     if (r.ips.length > MAX_IPS_IN_LABEL) lines.push(`+${r.ips.length - MAX_IPS_IN_LABEL} more`);
@@ -59,11 +135,17 @@
   }
 
   function subnetLabel(s) {
-    return [s.label_name, s.label_meta, usage(s)].join("\n");
+    return [wrapLine(shortName(s.label_name), "subnet"), wrapLine(s.label_meta, "subnet"), usage(s)]
+      .join("\n");
   }
 
   function subnetTitle(s) {
     return [s.name || s.subnet_id, s.subnet_id, `${s.cidr} · ${s.az}`, usage(s)].join("\n");
+  }
+
+  function vpcLabel(vpc) {
+    return [wrapLine(shortName(vpc.label_name), "vpc"), wrapLine(`${vpc.vpc_id} · ${vpc.label_cidrs}`, "vpc")]
+      .join("\n");
   }
 
   function groupLabel(g, expanded) {
@@ -84,6 +166,7 @@
         icon: iconBase + r.icon,
         iconFile: r.icon,
         eni: r.eni_id,
+        raw: r,
         ...extra,
       },
       classes: "res" + (r.status === "available" ? " idle" : "") + (extra.memberOf ? " member hidden" : ""),
@@ -96,10 +179,11 @@
       group: "nodes",
       data: {
         id: "vpc",
-        label: `${vpc.label_name}\n${vpc.vpc_id} · ${vpc.label_cidrs}`,
+        label: vpcLabel(vpc),
         title: [vpc.name || vpc.vpc_id, vpc.vpc_id, ...vpc.cidrs].join("\n"),
         icon: iconBase + data.icons.vpc,
         iconFile: data.icons.vpc,
+        raw: vpc,
       },
       classes: "vpc",
       grabbable: false,  // dragging the whole VPC would only look like panning
@@ -108,7 +192,7 @@
       const sid = "subnet:" + s.subnet_id;
       els.push({
         group: "nodes",
-        data: { id: sid, parent: "vpc", order: si, label: subnetLabel(s), title: subnetTitle(s) },
+        data: { id: sid, parent: "vpc", order: si, label: subnetLabel(s), title: subnetTitle(s), raw: s },
         classes: "subnet" + (s.items.length ? "" : " empty"),
       });
       s.items.forEach((item, i) => {
@@ -131,6 +215,18 @@
       });
     });
     return els;
+  }
+
+  // Rebuild every node label, e.g. after "Shorten long names" was toggled.
+  function refreshLabels(cy) {
+    cy.batch(() => {
+      cy.nodes().forEach((n) => {
+        const raw = n.data("raw");
+        if (n.hasClass("vpc")) n.data("label", vpcLabel(raw));
+        else if (n.hasClass("subnet")) n.data("label", subnetLabel(raw));
+        else if (n.hasClass("res")) n.data("label", resourceLabel(raw));
+      });
+    });
   }
 
   // -- edges --------------------------------------------------------------------------
@@ -176,7 +272,7 @@
           etype: m.type,
           source: m.source,
           target: m.target,
-          label: m.n > 1 ? `${m.label} ×${m.n}` : m.label,
+          label: m.n > 1 ? `${shortName(m.label)} ×${m.n}` : shortName(m.label),
           title: m.titles.join("\n") + (m.n > m.titles.length ? `\n… +${m.n - m.titles.length} more` : ""),
         },
         classes: "edge-" + m.type,
@@ -201,6 +297,7 @@
   }
 
   // Deterministic grid layout: subnets in rows, resources in a grid inside each subnet.
+  // Cells grow with the widest / tallest wrapped label so labels never overlap.
   function gridLayout(cy) {
     let x0 = 0, y0 = 0, rowH = 0, col = 0;
     const subnets = cy.nodes(".subnet").sort((a, b) => a.data("order") - b.data("order"));
@@ -210,15 +307,22 @@
         const n = Math.max(kids.length, 1);
         const cols = Math.min(COLS, n);
         const rows = Math.ceil(n / cols);
+        let cellW = CELL_W, cellH = CELL_H;
+        kids.forEach((k) => {
+          const dim = k.layoutDimensions({ nodeDimensionsIncludeLabels: true });
+          cellW = Math.max(cellW, dim.w + CELL_GAP);
+          cellH = Math.max(cellH, dim.h + CELL_GAP);
+        });
+        const labelW = sn.boundingBox({ includeNodes: false, includeLabels: true }).w || 0;
         if (kids.length) {
           kids.forEach((k, i) => {
-            k.position({ x: x0 + (i % cols) * CELL_W, y: y0 + Math.floor(i / cols) * CELL_H });
+            k.position({ x: x0 + (i % cols) * cellW, y: y0 + Math.floor(i / cols) * cellH });
           });
         } else {
-          sn.position({ x: x0 + CELL_W / 2, y: y0 });
+          sn.position({ x: x0 + cellW / 2, y: y0 });
         }
-        x0 += Math.max(cols * CELL_W, 2 * CELL_W) + SUBNET_GAP_X;
-        rowH = Math.max(rowH, rows * CELL_H);
+        x0 += Math.max(cols * cellW, 2 * CELL_W, labelW) + SUBNET_GAP_X;
+        rowH = Math.max(rowH, rows * cellH);
         col += 1;
         if (col === SUBNETS_PER_ROW) {
           col = 0; x0 = 0; y0 += rowH + SUBNET_GAP_Y; rowH = 0;
@@ -337,11 +441,17 @@
     });
   }
 
+  // Only the posted toggles change server-side.
+  function savePrefs(fields) {
+    post(container.dataset.prefsUrl, fields)
+      .catch((err) => { note.textContent = `Could not save the setting (${err.message}).`; });
+  }
+
   function saveBorders() {
-    post(container.dataset.prefsUrl, {
+    savePrefs({
       show_vpc: showVpcBox.checked ? "1" : "0",
       show_subnets: showSubnetsBox.checked ? "1" : "0",
-    }).catch((err) => { note.textContent = `Could not save the border setting (${err.message}).`; });
+    });
   }
 
   // -- export -------------------------------------------------------------------------
@@ -440,14 +550,15 @@
 
   const style = [
     { selector: "node", style: {
-      "label": "data(label)", "font-size": 10, "text-wrap": "wrap", "text-max-width": 160,
+      // Labels arrive pre-wrapped by wrapLine; the slack absorbs measuring differences.
+      "label": "data(label)", "font-size": 10, "text-wrap": "wrap", "text-max-width": TEXT_W.res + 4,
       "color": "#1f2933", "font-family": "system-ui, sans-serif",
     } },
     { selector: ".vpc", style: {
       "shape": "rectangle", "background-color": "#f7f3ff", "background-opacity": 1,
       "border-width": 2, "border-color": "#8c4fff", "padding": 50,
       "text-valign": "top", "text-halign": "center", "font-size": 14, "font-weight": "bold",
-      "text-margin-y": -6, "text-max-width": 420,
+      "text-margin-y": -6, "text-max-width": TEXT_W.vpc + 4,
       "background-image": "data(icon)", "background-width": 32, "background-height": 32,
       "background-position-x": 0, "background-position-y": 0, "background-clip": "none",
     } },
@@ -455,7 +566,7 @@
       "shape": "rectangle", "background-color": "#ffffff", "border-width": 1.5,
       "border-color": "#7aa116", "border-style": "solid", "padding": SUBNET_PAD,
       "text-valign": "top", "text-halign": "center", "font-size": 11, "text-margin-y": -4,
-      "text-max-width": 300, "min-width": SUBNET_MIN_W,
+      "text-max-width": TEXT_W.subnet + 4, "min-width": SUBNET_MIN_W,
     } },
     { selector: ".subnet.empty", style: { "width": SUBNET_MIN_W, "height": 50 } },
     // Border toggles: the box disappears, its label stays.
@@ -614,6 +725,12 @@
       applyBorders(cy);
       saveBorders();
     }));
+    // Label sizes change, so the automatic layout is redone; dragged nodes keep their spot.
+    shortenBox.addEventListener("change", () => {
+      refreshLabels(cy);
+      relayout();
+      savePrefs({ shorten_names: shortenBox.checked ? "1" : "0" });
+    });
     document.getElementById("export-svg").addEventListener("click", () => {
       download(container.dataset.exportSvg, currentView(cy));
     });

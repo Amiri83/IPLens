@@ -1,4 +1,4 @@
-"""Visual page helpers: connections between resource nodes and label truncation.
+"""Visual page helpers: connections between resource nodes and label shortening.
 
 Edges are derived from the stored snapshot only:
 
@@ -43,8 +43,12 @@ MAX_REACH_EDGES = 400
 ENDPOINT_PORT = 443
 REACH_LABEL = "can reach (SG)"
 
-# Maximum characters of a label line before it is cut with an ellipsis.
-LABEL_MAX = {"name": 24, "subnet": 32, "cidr": 40, "edge": 28}
+# Labels are sent in full; the Visual page's "Shorten long names" option cuts names
+# longer than this in the browser (``middleEllipsize`` in static/visual.js mirrors
+# :func:`middle_ellipsize`).
+SHORT_NAME_MAX = 32
+# Characters a long name may be wrapped or cut after.
+NAME_SEPARATORS = "-_./"
 
 
 def ellipsize(text: str | None, limit: int) -> str:
@@ -55,6 +59,31 @@ def ellipsize(text: str | None, limit: int) -> str:
     if limit <= 1:
         return "…"[:limit]
     return text[: limit - 1].rstrip() + "…"
+
+
+def middle_ellipsize(text: str | None, limit: int = SHORT_NAME_MAX) -> str:
+    """``text`` cut to at most ``limit`` characters by replacing its middle with "…".
+
+    The start and the (slightly longer) end are kept, so names sharing a long prefix
+    stay distinguishable: "datalab-…-kafka-producer". Each side is trimmed back to a
+    separator (``- _ . /``) when one lies in its outer half.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    if limit <= 2:
+        return "…"[:limit]
+    budget = limit - 1
+    head_n = budget * 2 // 5
+    tail_n = budget - head_n
+    head, tail = text[:head_n], text[-tail_n:]
+    cut = max(head.rfind(c) for c in NAME_SEPARATORS)
+    if cut >= head_n // 2:
+        head = head[: cut + 1]
+    starts = [i for i in (tail.find(c) for c in NAME_SEPARATORS) if i >= 0]
+    if starts and min(starts) <= tail_n // 2:
+        tail = tail[min(starts) :]
+    return head + "…" + tail
 
 
 def parse_edge_types(
@@ -108,7 +137,7 @@ class _EdgeSet:
                 "type": etype,
                 "source": source.eni_id,
                 "target": target.eni_id,
-                "label": ellipsize(label, LABEL_MAX["edge"]),
+                "label": label,
                 "title": title,
             }
         elif title not in edge["title"].split("\n"):

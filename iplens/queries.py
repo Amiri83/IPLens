@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .scope import UNSCOPED, ResolvedScope
-from .visual import EDGE_TYPES, LABEL_MAX, ellipsize, visual_edges
+from .visual import EDGE_TYPES, visual_edges
 
 # AWS reserves the first four addresses and the last address of every subnet.
 AWS_RESERVED_HEAD = 4
@@ -557,7 +557,7 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
                 "type": r["owner_type"],
                 "type_label": resource_type_label(r, labels),
                 "name": name,
-                "label_name": ellipsize(name, LABEL_MAX["name"]),
+                "label_name": name,
                 "ref": r["owner_ref"] or "",
                 "owners": owners,
                 "status": r["status"] or "",
@@ -639,8 +639,8 @@ def visual_data(
             {
                 "subnet_id": s.subnet_id,
                 "name": s.name,
-                "label_name": ellipsize(s.name or s.subnet_id, LABEL_MAX["subnet"]),
-                "label_meta": ellipsize(f"{s.subnet_id} · {s.cidr} · {s.az}", LABEL_MAX["cidr"]),
+                "label_name": s.name or s.subnet_id,
+                "label_meta": f"{s.subnet_id} · {s.cidr} · {s.az}",
                 "cidr": s.cidr,
                 "az": s.az,
                 "size": s.size,
@@ -658,8 +658,8 @@ def visual_data(
         "vpc": {
             "vpc_id": vpc.vpc_id,
             "name": vpc.name,
-            "label_name": ellipsize(vpc.name or vpc.vpc_id, LABEL_MAX["subnet"]),
-            "label_cidrs": ellipsize(", ".join(vpc.cidrs), LABEL_MAX["cidr"]),
+            "label_name": vpc.name or vpc.vpc_id,
+            "label_cidrs": ", ".join(vpc.cidrs),
             "cidrs": vpc.cidrs,
             "subnets": subnets,
         },

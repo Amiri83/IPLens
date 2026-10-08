@@ -1,6 +1,6 @@
 import sqlite3
 
-from iplens import queries
+from iplens import queries, viewstate
 from iplens.db import closing, init_db
 
 
@@ -31,6 +31,27 @@ def test_init_db_adds_account_alias_to_existing_database(tmp_path):
         1,
     )
     assert "account_ref" in cols
+
+
+def test_init_db_adds_shorten_names_to_existing_visual_prefs(tmp_path):
+    p = tmp_path / "old.db"
+    init_db(p)
+    with closing(p) as c:  # a visual_prefs table from before the "Shorten long names" toggle
+        c.execute("DROP TABLE visual_prefs")
+        c.execute(
+            "CREATE TABLE visual_prefs (account_ref INTEGER PRIMARY KEY, "
+            "show_vpc INTEGER NOT NULL DEFAULT 1, show_subnets INTEGER NOT NULL DEFAULT 1)"
+        )
+        c.execute("INSERT INTO visual_prefs VALUES(1, 0, 1)")
+
+    init_db(p)
+
+    with closing(p) as c:
+        assert viewstate.get_prefs(c, 1) == {
+            "show_vpc": False,
+            "show_subnets": True,
+            "shorten_names": False,
+        }
 
 
 def test_prune_and_history_are_per_account(db_path, snapshot_builder):

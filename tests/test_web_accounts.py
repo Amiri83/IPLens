@@ -565,6 +565,29 @@ def test_visual_border_prefs_remembered_per_account(client, two_accounts):
     assert 'id="show-vpc" checked' in page  # account B keeps the defaults
 
 
+def test_visual_shorten_names_pref_remembered_per_account(client, two_accounts):
+    page = client.get("/visual").data.decode()
+    assert 'id="shorten-names" >' in page  # unchecked by default
+    assert 'data-short-max="32"' in page
+    assert _post(client, "/visual/prefs", {"shorten_names": "1"}).status_code == 204
+    page = client.get("/visual").data.decode()
+    assert 'id="shorten-names" checked' in page
+    # saving only the shorten toggle leaves the border toggles alone, and vice versa
+    assert 'id="show-vpc" checked' in page and 'id="show-subnets" checked' in page
+    assert _post(client, "/visual/prefs", {"show_vpc": "0", "show_subnets": "1"}).status_code == 204
+    page = client.get("/visual").data.decode()
+    assert 'id="shorten-names" checked' in page and 'id="show-vpc" >' in page
+
+    _activate(client, two_accounts["b_id"])
+    assert 'id="shorten-names" >' in client.get("/visual").data.decode()  # B: default
+    assert _post(client, "/visual/prefs", {"shorten_names": "1"}).status_code == 204
+    assert _post(client, "/visual/prefs", {"shorten_names": "0"}).status_code == 204
+    assert 'id="shorten-names" >' in client.get("/visual").data.decode()
+
+    _activate(client, 1)
+    assert 'id="shorten-names" checked' in client.get("/visual").data.decode()
+
+
 def test_visual_layout_saved_per_account_and_vpc(client, two_accounts):
     positions = {f"res:{ENI_A}": {"x": 120.5, "y": -40}, f"subnet:{SUBNET_A}": {"x": 0, "y": 0}}
     resp = _post(client, "/visual/layout", {"vpc": VPC_A, "positions": json.dumps(positions)})
