@@ -54,6 +54,27 @@ def test_init_db_adds_shorten_names_to_existing_visual_prefs(tmp_path):
         }
 
 
+def test_init_db_adds_evidence_filter_to_existing_visual_prefs(tmp_path):
+    p = tmp_path / "old.db"
+    init_db(p)
+    with closing(p) as c:  # a visual_prefs table from before the Extended view filter
+        c.execute("DROP TABLE visual_prefs")
+        c.execute(
+            "CREATE TABLE visual_prefs (account_ref INTEGER PRIMARY KEY, "
+            "show_vpc INTEGER NOT NULL DEFAULT 1, show_subnets INTEGER NOT NULL DEFAULT 1, "
+            "shorten_names INTEGER NOT NULL DEFAULT 0)"
+        )
+        c.execute("INSERT INTO visual_prefs VALUES(1, 0, 1, 1)")
+
+    init_db(p)
+
+    with closing(p) as c:
+        assert viewstate.get_evidence(c, 1) == ("observed", "configured")
+        viewstate.save_evidence(c, 1, ("referenced",))
+        assert viewstate.get_evidence(c, 1) == ("referenced",)
+        assert viewstate.get_prefs(c, 1)["shorten_names"] is True
+
+
 def test_prune_and_history_are_per_account(db_path, snapshot_builder):
     with closing(db_path) as conn:
         conn.execute("INSERT INTO accounts(region, auth_mode) VALUES('us-east-1', 'env')")

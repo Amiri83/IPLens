@@ -245,7 +245,8 @@ CREATE TABLE IF NOT EXISTS visual_prefs (
     account_ref  INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
     show_vpc     INTEGER NOT NULL DEFAULT 1,
     show_subnets INTEGER NOT NULL DEFAULT 1,
-    shorten_names INTEGER NOT NULL DEFAULT 0
+    shorten_names INTEGER NOT NULL DEFAULT 0,
+    evidence     TEXT              -- Extended view evidence filter; NULL: the default levels
 );
 
 -- Per-account scope: the VPCs / subnets / IP ranges every view shows (JSON, see scope.py).
@@ -348,6 +349,7 @@ _ADDED_COLUMNS = (
     ("accounts", "last_seen_account_id", "TEXT"),
     ("enis", "owner_names", "TEXT"),
     ("visual_prefs", "shorten_names", "INTEGER NOT NULL DEFAULT 0"),
+    ("visual_prefs", "evidence", "TEXT"),
 )
 
 # Single-account settings rows from before multi-account support.

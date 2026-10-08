@@ -1,4 +1,5 @@
-"""Per-account Visual page state: border/label toggles and dragged node positions."""
+"""Per-account Visual page state: border/label toggles, the Extended view's evidence
+filter and dragged node positions."""
 
 from __future__ import annotations
 
@@ -6,6 +7,8 @@ import json
 import math
 import sqlite3
 from typing import Any
+
+from .declutter import DEFAULT_EVIDENCE, parse_evidence
 
 # Saved layouts are bounded: a VPC diagram with more nodes than this is not sensible.
 MAX_POSITIONS = 5000
@@ -36,6 +39,26 @@ def save_prefs(conn: sqlite3.Connection, account_ref: int, **changes: bool) -> N
         "VALUES(?,?,?,?) ON CONFLICT(account_ref) DO UPDATE SET show_vpc=excluded.show_vpc, "
         "show_subnets=excluded.show_subnets, shorten_names=excluded.shorten_names",
         (account_ref, *(int(prefs[k]) for k in DEFAULT_PREFS)),
+    )
+
+
+def get_evidence(conn: sqlite3.Connection, account_ref: int) -> tuple[str, ...]:
+    """The Extended view's evidence filter (default: observed + configured)."""
+    row = conn.execute(
+        "SELECT evidence FROM visual_prefs WHERE account_ref=?", (account_ref,)
+    ).fetchone()
+    try:
+        return parse_evidence(row["evidence"] if row is not None else None)
+    except ValueError:  # a level that no longer exists
+        return DEFAULT_EVIDENCE
+
+
+def save_evidence(conn: sqlite3.Connection, account_ref: int, levels: tuple[str, ...]) -> None:
+    """Store the ticked levels (validated by :func:`iplens.declutter.parse_evidence`)."""
+    conn.execute(
+        "INSERT INTO visual_prefs(account_ref, evidence) VALUES(?,?) "
+        "ON CONFLICT(account_ref) DO UPDATE SET evidence=excluded.evidence",
+        (account_ref, ",".join(parse_evidence(",".join(levels)))),
     )
 
 

@@ -46,6 +46,7 @@ from .collector import Collector
 from .config import AppPaths, default_paths
 from .crypto import SecretBox
 from .db import closing, connect, init_db
+from .declutter import DEFAULT_EVIDENCE, FOCUS_HOPS, parse_evidence
 from .export import XLSX_MIMETYPE, ips_to_xlsx
 from .extended import EVIDENCE_HELP, EVIDENCE_LABELS, EVIDENCE_LEVELS, ExtendedCrawler, latest_crawl
 from .logging_setup import LEVELS, configure_logging, read_log
@@ -73,6 +74,8 @@ MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 GROUP_BY = {"": "nothing", "sg": "security group", "tag": "tag", "tf": "Terraform root"}
 # Visual page modes: the IP view is the default; "extended" adds regional services.
 VIEW_MODES = {"ip": "IP view", "extended": "Extended view"}
+# Saved Extended view positions are stored under "<vpc id>:extended".
+EXT_LAYOUT_SUFFIX = ":extended"
 MAX_CRAWL_WARNINGS_FLASHED = 8
 
 
@@ -573,6 +576,9 @@ def _register(app: Flask) -> None:
         prefs = viewstate.get_prefs(_db(), ref) if ref is not None else viewstate.DEFAULT_PREFS
         group_by = request.args.get("group", "")
         mode = _view_mode()
+        evidence_on = viewstate.get_evidence(_db(), ref) if ref is not None else DEFAULT_EVIDENCE
+        # The Extended view's left-to-right layout keeps its own dragged positions.
+        layout_key = f"{vpc}{EXT_LAYOUT_SUFFIX}" if vpc and mode == "extended" else vpc
         return render_template(
             "visual.html",
             snap=snap,
@@ -584,6 +590,8 @@ def _register(app: Flask) -> None:
             evidence_levels=EVIDENCE_LEVELS,
             evidence_labels=EVIDENCE_LABELS,
             evidence_help=EVIDENCE_HELP,
+            evidence_on=evidence_on,
+            focus_hops=FOCUS_HOPS,
             flow_windows=flowlogs.WINDOW_LABELS,
             flow_default=flowlogs.DEFAULT_WINDOW,
             edge_types=EDGE_TYPES,
@@ -596,7 +604,10 @@ def _register(app: Flask) -> None:
             group_by_choices=GROUP_BY,
             group_by=group_by if group_by in GROUP_BY else "",
             group_tag=request.args.get("tag", "")[:128],
-            positions=viewstate.get_layout(_db(), ref, vpc) if ref is not None and vpc else {},
+            layout_key=layout_key,
+            positions=viewstate.get_layout(_db(), ref, layout_key)
+            if ref is not None and vpc
+            else {},
             legend_icons=_legend_icons(),
         )
 
@@ -627,8 +638,17 @@ def _register(app: Flask) -> None:
         ref = _active_or_400()
         # Only the toggles present in the form change; the others keep their value.
         changes = {k: request.form[k] == "1" for k in viewstate.DEFAULT_PREFS if k in request.form}
+        evidence = None
+        if "evidence" in request.form:  # Extended view filter, "" = nothing ticked
+            try:
+                evidence = parse_evidence(request.form["evidence"][:200])
+            except ValueError as exc:
+                abort(400, str(exc))
         with closing(_paths().db_path) as conn:
-            viewstate.save_prefs(conn, ref, **changes)
+            if changes:
+                viewstate.save_prefs(conn, ref, **changes)
+            if evidence is not None:
+                viewstate.save_evidence(conn, ref, evidence)
         return "", 204
 
     @app.post("/visual/layout")

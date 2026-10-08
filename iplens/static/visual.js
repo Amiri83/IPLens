@@ -1,7 +1,13 @@
 /* IPLens Visual page: nested VPC -> subnet -> resource diagram with resource edges
    (cytoscape.js + dagre, both vendored). The Extended view (data-mode="extended") adds
-   regional services and external gateways beside the VPC and styles every edge by its
-   strongest evidence level (observed > configured > permitted > referenced). */
+   regional services and external gateways and is decluttered (rules in declutter.js):
+     - one edge per node pair, styled by its strongest shown evidence level
+       (observed > configured > permitted > referenced), "+N" for further evidence;
+     - regional services of one type and Lambda / ECS ENIs of a subnet are collapsible
+       groups; edges between collapsed groups merge into one, wider with its count;
+     - one left-to-right dagre layout (sources -> compute -> targets), edges routed
+       along dagre's paths; swimlanes per app when grouping by tag / Terraform root;
+     - focus mode: a clicked or searched node and its 1- or 2-hop neighbourhood only. */
 (function () {
   "use strict";
 
@@ -36,6 +42,7 @@
   const eniUrl = container.dataset.eniUrl;
   const csrf = container.dataset.csrf;
   const vpcId = container.dataset.vpc;
+  const layoutKey = container.dataset.layoutKey || vpcId;  // saved positions per view
   const showVpcBox = document.getElementById("show-vpc");
   const showSubnetsBox = document.getElementById("show-subnets");
   const shortenBox = document.getElementById("shorten-names");
@@ -47,9 +54,15 @@
   const evidenceBoxes = Array.from(document.querySelectorAll('input[type="checkbox"][name="evidence"]'));
   const serviceFilters = document.getElementById("service-filters");
   const detail = document.getElementById("edge-detail");
-  const EVIDENCE = ["observed", "configured", "permitted", "referenced"];  // strongest first
-  const EXT_GAP = 160;         // space between the VPC box and the areas beside it
-  const EXT_COLS = 3;          // "Regional services" columns
+  const focusSearch = document.getElementById("focus-search");
+  const focusHops = document.getElementById("focus-hops");
+  const focusReset = document.getElementById("focus-reset");
+  const D = window.IPLensDeclutter;
+  const GROUP_THRESHOLD = 10;  // mirrors iplens.queries.VISUAL_GROUP_THRESHOLD
+  const COMPUTE_TYPES = new Set(["lambda", "ecs"]);
+  const SHARED_LANE = "shared";
+  const LANE_HEAD = 36;        // swimlanes: room for the lane title above each band
+  const LANE_GAP = 56;
   const SHORT_MAX = parseInt(container.dataset.shortMax, 10) || 32;
   const SAVE_DELAY_MS = 400;
   const GROUP_LABEL_MEMBERS = 3;  // mirrors iplens.queries.GROUP_LABEL_MEMBERS
@@ -207,6 +220,16 @@
     return lines.join("\n");
   }
 
+  // Extended view service group: "▸ SQS queue ×18" (collapsed node) / "▾ …" (box).
+  function svcLabel(g, expanded) {
+    const names = g.member_names.slice(0, GROUP_LABEL_MEMBERS).map(shortName);
+    const more = g.member_names.length > names.length ? ", …" : "";
+    const head = `${expanded ? "▾" : "▸"} ${g.type_label} ×${g.count}`;
+    return expanded
+      ? `${head} · click here to collapse`
+      : `${head}\n${wrapLine(names.join(", ") + more, "res")}\nclick to expand`;
+  }
+
   // -- elements -----------------------------------------------------------------------
 
   function resourceElement(r, parent, order, extra) {
@@ -274,29 +297,6 @@
         }
       });
     });
-    if (ext) {
-      // "Regional services" / "External" boxes beside (never inside) the VPC.
-      Object.entries(ext.areas || {}).forEach(([area, label]) => {
-        const members = ext.nodes.filter((n) => n.area === area);
-        if (!members.length) return;
-        els.push({
-          group: "nodes",
-          data: { id: "area:" + area, label: label, title: label, area: area },
-          classes: "area",
-          grabbable: false,
-        });
-        members.forEach((n, i) => {
-          els.push({
-            group: "nodes",
-            data: {
-              id: n.id, parent: "area:" + area, order: i, label: extLabel(n), title: extTitle(n),
-              icon: iconUrl(n.icon), iconFile: n.icon, service: n.service, raw: n,
-            },
-            classes: "ext" + (n.broad_access ? " broad" : ""),
-          });
-        });
-      });
-    }
     return els;
   }
 
@@ -308,8 +308,11 @@
         if (n.hasClass("vpc")) n.data("label", vpcLabel(raw));
         else if (n.hasClass("subnet")) n.data("label", subnetLabel(raw));
         else if (n.hasClass("res")) n.data("label", resourceLabel(raw));
+        else if (n.hasClass("svc")) n.data("label", svcLabel(raw, false));
+        else if (n.hasClass("svcbox")) n.data("label", svcLabel(raw, true));
         else if (n.hasClass("group")) n.data("label", groupLabel(raw, n.data("expanded")));
         else if (n.hasClass("ext")) n.data("label", extLabel(raw));
+        else if (n.hasClass("vpcleaf")) n.data("label", vpcLabel(raw));
       });
     });
   }
@@ -343,7 +346,7 @@
     cy.batch(() => {
       cy.nodes(".ctx").remove();
       cy.nodes(".tinted").removeClass("tinted").removeData("color");
-      if (!mode) return;
+      if (!mode || laneMode()) return;  // Extended view: swimlanes instead of boxes
       const boxes = new Map();
       cy.nodes(".res").forEach((n) => {
         const shown = n.hasClass("hidden") ? n.data("memberOf") : n.id();
@@ -417,32 +420,18 @@
 
   // A member hidden inside a collapsed group is drawn through its group node
   // (unless ``expandAll``: exports with "Expand all groups" keep the member).
-  // Extended view endpoints ("vpc", "x:<service>:<name>") are node ids already; a node
-  // hidden by the service filter takes its edges with it.
   function endpointId(cy, id, expandAll) {
-    if (id === "vpc" || id.startsWith("x:")) {
-      const x = cy.getElementById(id);
-      return x.nonempty() && !x.hasClass("filtered") ? id : null;
-    }
     const n = cy.getElementById("res:" + id);
     if (n.empty()) return null;
     return n.hasClass("hidden") && !expandAll ? n.data("memberOf") : n.id();
   }
 
-  function bestEvidence(lines) {
-    return EVIDENCE.find((lvl) => lines.some((ln) => ln.evidence === lvl)) || "configured";
-  }
-
-  /* Edges as drawn: endpoints mapped onto visible nodes, edges of one type between the
-     same two nodes merged. In the Extended view only evidence lines of the ticked
-     levels count, and an edge without any is left out. */
+  /* IP view edges as drawn: endpoints mapped onto visible nodes, edges of one type
+     between the same two nodes merged. */
   function visibleEdges(cy, edges, types, expandAll) {
     const merged = new Map();
-    const levels = enabledEvidence();
     edges.forEach((e) => {
-      if (e.type !== "ext" && !types.has(e.type)) return;
-      const lines = extended ? (e.lines || []).filter((ln) => levels.has(ln.evidence)) : [];
-      if (extended && !lines.length) return;
+      if (!types.has(e.type)) return;
       const s = endpointId(cy, e.source, expandAll);
       const t = endpointId(cy, e.target, expandAll);
       if (!s || !t || s === t) return;
@@ -451,27 +440,15 @@
       if (m) {
         m.n += 1;
         if (m.titles.length < MAX_TITLE_LINES) m.titles.push(e.title);
-        m.lines.push(...lines);
       } else {
-        merged.set(key, {
-          type: e.type, source: s, target: t, label: e.label, titles: [e.title], n: 1, lines: lines,
-        });
+        merged.set(key, { type: e.type, source: s, target: t, label: e.label, titles: [e.title], n: 1 });
       }
     });
-    const items = Array.from(merged.values());
-    items.forEach((m) => {
-      m.evidence = extended ? bestEvidence(m.lines) : "";
-      if (extended && m.type === "ext") {
-        const best = m.lines.find((ln) => ln.evidence === m.evidence);
-        m.label = best ? best.label : m.label;
-      }
-    });
-    return items;
+    return Array.from(merged.values());
   }
 
   function edgeLabel(m) {
-    const extra = m.type === "ext" && m.lines.length > 1 ? ` +${m.lines.length - 1}` : "";
-    return (m.n > 1 ? `${shortName(m.label)} ×${m.n}` : shortName(m.label)) + extra;
+    return m.n > 1 ? `${shortName(m.label)} ×${m.n}` : shortName(m.label);
   }
 
   // Export edge type: the evidence style in the Extended view, else the edge type.
@@ -488,24 +465,351 @@
         data: {
           id: "edge:" + i,
           etype: m.type,
-          evidence: m.evidence,
-          lines: m.lines,
           source: m.source,
           target: m.target,
           label: edgeLabel(m),
-          title: extended
-            ? m.lines.slice(0, MAX_TITLE_LINES).map((ln) => `[${ln.evidence}] ${ln.text}`).join("\n") +
-              (m.lines.length > MAX_TITLE_LINES ? `\n… +${m.lines.length - MAX_TITLE_LINES} more (click for all)` : "")
-            : m.titles.join("\n") + (m.n > m.titles.length ? `\n… +${m.n - m.titles.length} more` : ""),
+          title: m.titles.join("\n") + (m.n > m.titles.length ? `\n… +${m.n - m.titles.length} more` : ""),
         },
-        classes: "edge-" + m.type + (extended ? " ev-" + m.evidence : ""),
+        classes: "edge-" + m.type,
       })));
     });
   }
 
-  // -- extended view: service filter, detail panel, layout beside the VPC -------------
+  // -- extended view: scene (lanes, groups), drawn edges, focus ------------------------
 
-  function populateServiceFilters(cy, data, onChange) {
+  // Expanded group ids; everything else (service groups, Lambda / ECS groups) is collapsed.
+  const expandedGroups = new Set();
+  let focusId = null;  // node whose neighbourhood is shown (focus mode), else null
+
+  // Swimlanes replace the "Group by" boxes for tags and Terraform roots.
+  function laneMode() {
+    return extended && Boolean(groupBySelect) && ["tag", "tf"].includes(groupBySelect.value);
+  }
+
+  function hops() {
+    const n = parseInt(focusHops ? focusHops.value : "1", 10);
+    return D.FOCUS_HOPS.includes(n) ? n : D.FOCUS_HOPS[0];
+  }
+
+  function allResources(vpc) {
+    const out = [];
+    vpc.subnets.forEach((s) => s.items.forEach((item) => {
+      (item.kind === "group" ? item.members : [item]).forEach((r) => out.push(r));
+    }));
+    return out;
+  }
+
+  /* Lane of every resource (its first tag value / Terraform root) and every regional
+     node (the lane it has most connections to, a few passes so that a chain like
+     rule -> function -> queue follows its function); the rest goes to a shared lane. */
+  function assignLanes(data, resources, edges) {
+    const mode = groupBySelect.value;
+    const tagKey = groupTagSelect ? groupTagSelect.value : "";
+    const lanes = new Map();
+    const laneOf = new Map();  // edge endpoint id (ENI id, "x:…") -> lane key
+    const unset = { key: "tag:", label: `${tagKey || "tag"}: not set`, unmanaged: true };
+    resources.forEach((r) => {
+      const k = contextKeys(r, mode, tagKey, data)[0] || unset;
+      lanes.set(k.key, k);
+      laneOf.set(r.eni_id, k.key);
+    });
+    const extNodes = (data.extended.nodes || []).map((n) => n.id);
+    for (let pass = 0; pass < 3; pass += 1) {
+      extNodes.forEach((id) => {
+        if (laneOf.has(id)) return;
+        const votes = new Map();
+        edges.forEach((e) => {
+          const other = e.source === id ? e.target : e.target === id ? e.source : null;
+          const k = other ? laneOf.get(other) : null;
+          if (k) votes.set(k, (votes.get(k) || 0) + 1);
+        });
+        let best = null;
+        votes.forEach((v, k) => {
+          if (!best || v > best[1] || (v === best[1] && k < best[0])) best = [k, v];
+        });
+        if (best) laneOf.set(id, best[0]);
+      });
+    }
+    lanes.set(SHARED_LANE, { key: SHARED_LANE, label: "Shared / not linked to one app", unmanaged: true });
+    const ordered = Array.from(lanes.values())
+      .sort((a, b) => (a.unmanaged ? 1 : 0) - (b.unmanaged ? 1 : 0) || a.label.localeCompare(b.label));
+    const ids = new Map(ordered.map((l, i) => [l.key, "lane:" + i]));
+    return {
+      list: ordered.map((l, i) => ({
+        id: ids.get(l.key), label: l.label, order: i,
+        color: l.unmanaged ? UNMANAGED_COLOR : PALETTE[i % PALETTE.length],
+      })),
+      of: (id) => ids.get(laneOf.get(id) || SHARED_LANE),
+    };
+  }
+
+  function extElement(n, parent, extra) {
+    return {
+      group: "nodes",
+      data: {
+        id: n.id, parent: parent, label: extLabel(n), title: extTitle(n),
+        icon: iconUrl(n.icon), iconFile: n.icon, service: n.service, raw: n, ...extra,
+      },
+      classes: "ext" + (n.broad_access ? " broad" : "") + (extra.memberOf ? " member hidden" : ""),
+    };
+  }
+
+  function groupElement(id, parent, order, g) {
+    return {
+      group: "nodes",
+      data: {
+        id: id, parent: parent, order: order, label: groupLabel(g, false), title: groupTitle(g),
+        expanded: false, icon: iconBase + g.icon, iconFile: g.icon, raw: g,
+      },
+      classes: "group",
+    };
+  }
+
+  /* Extended view elements. Without swimlanes: VPC > subnets > resources, regional /
+     external nodes at the top level. With swimlanes: one lane per app holding its
+     resources and regional nodes (the VPC itself is a node of the shared lane).
+     Inside each subnet / lane, Lambda and ECS ENIs of one type (from D.AGG_MIN on) and
+     other types (above GROUP_THRESHOLD) become a collapsible group; regional nodes of
+     one service (from D.AGG_MIN on) become a service group: a collapsed node, or when
+     expanded a box ("svcbox") around its members. */
+  function extElements(data, edges) {
+    const vpc = data.vpc;
+    const ext = data.extended;
+    const resources = allResources(vpc);
+    const facts = ext.subnet_facts || {};
+    const lanes = laneMode() ? assignLanes(data, resources, edges) : null;
+    const els = [];
+    const vpcData = {
+      id: "vpc", label: vpcLabel(vpc), title: [vpc.name || vpc.vpc_id, vpc.vpc_id, ...vpc.cidrs].join("\n"),
+      icon: iconBase + data.icons.vpc, iconFile: data.icons.vpc, raw: vpc,
+    };
+    if (lanes) {
+      lanes.list.forEach((l) => els.push({
+        group: "nodes",
+        data: { id: l.id, label: l.label, title: l.label, order: l.order, color: l.color },
+        classes: "lane", grabbable: false, selectable: false,
+      }));
+      els.push({ group: "nodes", data: { ...vpcData, parent: lanes.of("vpc") }, classes: "vpcleaf" });
+    } else {
+      els.push({ group: "nodes", data: vpcData, classes: "vpc", grabbable: false });
+      vpc.subnets.forEach((s, si) => els.push({
+        group: "nodes",
+        data: {
+          id: "subnet:" + s.subnet_id, parent: "vpc", order: si, label: subnetLabel(s),
+          title: subnetTitle(s, facts[s.subnet_id]), raw: s,
+        },
+        classes: "subnet" + (s.items.length ? "" : " empty"),
+      }));
+    }
+
+    const byParent = new Map();  // container id -> Map(type -> resources)
+    resources.forEach((r) => {
+      const parent = lanes ? lanes.of(r.eni_id) : "subnet:" + r.subnet_id;
+      if (!byParent.has(parent)) byParent.set(parent, new Map());
+      const byType = byParent.get(parent);
+      if (!byType.has(r.type)) byType.set(r.type, []);
+      byType.get(r.type).push(r);
+    });
+    byParent.forEach((byType, parent) => {
+      let order = 0;
+      byType.forEach((members, type) => {
+        const min = COMPUTE_TYPES.has(type) ? D.AGG_MIN : GROUP_THRESHOLD + 1;
+        if (members.length < min) {
+          members.forEach((r) => els.push(resourceElement(r, parent, order++, {})));
+          return;
+        }
+        const gid = `group:${parent}:${type}`;
+        const g = {
+          kind: "group", id: gid, type: type, type_label: members[0].type_label,
+          member_names: Array.from(new Set(members.map((m) => m.name).filter(Boolean))),
+          count: members.length, ip_count: members.reduce((a, m) => a + m.ips.length, 0),
+          icon: members[0].icon,
+        };
+        els.push(groupElement(gid, parent, order, g));
+        members.forEach((m, j) => {
+          els.push(resourceElement(m, parent, order + (j + 1) / (members.length + 1), { memberOf: gid }));
+        });
+        order += 1;
+      });
+    });
+
+    const byService = new Map();  // "<lane>|<service>" -> nodes
+    ext.nodes.forEach((n) => {
+      const key = `${lanes ? lanes.of(n.id) : ""}|${n.service}`;
+      if (!byService.has(key)) byService.set(key, []);
+      byService.get(key).push(n);
+    });
+    byService.forEach((members, key) => {
+      const parent = key.split("|")[0] || undefined;
+      if (members.length < D.AGG_MIN) {
+        members.forEach((n) => els.push(extElement(n, parent, {})));
+        return;
+      }
+      const service = members[0].service;
+      const gid = `svc:${parent ? parent + ":" : ""}${service}`;
+      const g = {
+        id: gid, service: service, type_label: members[0].service_label, count: members.length,
+        member_names: members.map((n) => n.label_name), names: members.map((n) => n.name),
+        arns: members.map((n) => n.arn).filter(Boolean),
+      };
+      const title = [`${g.type_label} ×${g.count}`, ...g.member_names.slice(0, MAX_TITLE_LINES)];
+      if (g.count > MAX_TITLE_LINES) title.push(`… +${g.count - MAX_TITLE_LINES} more`);
+      els.push({
+        group: "nodes",
+        data: { id: "box:" + gid, parent: parent, label: svcLabel(g, true), title: title.join("\n"), raw: g, group: gid },
+        classes: "svcbox hidden", grabbable: false,
+      });
+      els.push({
+        group: "nodes",
+        data: {
+          id: gid, parent: parent, label: svcLabel(g, false), title: title.join("\n"),
+          icon: iconUrl(members[0].icon), iconFile: members[0].icon, service: service, raw: g,
+        },
+        classes: "group svc",
+      });
+      members.forEach((n) => els.push(extElement(n, "box:" + gid, { memberOf: gid })));
+    });
+    return els;
+  }
+
+  function setExpanded(cy, group, on) {
+    if (on) expandedGroups.add(group.id()); else expandedGroups.delete(group.id());
+    groupMembers(cy, group).toggleClass("hidden", !on);
+    group.data("expanded", on);
+    if (group.hasClass("svc")) {
+      cy.getElementById("box:" + group.id()).toggleClass("hidden", !on);
+      group.toggleClass("hidden", on);
+    } else {
+      group.data("label", groupLabel(group.data("raw"), on));
+    }
+  }
+
+  // Service filter: unticked services disappear, and with them a group of only those.
+  function applyServiceFilter(cy) {
+    const off = new Set(Array.from(document.querySelectorAll('input[name="service"]'))
+      .filter((b) => !b.checked).map((b) => b.value));
+    cy.batch(() => {
+      cy.nodes(".ext").forEach((n) => { n.toggleClass("filtered", off.has(n.data("service"))); });
+      cy.nodes(".svc").forEach((g) => {
+        const gone = groupMembers(cy, g).every((m) => m.hasClass("filtered"));
+        g.toggleClass("filtered", gone);
+        cy.getElementById("box:" + g.id()).toggleClass("filtered", gone);
+      });
+    });
+  }
+
+  // Where an edge end is drawn: its node, or the collapsed group holding it.
+  function extEndpoint(cy, id) {
+    const n = cy.getElementById(id === "vpc" || id.startsWith("x:") ? id : "res:" + id);
+    if (n.empty() || n.hasClass("filtered")) return null;
+    const g = n.data("memberOf");
+    return g && !expandedGroups.has(g) ? g : n.id();
+  }
+
+  function drawnEdges(cy, edges) {
+    const types = enabledEdgeTypes();
+    const input = edges.filter((e) => e.type === "ext" || types.has(e.type));
+    return D.mergeEdges(input, Array.from(enabledEvidence()), (id) => extEndpoint(cy, id));
+  }
+
+  /* The focused node as drawn now: a member of a collapsed group focuses the group, an
+     expanded group its members. Empty when nothing (shown) is focused. */
+  function focusTargets(cy) {
+    if (!focusId) return [];
+    let n = cy.getElementById(focusId);
+    if (n.empty()) return [];
+    const g = n.data("memberOf");
+    if (g && !expandedGroups.has(g)) n = cy.getElementById(g);
+    if (n.empty() || n.hasClass("filtered")) return [];
+    if (n.hasClass("group") && expandedGroups.has(n.id())) {
+      const members = groupMembers(cy, n).filter((m) => !m.hasClass("filtered")).map((m) => m.id());
+      return n.hasClass("svc") ? members : [n.id(), ...members];
+    }
+    return [n.id()];
+  }
+
+  /* Focus mode: every node outside the focused node's neighbourhood is hidden, and so
+     is a box (subnet, VPC, lane, service group) left without a shown node. */
+  function applyExtFocus(cy, drawn) {
+    cy.nodes(".unfocused").removeClass("unfocused");
+    cy.nodes(".focus").removeClass("focus");
+    const targets = focusTargets(cy);
+    if (!targets.length) return drawn;
+    const keep = new Set();
+    targets.forEach((id) => D.neighbourhood(drawn, id, hops()).forEach((k) => keep.add(k)));
+    targets.forEach((id) => cy.getElementById(id).addClass("focus"));
+    cy.nodes().forEach((n) => {
+      if (!n.isParent() && !n.hasClass("ctx") && !n.hasClass("pin") && !keep.has(n.id())) n.addClass("unfocused");
+    });
+    cy.nodes().filter((n) => n.isParent())
+      .sort((a, b) => b.ancestors().length - a.ancestors().length)
+      .forEach((p) => {
+        const empty = p.children().every((c) => ["unfocused", "hidden", "filtered", "pin"].some((k) => c.hasClass(k)));
+        if (empty) p.addClass("unfocused");
+      });
+    return drawn.filter((e) => keep.has(e.source) && keep.has(e.target));
+  }
+
+  function extEdgeLabel(m) {
+    return shortName(m.label) + (m.count > 1 ? ` ×${m.count}` : "") + (m.extra ? ` +${m.extra}` : "");
+  }
+
+  function extEdgeTitle(m) {
+    const shown = m.lines.filter((ln) => ln.shown);
+    const lines = shown.slice(0, MAX_TITLE_LINES).map((ln) => `[${ln.evidence}] ${ln.text}`);
+    if (m.count > 1) lines.unshift(`${m.count} connections merged`);
+    const more = m.lines.length - Math.min(shown.length, MAX_TITLE_LINES);
+    if (more > 0) lines.push(`… +${more} more evidence line(s) (click for all)`);
+    return lines.join("\n");
+  }
+
+  // Draws the merged edges (after focus); returns them for the layout.
+  function syncExtEdges(cy, edges) {
+    const drawn = applyExtFocus(cy, drawnEdges(cy, edges));
+    cy.batch(() => {
+      cy.edges().remove();
+      cy.add(drawn.map((m, i) => ({
+        group: "edges",
+        data: {
+          id: "edge:" + i, etype: "ext", source: m.source, target: m.target,
+          evidence: m.evidence, lines: m.lines, count: m.count, extra: m.extra,
+          width: m.width, bidir: m.bidir, label: extEdgeLabel(m), title: extEdgeTitle(m),
+        },
+        classes: `edge-ext ev-${m.evidence}` + (m.count > 1 ? " agg" : "") + (m.bidir ? " bidir" : ""),
+      })));
+    });
+    return drawn;
+  }
+
+  /* Search box: the best match by name, ARN, IP, ENI id or member name (exact >
+     prefix > substring; a node before a group). */
+  function findNode(cy, query) {
+    const q = query.trim().toLowerCase();
+    if (!q) return null;
+    let best = null;
+    let bestScore = 0;
+    cy.nodes(".res, .ext, .group, .vpc, .vpcleaf").forEach((n) => {
+      if (n.hasClass("filtered")) return;
+      const raw = n.data("raw") || {};
+      const fields = [raw.label_name, raw.name, raw.arn, raw.ref, raw.eni_id, raw.vpc_id,
+        ...(raw.ips || []), ...(raw.owners || []), ...(raw.member_names || []), ...(raw.arns || [])];
+      let score = 0;
+      fields.filter(Boolean).forEach((f) => {
+        const s = String(f).toLowerCase();
+        if (s === q) score = Math.max(score, 3);
+        else if (s.startsWith(q)) score = Math.max(score, 2);
+        else if (s.includes(q)) score = Math.max(score, 1);
+      });
+      if (score && n.hasClass("group")) score -= 0.5;
+      if (score > bestScore) {
+        best = n;
+        bestScore = score;
+      }
+    });
+    return best;
+  }
+
+  function populateServiceFilters(data, onChange) {
     if (!serviceFilters || !data.extended) return;
     const services = data.extended.services || [];
     if (services.length) document.getElementById("service-filters-empty").remove();
@@ -517,14 +821,7 @@
       box.name = "service";
       box.value = s.service;
       box.checked = true;
-      box.addEventListener("change", () => {
-        cy.nodes(".ext").filter((n) => n.data("service") === s.service).toggleClass("filtered", !box.checked);
-        // An area whose every node is filtered out disappears too.
-        cy.nodes(".area").forEach((a) => {
-          a.toggleClass("filtered", a.children().every((c) => c.hasClass("filtered")));
-        });
-        onChange();
-      });
+      box.addEventListener("change", onChange);
       label.append(box, ` ${s.label} `);
       const count = document.createElement("span");
       count.className = "muted";
@@ -534,10 +831,12 @@
     });
   }
 
+  // Display name of a node id, or of an edge end as stored (ENI id, "x:…", "vpc").
   function nodeName(cy, id) {
-    const n = cy.getElementById(id);
+    let n = cy.getElementById(id);
+    if (n.empty()) n = cy.getElementById("res:" + id);
     const raw = n.data("raw") || {};
-    return raw.label_name || raw.name || n.id();
+    return raw.label_name || raw.name || (raw.type_label ? `${raw.type_label} ×${raw.count}` : "") || id;
   }
 
   // Every evidence line of an edge (or the facts of a service node), as plain text.
@@ -559,33 +858,158 @@
     detail.hidden = false;
   }
 
-  /* Place the "Regional services" area to the right of the VPC and the "External" area
-     to its left, each a grid of nodes (sorted by service, then name). */
-  function placeExtended(cy) {
-    const areas = cy.nodes(".area");
-    if (areas.empty()) return;
-    const vpc = cy.getElementById("vpc").boundingBox({ includeLabels: true });
+  // -- extended view layout: one left-to-right dagre graph -----------------------------
+
+  function isServiceNode(n) {
+    return n.hasClass("ext") || n.hasClass("svc");
+  }
+
+  function isCompute(n) {
+    return !isServiceNode(n) || D.serviceTier(n.data("service"), false) === 1;
+  }
+
+  /* One dagre layout (rankdir LR) of everything shown, boxes included: the VPC, its
+     subnets, service groups and lanes are dagre clusters. Edges are oriented by tier so
+     that sources (EventBridge / SNS / API Gateway / S3) rank left of compute (Lambda /
+     ECS / the VPC's resources) and targets right of it. An edge to a box (e.g. a VPC
+     route) is laid out to the box's first node. Returns dagre's route of every edge. */
+  function extLayout(cy, drawn) {
+    const g = new dagre.graphlib.Graph({ compound: true, multigraph: true });
+    g.setGraph({ rankdir: "LR", nodesep: 56, ranksep: 150, edgesep: 16, marginx: 30, marginy: 30 });
+    g.setDefaultEdgeLabel(() => ({}));
+    cy.nodes(".pin").remove();
+    const shown = cy.nodes().filter((n) => n.visible() && !n.hasClass("ctx"));
+    const leaves = [];
+    shown.forEach((n) => {
+      if (n.isParent() && n.children().some((c) => c.visible())) {
+        g.setNode(n.id(), {});
+      } else {
+        const dim = n.layoutDimensions({ nodeDimensionsIncludeLabels: true });
+        g.setNode(n.id(), { width: dim.w, height: dim.h });
+        leaves.push(n);
+      }
+    });
+    shown.forEach((n) => {
+      const p = n.parent();
+      if (p.nonempty() && g.hasNode(p.id())) g.setParent(n.id(), p.id());
+    });
+    const leafIds = new Set(leaves.map((n) => n.id()));
+    const layoutEnd = (id) => {
+      if (leafIds.has(id)) return id;
+      const first = cy.getElementById(id).descendants().filter((d) => leafIds.has(d.id()))[0];
+      return first ? first.id() : null;
+    };
+    const feeds = new Set(drawn.filter((e) => isCompute(cy.getElementById(e.target))).map((e) => e.source));
+    const tier = (id) => {
+      const n = cy.getElementById(id);
+      return isServiceNode(n) ? D.serviceTier(n.data("service"), feeds.has(id)) : 1;
+    };
+    const routes = [];
+    drawn.forEach((e, i) => {
+      const s = layoutEnd(e.source);
+      const t = layoutEnd(e.target);
+      if (!s || !t || s === t) return;
+      const flip = tier(e.source) > tier(e.target);
+      const [v, w] = flip ? [t, s] : [s, t];
+      g.setEdge(v, w, { weight: Math.min(e.count || 1, 5), minlen: 1 }, "edge:" + i);
+      routes.push({ id: "edge:" + i, v: v, w: w, flip: flip, direct: s === e.source && t === e.target });
+    });
+
+    dagre.layout(g);
     cy.batch(() => {
-      areas.forEach((area) => {
-        const kids = area.children().sort((a, b) => {
-          const ra = a.data("raw"), rb = b.data("raw");
-          return ra.service.localeCompare(rb.service) || ra.label_name.localeCompare(rb.label_name);
-        });
-        let cellW = CELL_W, cellH = CELL_H;
+      leaves.forEach((n) => {
+        const p = g.node(n.id());
+        const dy = (p.height - n.outerHeight()) / 2;  // dagre centres node + label
+        n.position({ x: p.x, y: p.y - dy });
+      });
+    });
+    const out = new Map();
+    routes.forEach((r) => {
+      if (!r.direct) return;  // laid out to a stand-in node: drawn as a plain curve
+      const pts = (g.edge({ v: r.v, w: r.w, name: r.id }) || {}).points || [];
+      out.set(r.id, r.flip ? pts.slice().reverse() : pts);
+    });
+    if (laneMode()) stackLanes(cy, out);
+    return out;
+  }
+
+  /* Swimlanes: dagre keeps each lane's nodes together; the lanes are then stacked top
+     to bottom (keeping x, so tiers line up across lanes) and stretched to one width by
+     two invisible "pin" nodes each. Routes inside a lane move with it; routes between
+     lanes are dropped (plain curves). */
+  function stackLanes(cy, routes) {
+    const lanes = cy.nodes(".lane").filter((l) => l.visible())
+      .sort((a, b) => a.data("order") - b.data("order"));
+    const shiftOf = new Map();
+    let top = null;
+    cy.batch(() => {
+      lanes.forEach((lane) => {
+        const kids = lane.descendants().filter((n) => !n.isParent() && n.visible());
+        if (kids.empty()) return;
+        const bb = kids.boundingBox({ includeLabels: true, includeOverlays: false });
+        if (top === null) top = bb.y1;
+        const shift = top + LANE_HEAD - bb.y1;
         kids.forEach((k) => {
-          const dim = k.layoutDimensions({ nodeDimensionsIncludeLabels: true });
-          cellW = Math.max(cellW, dim.w + CELL_GAP);
-          cellH = Math.max(cellH, dim.h + CELL_GAP);
+          k.position({ x: k.position("x"), y: k.position("y") + shift });
+          shiftOf.set(k.id(), shift);
         });
-        const regional = area.data("area") === "regional";
-        const cols = regional ? Math.min(EXT_COLS, kids.length) : 1;
-        const x0 = regional ? vpc.x2 + EXT_GAP + cellW / 2 : vpc.x1 - EXT_GAP - cellW / 2;
-        const y0 = vpc.y1 + 60;
-        kids.forEach((k, i) => {
-          k.position({ x: x0 + (i % cols) * cellW, y: y0 + Math.floor(i / cols) * cellH });
+        top += bb.h + LANE_HEAD + LANE_GAP;
+      });
+    });
+    cy.edges().forEach((e) => {
+      const route = routes.get(e.id());
+      if (!route) return;
+      const a = shiftOf.get(e.source().id());
+      const b = shiftOf.get(e.target().id());
+      if (a === undefined || a !== b) routes.delete(e.id());
+      else routes.set(e.id(), route.map((p) => ({ x: p.x, y: p.y + a })));
+    });
+    const all = cy.nodes(".lane").descendants().filter((n) => !n.isParent() && n.visible())
+      .boundingBox({ includeLabels: true, includeOverlays: false });
+    cy.batch(() => {
+      lanes.forEach((lane) => {
+        const kids = lane.descendants().filter((n) => !n.isParent() && n.visible());
+        if (kids.empty()) return;
+        const y = kids.boundingBox().y1;
+        [all.x1, all.x2].forEach((x, i) => cy.add({
+          group: "nodes",
+          data: { id: `pin:${lane.id()}:${i}`, parent: lane.id() },
+          position: { x: x, y: y },
+          classes: "pin", grabbable: false, selectable: false,
+        }));
+      });
+    });
+  }
+
+  /* Edges follow dagre's route (fewer crossings, never through a node) as
+     unbundled-bezier control points relative to the source -> target line. */
+  function applyRoutes(cy, routes) {
+    cy.batch(() => {
+      cy.edges().forEach((e) => {
+        const pts = (routes.get(e.id()) || []).slice(1, -1);
+        const s = e.source().position();
+        const t = e.target().position();
+        const dx = t.x - s.x;
+        const dy = t.y - s.y;
+        const l2 = dx * dx + dy * dy;
+        if (!pts.length || l2 < 1) {
+          unroute(e);
+          return;
+        }
+        const l = Math.sqrt(l2);
+        e.style({
+          "curve-style": "unbundled-bezier",
+          "edge-distances": "node-position",
+          "control-point-weights": pts.map((p) => ((p.x - s.x) * dx + (p.y - s.y) * dy) / l2),
+          "control-point-distances": pts.map((p) => ((p.x - s.x) * -dy + (p.y - s.y) * dx) / l),
         });
       });
     });
+  }
+
+  // Back to a plain curve, e.g. once an end was dragged away from dagre's route.
+  function unroute(edges) {
+    edges.removeStyle("curve-style edge-distances control-point-weights control-point-distances");
   }
 
   function rememberEdgeFilter() {
@@ -651,10 +1075,9 @@
     g.setGraph({ rankdir: "TB", nodesep: 30, ranksep: 40, marginx: 20, marginy: 20 });
     g.setDefaultEdgeLabel(() => ({}));
 
-    // Extended view nodes are placed beside the VPC afterwards (placeExtended).
+    // IP view only; the Extended view has its own left-to-right layout (extLayout).
     const leaves = [];
-    cy.nodes().filter((n) => !n.hasClass("hidden") && !n.hasClass("ctx") && !n.hasClass("area") &&
-      !n.hasClass("ext")).forEach((n) => {
+    cy.nodes().filter((n) => !n.hasClass("hidden") && !n.hasClass("ctx")).forEach((n) => {
       if (n.isParent()) {
         g.setNode(n.id(), {});
       } else {
@@ -717,20 +1140,34 @@
   }
 
   function leaves(cy) {
-    return cy.nodes().filter((n) => !n.isParent() && !n.hasClass("hidden") && !n.hasClass("ctx"));
+    return cy.nodes().filter((n) => !n.isParent() && !n.hasClass("hidden") && !n.hasClass("ctx") &&
+      !n.hasClass("pin"));
   }
 
+  // Extended view: dragged positions belong to the full diagram only (not to focus mode
+  // or swimlanes, which are laid out afresh every time).
+  function savingPositions() {
+    return !extended || (!focusId && !laneMode());
+  }
+
+  // Returns the nodes moved to a saved position.
   function applySaved(cy) {
+    const moved = leaves(cy).filter((n) => Boolean(saved[n.id()]));
     cy.batch(() => {
-      leaves(cy).forEach((n) => {
+      moved.forEach((n) => {
         const p = saved[n.id()];
-        if (p) n.position({ x: p.x, y: p.y });
+        n.position({ x: p.x, y: p.y });
       });
     });
+    return moved;
   }
 
   let saveTimer = null;
   function savePositions(cy) {
+    if (!savingPositions()) {
+      note.textContent = "Positions are not saved in focus mode or with swimlanes.";
+      return;
+    }
     // Merge, so members of a collapsed group keep their saved spot.
     leaves(cy).forEach((n) => {
       const p = n.position();
@@ -738,7 +1175,7 @@
     });
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      post(container.dataset.layoutUrl, { vpc: vpcId, positions: JSON.stringify(saved) })
+      post(container.dataset.layoutUrl, { vpc: layoutKey, positions: JSON.stringify(saved) })
         .then(() => { note.textContent = "Layout saved for this account and VPC."; })
         .catch((err) => { note.textContent = `Could not save the layout (${err.message}).`; });
     }, SAVE_DELAY_MS);
@@ -766,11 +1203,14 @@
 
   // -- export -------------------------------------------------------------------------
 
+  // Extended view: an expanded service group exports as an "area" box, a swimlane as a
+  // "lane" box, the VPC drawn as a node of the shared lane as a resource.
   function nodeKind(n) {
     if (n.hasClass("vpc")) return "vpc";
     if (n.hasClass("subnet")) return "subnet";
     if (n.hasClass("ctx")) return "ctx";
-    if (n.hasClass("area")) return "area";
+    if (n.hasClass("svcbox")) return "area";
+    if (n.hasClass("lane")) return "lane";
     return n.hasClass("group") ? "group" : "res";
   }
 
@@ -784,7 +1224,7 @@
      group box (iplens.diagram.expand_groups). An expanded group's header is left out. */
   function currentView(cy, dataEdges, expand) {
     const nodes = [];
-    cy.nodes().filter((n) => n.visible()).forEach((n) => {
+    cy.nodes().filter((n) => n.visible() && !n.hasClass("pin")).forEach((n) => {
       const kind = nodeKind(n);
       if (expand && kind === "group" && n.data("expanded")) return;
       const bb = n.boundingBox({ includeLabels: false, includeOverlays: false });
@@ -824,6 +1264,8 @@
         target: e.target().id(),
         type: exportType(e.data("etype"), e.data("evidence")),
         label: e.data("label") || "",
+        ...(e.hasClass("agg") ? { width: e.data("width") } : {}),
+        ...(e.data("bidir") ? { bidir: true } : {}),
       }));
     return {
       vpc_id: vpcId,
@@ -866,7 +1308,6 @@
       }
     }
     if (!done) gridLayout(cy);
-    if (extended) placeExtended(cy);
   }
 
   // -- focus (single click): highlight one node's edges, dim the rest ------------------
@@ -945,12 +1386,27 @@
       "text-valign": "top", "text-halign": "center", "text-margin-y": CTX_LABEL_H,
       "events": "no",
     } },
-    // Extended view: areas beside the VPC, service / gateway nodes, evidence styles.
-    { selector: ".area", style: {
+    // Extended view: expanded service groups, swimlanes, service / gateway nodes,
+    // evidence styles.
+    { selector: ".svcbox", style: {
       "shape": "rectangle", "background-color": "#f6f7f9", "border-width": 2,
-      "border-style": "dashed", "border-color": "#5b6573", "padding": 30,
+      "border-style": "dashed", "border-color": "#5b6573", "padding": 24,
       "text-valign": "top", "text-halign": "center", "font-size": 12, "font-weight": "bold",
       "text-margin-y": -6, "text-max-width": TEXT_W.vpc,
+    } },
+    { selector: ".lane", style: {
+      "shape": "rectangle", "background-color": "data(color)", "background-opacity": 0.04,
+      "border-width": 1.5, "border-color": "data(color)", "padding": 24,
+      "label": "data(label)", "color": "data(color)", "font-size": 13, "font-weight": "bold",
+      "text-valign": "top", "text-halign": "center", "text-margin-y": -6,
+      "text-max-width": TEXT_W.vpc,
+    } },
+    { selector: ".pin", style: { "width": 1, "height": 1, "opacity": 0, "events": "no", "label": "" } },
+    { selector: ".vpcleaf", style: {
+      "shape": "round-rectangle", "width": 44, "height": 44, "background-color": "#f7f3ff",
+      "background-image": "data(icon)", "background-fit": "contain", "border-width": 2,
+      "border-color": "#8c4fff", "text-valign": "bottom", "text-halign": "center",
+      "text-margin-y": 5, "font-weight": "bold",
     } },
     { selector: ".ext", style: {
       "shape": "round-rectangle", "width": 44, "height": 44,
@@ -959,7 +1415,7 @@
       "text-valign": "bottom", "text-halign": "center", "text-margin-y": 5,
     } },
     { selector: ".ext.broad", style: { "border-width": 3, "border-color": "#c2410c", "border-style": "dashed" } },
-    { selector: ".hidden, .filtered", style: { "display": "none" } },
+    { selector: ".hidden, .filtered, .unfocused", style: { "display": "none" } },
     { selector: "node.res:active, node.group:active", style: { "overlay-opacity": 0.15 } },
     { selector: "edge", style: {
       "curve-style": "bezier", "width": 2, "target-arrow-shape": "triangle", "arrow-scale": 0.9,
@@ -980,29 +1436,34 @@
     } },
     // Mirrors EDGE_STYLES["ev_*"] in iplens/diagram.py and the ev-* swatches in style.css.
     { selector: "edge.ev-observed", style: {
-      "line-color": "#1a7f37", "target-arrow-color": "#1a7f37", "width": 3,
-      "line-style": "solid", "target-arrow-shape": "triangle", "color": "#14532d",
+      "line-color": "#1a7f37", "target-arrow-color": "#1a7f37", "source-arrow-color": "#1a7f37",
+      "width": 3, "line-style": "solid", "target-arrow-shape": "triangle", "color": "#14532d",
     } },
     { selector: "edge.ev-configured", style: {
-      "line-color": "#2457c5", "target-arrow-color": "#2457c5", "width": 2,
-      "line-style": "solid", "target-arrow-shape": "triangle",
+      "line-color": "#2457c5", "target-arrow-color": "#2457c5", "source-arrow-color": "#2457c5",
+      "width": 2, "line-style": "solid", "target-arrow-shape": "triangle",
     } },
     { selector: "edge.ev-permitted", style: {
-      "line-color": "#c2410c", "target-arrow-color": "#c2410c", "width": 1.8,
-      "line-style": "dashed", "line-dash-pattern": [7, 4], "target-arrow-shape": "vee",
+      "line-color": "#c2410c", "target-arrow-color": "#c2410c", "source-arrow-color": "#c2410c",
+      "width": 1.8, "line-style": "dashed", "line-dash-pattern": [7, 4], "target-arrow-shape": "vee",
       "color": "#7c2d12", "opacity": 1,
     } },
     { selector: "edge.ev-referenced", style: {
-      "line-color": "#6b7280", "target-arrow-color": "#6b7280", "width": 1.5,
-      "line-style": "dashed", "line-dash-pattern": [2, 3], "target-arrow-shape": "vee",
+      "line-color": "#6b7280", "target-arrow-color": "#6b7280", "source-arrow-color": "#6b7280",
+      "width": 1.5, "line-style": "dashed", "line-dash-pattern": [2, 3], "target-arrow-shape": "vee",
       "color": "#374151", "opacity": 1,
     } },
+    // Evidence in both directions: an arrow at each end.
+    { selector: "edge.bidir.ev-observed, edge.bidir.ev-configured", style: { "source-arrow-shape": "triangle" } },
+    { selector: "edge.bidir.ev-permitted, edge.bidir.ev-referenced", style: { "source-arrow-shape": "vee" } },
     { selector: "node.dim", style: { "opacity": 0.2 } },
     { selector: "edge.dim", style: { "opacity": 0.08, "text-opacity": 0 } },
     { selector: "node.focus", style: { "overlay-color": "#2457c5", "overlay-opacity": 0.12 } },
     { selector: "edge:selected, edge.hover, edge.focus", style: {
       "width": 3, "opacity": 1, "z-index": 10,
     } },
+    // Merged connections (collapsed groups): stroke width grows with their count.
+    { selector: "edge.agg", style: { "width": "data(width)", "arrow-scale": 0.7 } },
   ];
 
   // -- tooltip ------------------------------------------------------------------------
@@ -1030,9 +1491,10 @@
     }
     const ext = extended ? data.extended : null;
     const edges = (data.edges || []).concat(ext ? ext.edges || [] : []);
+    populateTagKeys(data);  // before the Extended view's swimlanes need the tag key
     const cy = cytoscape({
       container: container,
-      elements: buildElements(data),
+      elements: ext ? extElements(data, edges) : buildElements(data),
       style: style,
       layout: { name: "preset" },
       minZoom: 0.05,
@@ -1040,72 +1502,161 @@
       boxSelectionEnabled: false,
     });
     applyBorders(cy);
-    let focused = null;  // id of the node whose edges are highlighted
+    let focused = null;  // IP view: id of the node whose edges are highlighted
+    let drawnCount = 0;
     const refreshEdges = () => {
       syncEdges(cy, edges);  // re-adds every edge, so the highlight is re-applied
       applyFocus(cy, focused);
     };
-    populateTagKeys(data);
     const refreshContext = () => syncContext(cy, data);
     // Saved (dragged) positions always win over the automatic layout.
     const relayout = () => {
-      refreshEdges();
-      runLayout(cy, edges);
-      applySaved(cy);
+      if (ext) {
+        const drawn = syncExtEdges(cy, edges);
+        drawnCount = drawn.length;
+        let routes = new Map();
+        try {
+          routes = extLayout(cy, drawn);
+        } catch (err) {
+          console.warn("dagre layout failed, using a plain grid", err);
+          cy.nodes(":visible").filter((n) => !n.isParent())
+            .layout({ name: "grid", avoidOverlap: true, nodeDimensionsIncludeLabels: true }).run();
+        }
+        const moved = savingPositions() ? applySaved(cy) : cy.collection();
+        applyRoutes(cy, routes);
+        unroute(moved.connectedEdges());
+        updateStatus();
+      } else {
+        refreshEdges();
+        runLayout(cy, edges);
+        applySaved(cy);
+      }
       refreshContext();
     };
+    const fitShown = () => cy.fit(cy.elements(":visible"), 30);
+
+    // Extended view: focus mode, groups, filters remembered per account.
+    const setFocus = (id) => {
+      focusId = id;
+      relayout();
+      fitShown();
+      if (focusReset) focusReset.disabled = !focusId;
+      note.textContent = focusId
+        ? `Showing ${nodeName(cy, focusId)} and its ${hops()}-hop neighbourhood · ` +
+          "Esc or Show all to see everything."
+        : "";
+    };
+    const rebuild = () => {
+      cy.elements().remove();
+      cy.add(extElements(data, edges));
+      applyServiceFilter(cy);
+      cy.nodes(".group").filter((g) => expandedGroups.has(g.id())).forEach((g) => setExpanded(cy, g, true));
+      applyBorders(cy);
+      relayout();
+      fitShown();
+    };
+    if (ext) populateServiceFilters(data, () => {
+      applyServiceFilter(cy);
+      relayout();
+    });
     relayout();
     cy.fit(undefined, 30);
 
-    // "onetap" fires only after the double-click window (multiClickDebounceTime) has
-    // passed without a second tap, so a double-click never also toggles the highlight.
-    cy.on("onetap", "node.res", (evt) => {
-      focused = focused === evt.target.id() ? null : evt.target.id();
-      applyFocus(cy, focused);
-    });
-    cy.on("dbltap", "node.res", (evt) => {
-      window.location.href = eniUrl.replace("__ENI__", encodeURIComponent(evt.target.data("eni")));
-    });
-    cy.on("onetap", "node.group", (evt) => {
-      toggleGroup(cy, evt.target);
-      relayout();
-    });
-    cy.on("onetap", (evt) => {
-      if (evt.target !== cy || !focused) return;
-      focused = null;
-      applyFocus(cy, null);
-    });
     if (ext) {
-      // Extended view: a service node highlights its edges and lists its facts; an edge
-      // lists every evidence line behind it.
-      cy.on("onetap", "node.ext", (evt) => {
+      // Click a node: its neighbourhood only. Click a group: expand / collapse it;
+      // double-click it: its neighbourhood. An edge (or a service node) lists all of
+      // its evidence below the diagram.
+      cy.on("onetap", "node.res, node.ext, node.vpcleaf", (evt) => {
         const n = evt.target;
-        focused = focused === n.id() ? null : n.id();
-        applyFocus(cy, focused);
-        const raw = n.data("raw");
-        const facts = (raw.facts || []).map((text) => ({ text: text }));
-        if (raw.arn) facts.unshift({ text: raw.arn });
-        showDetail(`${raw.service_label}: ${raw.label_name}`, facts.length ? facts : [{ text: "No further details." }]);
+        if (n.hasClass("ext")) {
+          const raw = n.data("raw");
+          const facts = (raw.facts || []).map((text) => ({ text: text }));
+          if (raw.arn) facts.unshift({ text: raw.arn });
+          showDetail(`${raw.service_label}: ${raw.label_name}`, facts.length ? facts : [{ text: "No further details." }]);
+        }
+        setFocus(n.id());
+      });
+      cy.on("onetap", "node.group", (evt) => {
+        setExpanded(cy, evt.target, !expandedGroups.has(evt.target.id()));
+        relayout();
+      });
+      cy.on("dbltap", "node.group", (evt) => setFocus(evt.target.id()));
+      cy.on("onetap", "node.svcbox", (evt) => {
+        if (!evt.target.hasClass("svcbox")) return;  // a tap on a member bubbles up
+        setExpanded(cy, cy.getElementById(evt.target.data("group")), false);
+        relayout();
       });
       cy.on("onetap", "edge", (evt) => {
         const e = evt.target;
         const lines = e.data("lines") || [];
+        const count = e.data("count") || 1;
         showDetail(
-          `${nodeName(cy, e.source().id())} → ${nodeName(cy, e.target().id())}: ` +
-            `${lines.length} evidence line(s), strongest ${e.data("evidence")}`,
-          lines,
+          `${nodeName(cy, e.source().id())} ${e.data("bidir") ? "↔" : "→"} ${nodeName(cy, e.target().id())}: ` +
+            `${lines.length} evidence line(s)` + (count > 1 ? ` over ${count} merged connections` : "") +
+            `, drawn as ${e.data("evidence")}`,
+          lines.map((ln) => ({
+            evidence: ln.evidence,
+            text: (count > 1 || ln.reverse ? `${nodeName(cy, ln.source)} → ${nodeName(cy, ln.target)}: ` : "") +
+              ln.text + (ln.shown ? "" : " (level not shown: tick it under Evidence)"),
+          })),
         );
       });
-      cy.on("mouseover", "node.ext, edge", () => { container.style.cursor = "pointer"; });
+      cy.on("mouseover", "node.ext, node.vpcleaf, node.svcbox, edge", () => { container.style.cursor = "pointer"; });
       cy.on("mouseout", "edge", () => { container.style.cursor = ""; });
-      populateServiceFilters(cy, data, refreshEdges);
-      evidenceBoxes.forEach((box) => box.addEventListener("change", refreshEdges));
+      cy.on("grab", "node", (evt) => unroute(evt.target.union(evt.target.descendants()).connectedEdges()));
+      evidenceBoxes.forEach((box) => box.addEventListener("change", () => {
+        relayout();
+        savePrefs({ evidence: Array.from(enabledEvidence()).join(",") });
+      }));
       (ext.evidence_levels || []).forEach((lvl) => {
         const el = document.querySelector(`[data-evidence-count="${lvl.level}"]`);
         if (el) el.textContent = `(${lvl.count})`;
       });
+      const find = () => {
+        const n = findNode(cy, focusSearch.value);
+        if (!n) {
+          note.textContent = `No node matches "${focusSearch.value.trim()}".`;
+          return;
+        }
+        const g = n.data("memberOf");
+        if (g && !expandedGroups.has(g)) setExpanded(cy, cy.getElementById(g), true);
+        setFocus(n.id());
+      };
+      if (focusSearch) {
+        // Enter searches instead of submitting the page form.
+        focusSearch.addEventListener("keydown", (evt) => {
+          if (evt.key !== "Enter") return;
+          evt.preventDefault();
+          find();
+        });
+        document.getElementById("focus-find").addEventListener("click", find);
+      }
+      if (focusReset) focusReset.addEventListener("click", () => setFocus(null));
+      if (focusHops) focusHops.addEventListener("change", () => { if (focusId) setFocus(focusId); });
+      document.addEventListener("keydown", (evt) => {
+        if (evt.key === "Escape" && focusId) setFocus(null);
+      });
       setupFlowLogs();
+    } else {
+      // "onetap" fires only after the double-click window (multiClickDebounceTime) has
+      // passed without a second tap, so a double-click never also toggles the highlight.
+      cy.on("onetap", "node.res", (evt) => {
+        focused = focused === evt.target.id() ? null : evt.target.id();
+        applyFocus(cy, focused);
+      });
+      cy.on("onetap", "node.group", (evt) => {
+        toggleGroup(cy, evt.target);
+        relayout();
+      });
+      cy.on("onetap", (evt) => {
+        if (evt.target !== cy || !focused) return;
+        focused = null;
+        applyFocus(cy, null);
+      });
     }
+    cy.on("dbltap", "node.res", (evt) => {
+      window.location.href = eniUrl.replace("__ENI__", encodeURIComponent(evt.target.data("eni")));
+    });
     cy.on("mouseover", "node.res, node.group", () => { container.style.cursor = "pointer"; });
     cy.on("mouseout", "node", () => { container.style.cursor = ""; });
     cy.on("mouseover", "node, edge", showTip);
@@ -1124,14 +1675,12 @@
     document.getElementById("zoom-in").addEventListener("click", () => zoomBy(1.25));
     document.getElementById("zoom-out").addEventListener("click", () => zoomBy(0.8));
     document.getElementById("zoom-fit").addEventListener("click", () => cy.fit(undefined, 30));
-    document.getElementById("expand-all").addEventListener("click", () => {
-      cy.nodes(".group").forEach((g) => toggleGroup(cy, g, true));
+    const expandAll = (on) => {
+      cy.nodes(".group").forEach((g) => (ext ? setExpanded(cy, g, on) : toggleGroup(cy, g, on)));
       relayout();
-    });
-    document.getElementById("collapse-all").addEventListener("click", () => {
-      cy.nodes(".group").forEach((g) => toggleGroup(cy, g, false));
-      relayout();
-    });
+    };
+    document.getElementById("expand-all").addEventListener("click", () => expandAll(true));
+    document.getElementById("collapse-all").addEventListener("click", () => expandAll(false));
     layoutSelect.addEventListener("change", () => {
       runLayout(cy, edges);
       applySaved(cy);
@@ -1153,10 +1702,10 @@
     });
     cy.on("grab", "node", hideTip);
     document.getElementById("reset-layout").addEventListener("click", () => {
-      post(container.dataset.resetUrl, { vpc: vpcId })
+      post(container.dataset.resetUrl, { vpc: layoutKey })
         .then(() => {
           saved = {};
-          runLayout(cy, edges);
+          if (ext) relayout(); else runLayout(cy, edges);
           refreshContext();
           cy.fit(undefined, 30);
           note.textContent = "Layout reset.";
@@ -1173,20 +1722,28 @@
       relayout();
       savePrefs({ shorten_names: shortenBox.checked ? "1" : "0" });
     });
-    const exportView = () => currentView(cy, edges, expandExportBox && expandExportBox.checked);
+    // The Extended view exports exactly what is drawn (focus, groups, filters).
+    const exportView = () => currentView(cy, edges, !ext && expandExportBox && expandExportBox.checked);
     document.getElementById("export-svg").addEventListener("click", () => {
       download(container.dataset.exportSvg, exportView());
     });
     document.getElementById("export-drawio").addEventListener("click", () => {
       download(container.dataset.exportDrawio, exportView());
     });
+    let lanesShown = laneMode();
     [groupBySelect, groupTagSelect].forEach((sel) => sel.addEventListener("change", () => {
       groupTagSelect.hidden = groupBySelect.value !== "tag";
-      refreshContext();
+      // Swimlanes (Extended view, tag / Terraform root) change which box holds a node.
+      if (ext && (lanesShown || laneMode())) {
+        lanesShown = laneMode();
+        rebuild();
+      } else {
+        refreshContext();
+      }
       rememberGroupBy();
     }));
     edgeBoxes.forEach((box) => box.addEventListener("change", () => {
-      refreshEdges();
+      if (ext) relayout(); else refreshEdges();
       rememberEdgeFilter();
     }));
 
@@ -1194,16 +1751,20 @@
       const el = document.querySelector(`[data-edge-count="${t.type}"]`);
       if (el) el.textContent = `(${t.count})`;
     });
-    const nRes = data.vpc.subnets.reduce((a, s) => a + s.resource_count, 0);
-    const cut = (data.edge_types || []).filter((t) => t.truncated).map((t) => t.label);
-    status.textContent = `${data.vpc.subnets.length} subnet(s) · ${nRes} resource ENI(s) · ` +
-      `${edges.length} connection(s) · snapshot #${data.snapshot_id}` +
-      (cut.length ? ` · truncated: ${cut.join(", ")}` : "") +
-      (ext ? ` · ${ext.nodes.length} regional / external node(s)` +
-        (ext.hidden_nodes ? ` (${ext.hidden_nodes} crawled node(s) not linked to this VPC hidden)` : "") +
-        (ext.crawl ? "" : " · services not crawled yet") +
-        (ext.flow ? ` · flow logs: ${ext.flow.pairs} aggregate(s), ${ext.flow.bytes_label} scanned` : "")
-        : "");
+    function updateStatus() {
+      const nRes = data.vpc.subnets.reduce((a, s) => a + s.resource_count, 0);
+      const cut = (data.edge_types || []).filter((t) => t.truncated).map((t) => t.label);
+      status.textContent = `${data.vpc.subnets.length} subnet(s) · ${nRes} resource ENI(s) · ` +
+        `${edges.length} connection(s) · snapshot #${data.snapshot_id}` +
+        (cut.length ? ` · truncated: ${cut.join(", ")}` : "") +
+        (ext ? ` · ${ext.nodes.length} regional / external node(s)` +
+          (ext.hidden_nodes ? ` (${ext.hidden_nodes} crawled node(s) not linked to this VPC hidden)` : "") +
+          ` · ${drawnCount} line(s) drawn` +
+          (ext.crawl ? "" : " · services not crawled yet") +
+          (ext.flow ? ` · flow logs: ${ext.flow.pairs} aggregate(s), ${ext.flow.bytes_label} scanned` : "")
+          : "");
+    }
+    updateStatus();
   }
 
   // -- extended view: opt-in flow log query (estimate first, then confirm) --------------

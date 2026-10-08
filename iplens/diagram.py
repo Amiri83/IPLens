@@ -13,9 +13,12 @@ member nodes, laid out in rows appended to the group's subnet (everything below 
 moved down). Context boxes (``ctx``: "Group by" security group / tag / Terraform
 root) are dashed boxes around their ``members`` and are refitted after expansion.
 
-The Extended view (``mode: "extended"``) adds ``area`` containers drawn beside the
-VPC ("Regional services", "External") holding service / gateway nodes, and edges typed
-by their strongest evidence level (``ev_observed`` ... ``ev_referenced``).
+The Extended view (``mode: "extended"``) adds ``area`` containers (an expanded
+service group such as "SQS ×18") holding service / gateway nodes, ``lane`` containers
+(one swimlane per app when grouping by tag or Terraform root) and edges typed by their
+strongest evidence level (``ev_observed`` ... ``ev_referenced``). An edge standing for
+several merged connections carries a ``width``; ``bidir`` adds an arrow at its source.
+The view is exported as drawn, so focus mode, aggregation and filters carry over.
 """
 
 from __future__ import annotations
@@ -39,9 +42,9 @@ from .visual import EDGE_TYPES
 ICON_ROOT = Path(__file__).parent / "static" / "icons"
 ICON_DIR = ICON_ROOT / "aws"
 ALLOWED_ICONS = frozenset({*TYPE_ICONS.values(), *LB_ICONS.values(), VPC_ICON, *EXT_ICONS.values()})
-# Extended view: "area" boxes ("Regional services", "External") sit beside the VPC.
-NODE_KINDS = ("vpc", "subnet", "res", "group", "ctx", "area")
-CONTAINER_KINDS = ("vpc", "subnet", "area")
+# Extended view: "area" boxes (expanded service groups) and "lane" boxes (swimlanes).
+NODE_KINDS = ("vpc", "subnet", "res", "group", "ctx", "area", "lane")
+CONTAINER_KINDS = ("vpc", "subnet", "area", "lane")
 # Extended view edges are drawn by their strongest evidence level.
 EXT_EDGE_TYPES = tuple(f"ev_{level}" for level in EVIDENCE_LEVELS)
 ALL_EDGE_TYPES = EDGE_TYPES + EXT_EDGE_TYPES
@@ -53,6 +56,7 @@ MAX_EDGES = 20000
 MAX_LABEL = 600
 MAX_COORD = 1e7
 MAX_MEMBERS = 5000
+MIN_EDGE_W, MAX_EDGE_W = 0.5, 20.0
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 # Expanded group members: grid cells sized like the Visual page's grid layout.
@@ -65,9 +69,18 @@ SUBNET_STROKE, SUBNET_FILL = "#7aa116", "#ffffff"
 IDLE_STROKE, GROUP_STROKE = "#e8a33a", "#2457c5"
 CTX_STROKE = "#5b6573"
 AREA_STROKE, AREA_FILL = "#5b6573", "#f6f7f9"
+LANE_STROKE, LANE_FILL = "#475569", "#fbfcfd"
 TEXT = "#1f2933"
 FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
-FONT_SIZE = {"vpc": 14, "subnet": 11, "res": 10, "group": 10, "ctx": 10, "area": 12}
+FONT_SIZE = {
+    "vpc": 14,
+    "subnet": 11,
+    "res": 10,
+    "group": 10,
+    "ctx": 10,
+    "area": 12,
+    "lane": 13,
+}
 EDGE_STYLES: dict[str, dict[str, Any]] = {
     "targets": {"color": "#2457c5", "width": 2, "dash": "", "head": "triangle"},
     "ecs_lb": {"color": "#2f8f4e", "width": 2, "dash": "", "head": "triangle"},
@@ -126,6 +139,8 @@ class ViewEdge:
     target: str
     type: str
     label: str = ""
+    width: float | None = None  # merged connections: stroke width instead of the type's
+    bidir: bool = False  # evidence in both directions: arrows at both ends
 
 
 @dataclass
@@ -204,7 +219,7 @@ def parse_view(raw: str) -> View:
     for node in view.nodes:
         parent = seen.get(node.parent or "")
         if node.parent and (parent is None or parent.kind not in CONTAINER_KINDS):
-            raise ValueError("a node's parent must be a VPC or subnet node of the view")
+            raise ValueError("a node's parent must be a container node of the view")
         if node.kind == "ctx" and node.parent:
             raise ValueError("a context box cannot have a parent")
     for e in raw_edges:
@@ -215,7 +230,10 @@ def parse_view(raw: str) -> View:
             target=_text(e.get("target"), 200),
             type=e.get("type") if e.get("type") in ALL_EDGE_TYPES else "",
             label=_text(e.get("label"), 200),
+            bidir=e.get("bidir") is True,
         )
+        if e.get("width") is not None:
+            edge.width = min(MAX_EDGE_W, max(MIN_EDGE_W, _num(e.get("width"), "edge width")))
         if not edge.type:
             raise ValueError(f"edge type must be one of {', '.join(ALL_EDGE_TYPES)}")
         ends = (
@@ -471,6 +489,9 @@ def view_to_svg(view: View) -> str:
         )
         d = "M0,0 L10,5 L0,10 z" if st["head"] == "triangle" else "M0,0 L10,5 L0,10 L3,5 z"
         ET.SubElement(marker, "path", {"d": d, "fill": st["color"]})
+        start = ET.SubElement(defs, "marker", {**marker.attrib, "id": f"arrow-start-{etype}"})
+        start.set("orient", "auto-start-reverse")
+        ET.SubElement(start, "path", {"d": d, "fill": st["color"]})
     ET.SubElement(
         svg,
         "rect",
@@ -488,6 +509,7 @@ def view_to_svg(view: View) -> str:
                 "vpc": (VPC_STROKE, VPC_FILL),
                 "subnet": (SUBNET_STROKE, SUBNET_FILL),
                 "area": (AREA_STROKE, AREA_FILL),
+                "lane": (LANE_STROKE, LANE_FILL),
             }[n.kind]
             attrs = {
                 "x": _fmt(n.x),
@@ -545,9 +567,11 @@ def view_to_svg(view: View) -> str:
             "x2": _fmt(tx),
             "y2": _fmt(ty),
             "stroke": st["color"],
-            "stroke-width": str(st["width"]),
+            "stroke-width": _fmt(e.width or st["width"]),
             "marker-end": f"url(#arrow-{e.type})",
         }
+        if e.bidir:
+            attrs["marker-start"] = f"url(#arrow-start-{e.type})"
         if st["dash"]:
             attrs["stroke-dasharray"] = st["dash"]
         ET.SubElement(g, "line", attrs)
@@ -726,6 +750,11 @@ DRAWIO_EDGE_STYLES = {
     "ev_permitted": "endArrow=open;dashed=1;dashPattern=7 4;strokeColor=#C2410C;strokeWidth=1.8;",
     "ev_referenced": "endArrow=open;dashed=1;dashPattern=2 3;strokeColor=#6B7280;strokeWidth=1.5;",
 }
+DRAWIO_LANE = (
+    "swimlane;horizontal=0;startSize=28;html=1;whiteSpace=wrap;fontSize=13;fontStyle=1;"
+    "strokeColor=#475569;fillColor=#F1F5F9;swimlaneFillColor=#FBFCFD;container=1;"
+    "collapsible=0;recursiveResize=0;"
+)
 DRAWIO_AREA = (
     "rounded=0;dashed=1;dashPattern=8 5;strokeColor=#5B6573;fillColor=#F6F7F9;html=1;"
     "whiteSpace=wrap;verticalAlign=bottom;labelPosition=center;verticalLabelPosition=top;"
@@ -744,6 +773,8 @@ def drawio_style(node: ViewNode, view: View) -> str:
         return DRAWIO_SUBNET + ("" if view.show_subnets else DRAWIO_HIDDEN_BOX)
     if node.kind == "area":
         return DRAWIO_AREA
+    if node.kind == "lane":
+        return DRAWIO_LANE
     if node.kind == "ctx":
         color = (node.color or CTX_STROKE).upper()
         return f"{DRAWIO_CTX}strokeColor={color};fontColor={color};"
@@ -752,6 +783,15 @@ def drawio_style(node: ViewNode, view: View) -> str:
         style += "fontStyle=1;"
     if node.idle:
         style += "labelBorderColor=#E8A33A;"
+    return style
+
+
+def drawio_edge_style(e: ViewEdge) -> str:
+    style = DRAWIO_EDGE + DRAWIO_EDGE_STYLES[e.type]
+    if e.width is not None:
+        style += f"strokeWidth={_fmt(e.width)};"  # later keys win in draw.io styles
+    if e.bidir:
+        style += "startArrow=block;startFill=1;" if "endFill=1" in style else "startArrow=open;"
     return style
 
 
@@ -815,7 +855,7 @@ def view_to_drawio(view: View) -> str:
             {
                 "id": f"e{i}",
                 "value": html.escape(e.label),
-                "style": DRAWIO_EDGE + DRAWIO_EDGE_STYLES[e.type],
+                "style": drawio_edge_style(e),
                 "edge": "1",
                 "parent": "1",
                 "source": cell_ids[e.source],

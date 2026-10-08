@@ -608,6 +608,51 @@ def test_visual_layout_saved_per_account_and_vpc(client, two_accounts):
     assert 'id="visual-positions">{}</script>' in client.get("/visual").data.decode()
 
 
+def _evidence_ticked(page: str) -> set[str]:
+    return {
+        level
+        for level in ("observed", "configured", "permitted", "referenced")
+        if f'name="evidence" value="{level}" checked' in page
+    }
+
+
+def test_extended_evidence_filter_default_and_remembered_per_account(client, two_accounts):
+    url = f"/visual?vpc={VPC_A}&view=extended"
+    # Default: configured + observed; permitted and referenced are opt-in.
+    assert _evidence_ticked(client.get(url).data.decode()) == {"observed", "configured"}
+    assert _post(client, "/visual/prefs", {"evidence": "observed,permitted"}).status_code == 204
+    assert _evidence_ticked(client.get(url).data.decode()) == {"observed", "permitted"}
+    # Saving other toggles keeps the evidence filter, and vice versa.
+    assert _post(client, "/visual/prefs", {"shorten_names": "1"}).status_code == 204
+    page = client.get(url).data.decode()
+    assert _evidence_ticked(page) == {"observed", "permitted"}
+    assert 'id="shorten-names" checked' in page
+    assert _post(client, "/visual/prefs", {"evidence": "observed,bogus"}).status_code == 400
+
+    _activate(client, two_accounts["b_id"])
+    assert _evidence_ticked(client.get("/visual?view=extended").data.decode()) == {
+        "observed",
+        "configured",
+    }
+    assert _post(client, "/visual/prefs", {"evidence": ""}).status_code == 204  # none ticked
+    assert _evidence_ticked(client.get("/visual?view=extended").data.decode()) == set()
+
+    _activate(client, 1)
+    assert _evidence_ticked(client.get(url).data.decode()) == {"observed", "permitted"}
+
+
+def test_extended_view_keeps_its_own_layout(client, two_accounts):
+    positions = {f"res:{ENI_A}": {"x": 10, "y": 20}}
+    key = f"{VPC_A}:extended"
+    resp = _post(client, "/visual/layout", {"vpc": key, "positions": json.dumps(positions)})
+    assert resp.status_code == 204
+    page = client.get(f"/visual?vpc={VPC_A}&view=extended").data.decode()
+    assert f'data-layout-key="{key}"' in page
+    assert f"res:{ENI_A}" in page.split('id="visual-positions">', 1)[1].split("</script>", 1)[0]
+    page = client.get(f"/visual?vpc={VPC_A}").data.decode()  # the IP view is unaffected
+    assert f'data-layout-key="{VPC_A}"' in page and 'id="visual-positions">{}</script>' in page
+
+
 @pytest.mark.parametrize(
     "positions",
     ["not json", "[]", '{"a": {"x": "1", "y": 2}}', '{"a": {"x": 1e99, "y": 2}}', '{"a": 1}'],
