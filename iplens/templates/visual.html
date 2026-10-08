@@ -3,12 +3,67 @@
 {% block title %}Visual{% endblock %}
 {% block content %}
 <h1>Visual</h1>
+{% set extended = view_mode == 'extended' %}
+<nav class="view-tabs" aria-label="Diagram view">
+  {% for mode, label in view_modes.items() %}
+    <a href="{{ url_for('visual', vpc=vpc or None, view=None if mode == 'ip' else mode) }}"
+       class="view-tab {{ 'active' if mode == view_mode }}" {% if mode == view_mode %}aria-current="page"{% endif %}>{{ label }}</a>
+  {% endfor %}
+</nav>
 {% if not snap %}
   {{ no_data() }}
 {% elif not tree %}
   <div class="card muted">No VPCs {{ 'in the active scope' if scope_count else 'found in this snapshot' }}.</div>
 {% else %}
+{% if extended %}
+<section class="card extended-panel" aria-labelledby="ext-title">
+  <h2 id="ext-title">Extended view</h2>
+  <p class="muted">
+    Regional services (SNS, SQS, DynamoDB, EventBridge, S3, API Gateway, Step Functions, Lambda,
+    ECS, Secrets Manager names) are drawn outside the VPC; Transit Gateway, peering and internet
+    via NAT as external nodes. Every connection carries evidence:
+    {% for level in evidence_levels %}<b>{{ evidence_labels[level] }}</b> ({{ evidence_help[level] }}){{ ' > ' if not loop.last }}{% endfor %}.
+    Environment variables and IAM policies are only matched against known resource names and
+    ARNs: their values are never stored or shown. IAM <code>Resource: "*"</code> appears as a
+    <span class="badge err">broad access</span> badge and is never expanded.
+  </p>
+  <div class="row">
+    <form method="post" action="{{ url_for('visual_extended_crawl') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="vpc" value="{{ vpc }}">
+      <button type="submit">{{ 'Re-crawl services' if crawl else 'Crawl services' }}</button>
+    </form>
+    <span class="muted">
+      {% if crawl %}Services crawled {{ crawl.crawled_at | localtime }} for snapshot #{{ snap.id }}
+        · {{ crawl.sources | length }} source(s) read · {{ crawl.warnings | length }} warning(s).
+      {% else %}Not crawled for snapshot #{{ snap.id }} yet: read-only, each source is optional
+        (a missing permission or disabled feature is a warning).{% endif %}
+    </span>
+  </div>
+  {% if crawl and crawl.warnings %}
+  <details class="crawl-warnings">
+    <summary>{{ crawl.warnings | length }} crawl warning(s)</summary>
+    <ul>{% for w in crawl.warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+  </details>
+  {% endif %}
+  <fieldset class="edge-filters flow-logs" id="flow-logs"
+            data-estimate-url="{{ url_for('visual_flowlogs_estimate') }}"
+            data-run-url="{{ url_for('visual_flowlogs_run') }}">
+    <legend>Flow logs (opt-in, observed evidence)</legend>
+    <label for="flow-window">Window</label>
+    <select id="flow-window">
+      {% for value, label in flow_windows.items() %}<option value="{{ value }}" {{ 'selected' if value == flow_default }}>{{ label }}</option>{% endfor %}
+    </select>
+    <button type="button" class="secondary" id="flow-estimate">Estimate scan size</button>
+    <span id="flow-estimate-result" aria-live="polite"></span>
+    <button type="button" id="flow-run" hidden>Run query</button>
+    <span class="muted small" style="flex: 1 1 100%">Queries this VPC's flow logs in CloudWatch Logs
+      Insights (billed per GB scanned). Only ENI↔ENI/port aggregates are stored, never raw records.</span>
+  </fieldset>
+</section>
+{% endif %}
 <form method="get" action="{{ url_for('visual') }}" class="card row visual-controls" id="visual-form">
+  {% if extended %}<input type="hidden" name="view" value="extended">{% endif %}
   <div><label for="vpc">VPC</label>
     <select id="vpc" name="vpc" onchange="this.form.submit()">
       {% for v in tree %}<option value="{{ v.vpc_id }}" {{ 'selected' if v.vpc_id == vpc }}>{{ v.vpc_id }}{% if v.name %} · {{ v.name }}{% endif %} ({{ v.cidrs | join(', ') }})</option>{% endfor %}
@@ -58,6 +113,19 @@
       <i class="edge-swatch edge-{{ t }}"></i> {{ edge_labels[t] }} <span class="muted" data-edge-count="{{ t }}"></span></label>
     {% endfor %}
   </fieldset>
+  {% if extended %}
+  <fieldset class="edge-filters">
+    <legend>Evidence</legend>
+    {% for level in evidence_levels %}
+    <label class="edge-filter" title="{{ evidence_help[level] }}"><input type="checkbox" name="evidence" value="{{ level }}" checked>
+      <i class="edge-swatch ev-{{ level }}"></i> {{ evidence_labels[level] }} <span class="muted" data-evidence-count="{{ level }}"></span></label>
+    {% endfor %}
+  </fieldset>
+  <fieldset class="edge-filters" id="service-filters">
+    <legend>Services</legend>
+    <span class="muted small" id="service-filters-empty">Crawl services to list them.</span>
+  </fieldset>
+  {% endif %}
   <div class="muted" style="flex: 1 1 100%">
     Scroll to zoom, drag to pan, hover for full names. Click a resource to highlight its
     connections (click the background to clear); double-click it to open its ENI. Click a group
@@ -72,12 +140,17 @@
     resources sharing a security group, a tag value or a Terraform root (loaded under Settings).
     Exports contain the diagram as currently shown; with <b>Expand all groups</b> (default) every
     collapsed group is exported as its member resources.
+    {% if extended %}<br><b>Extended view:</b> lines are styled by their strongest evidence;
+    click a connection (or a service node) to list all of its evidence below the diagram.
+    Exports include the regional / external nodes and connections as shown.{% endif %}
   </div>
 </form>
 <div class="cy-wrap">
   <div id="cy" class="card"
-       data-src="{{ url_for('visual_data', vpc=vpc) }}"
+       data-src="{{ url_for('visual_data', vpc=vpc, view='extended' if extended else None) }}"
        data-vpc="{{ vpc }}"
+       data-mode="{{ view_mode }}"
+       data-icon-root="{{ url_for('static', filename='icons/') }}"
        data-icons="{{ url_for('static', filename='icons/aws/') }}"
        data-eni-url="{{ url_for('eni', eni_id='__ENI__') }}"
        data-csrf="{{ csrf_token }}"
@@ -89,6 +162,12 @@
        data-export-drawio="{{ url_for('visual_export_drawio') }}"></div>
   <div id="cy-tip" class="cy-tip" role="tooltip" hidden></div>
 </div>
+{% if extended %}
+<aside class="card edge-detail" id="edge-detail" aria-live="polite" hidden>
+  <h2 id="edge-detail-title">Evidence</h2>
+  <ul id="edge-detail-lines"></ul>
+</aside>
+{% endif %}
 <script type="application/json" id="visual-positions">{{ positions | tojson }}</script>
 <p class="muted" id="cy-status"></p>
 <p class="muted small" id="cy-note" aria-live="polite"></p>
@@ -105,10 +184,23 @@
     <span class="legend-item"><i class="node-swatch node-idle"></i> Idle ENI (available)</span>
     <span class="legend-item"><i class="node-swatch node-group"></i> Group (click to expand)</span>
     <span class="legend-item"><i class="box-swatch box-ctx"></i> Group by: security group / tag / Terraform root</span>
+    {% if not extended %}
     {% for t in edge_types %}
       <span class="legend-item"><i class="edge-swatch edge-{{ t }}"></i> {{ edge_labels[t] }}</span>
     {% endfor %}
+    {% endif %}
   </div>
+  {% if extended %}
+  <div class="legend-grid" aria-label="Evidence levels">
+    {% for level in evidence_levels %}
+      <span class="legend-item"><i class="edge-swatch ev-{{ level }}"></i> <b>{{ evidence_labels[level] }}</b>: {{ evidence_help[level] }}</span>
+    {% endfor %}
+  </div>
+  <div class="legend-grid">
+    <span class="legend-item"><i class="box-swatch box-area"></i> Regional services / External (outside the VPC)</span>
+    <span class="legend-item"><span class="badge err">broad access</span> an IAM statement allows Resource "*" (not expanded)</span>
+  </div>
+  {% endif %}
 </section>
 <p class="muted small">Icons: AWS Architecture Icons, © Amazon Web Services, Inc. or its affiliates.
   Layout: dagre (MIT).</p>

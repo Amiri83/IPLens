@@ -37,6 +37,17 @@ Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (defau
    positions are saved per account + VPC until **Reset layout**. **Export SVG** / **Export
    draw.io** download the view exactly as shown (draw.io: `mxgraph.aws4` shapes, VPC and subnets
    as containers, edges kept). Data comes from `GET /visual/data.json?vpc=<vpc-id>`.
+   The **IP view** is the default; the **Extended view** tab adds a "Regional services" area
+   (SNS, SQS, DynamoDB, EventBridge, S3, API Gateway, Step Functions, Lambda, ECS, Secrets Manager
+   names) and an "External" area (Transit Gateway, peering, internet via IGW / NAT) beside the VPC.
+   **Crawl services** (opt-in) reads them; every connection carries evidence, strongest first:
+   *observed* (flow logs, X-Ray) > *configured* (subscriptions, event source mappings, targets,
+   routes, ...) > *permitted* (IAM policies of Lambda / ECS roles) > *referenced* (environment
+   variables). Environment variable values, policy documents and secret values are only matched
+   against known resource names / ARNs in memory and never stored; IAM `Resource: "*"` shows a
+   *broad access* badge. **Flow logs** (opt-in) shows the estimated Logs Insights scan size for the
+   chosen window (default 1 hour) before running, and stores only ENI↔ENI/port aggregates.
+   Filters by service and evidence level apply to the diagram and its exports.
 5. Define **Rules** (GUI or YAML import/export) and review **Suggestions**; anything a rule forbids is
    greyed out together with the IPs it would have saved.
 6. **Logs** shows the application log file.
@@ -45,7 +56,10 @@ Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (defau
 
 Every boto3 client is created through `iplens.aws.AwsGateway`, which registers a botocore
 `before-call` hook that rejects any operation not starting with `Describe`, `List` or `Get`.
-Minimal IAM permissions:
+The only exceptions are the CloudWatch Logs query calls of the opt-in flow log analysis
+(`logs:StartQuery`, `logs:GetQueryResults`, `logs:StopQuery`, `logs:FilterLogEvents`); calls that
+return secret values (`secretsmanager:GetSecretValue`, `ssm:GetParameter*`, ...) are refused even
+though they start with `Get`. Minimal IAM permissions:
 
 ```
 ec2:DescribeVpcs  ec2:DescribeSubnets  ec2:DescribeNetworkInterfaces  ec2:DescribeVpcEndpoints
@@ -57,6 +71,21 @@ shows the account id only, or the *Account display name* set in Settings).
 `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth` and
 `ec2:DescribeSecurityGroups` add load balancer → target and security group reference
 connections to the Visual page; without them those connections are left out.
+
+Extended view (each source optional; a missing permission or disabled feature becomes a crawl
+warning): `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:ListTables`,
+`dynamodb:DescribeTable`, `events:List*`, `s3:ListAllMyBuckets`,
+`s3:GetBucketNotification`, `apigateway:GET`, `states:List*`, `states:DescribeStateMachine`,
+`secretsmanager:ListSecrets`, `lambda:ListEventSourceMappings`, `ecs:List*`, `ecs:Describe*`,
+`iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, `iam:GetRolePolicy`, `iam:GetPolicy`,
+`iam:GetPolicyVersion`, `ec2:DescribeRouteTables`, `ec2:DescribeNetworkAcls`,
+`ec2:DescribeTransitGateway*`, `ec2:GetTransitGatewayRouteTablePropagations`,
+`ec2:DescribeVpcPeeringConnections`, `ec2:DescribeManagedPrefixLists`,
+`route53:ListHostedZones`, `route53:GetHostedZone`, `route53resolver:List*`,
+`config:DescribeConfigurationRecorderStatus`, `config:GetResourceConfigHistory`,
+`resource-explorer-2:GetIndex`, `resource-explorer-2:ListResources`, `xray:GetServiceGraph`.
+Flow logs: `ec2:DescribeFlowLogs`, `logs:DescribeLogGroups`, `logs:StartQuery`,
+`logs:GetQueryResults`, `logs:StopQuery`.
 
 ## Rules
 

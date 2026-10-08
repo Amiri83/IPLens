@@ -12,6 +12,10 @@ node carries its ``members``; :func:`expand_groups` replaces the group box with 
 member nodes, laid out in rows appended to the group's subnet (everything below is
 moved down). Context boxes (``ctx``: "Group by" security group / tag / Terraform
 root) are dashed boxes around their ``members`` and are refitted after expansion.
+
+The Extended view (``mode: "extended"``) adds ``area`` containers drawn beside the
+VPC ("Regional services", "External") holding service / gateway nodes, and edges typed
+by their strongest evidence level (``ev_observed`` ... ``ev_referenced``).
 """
 
 from __future__ import annotations
@@ -27,13 +31,21 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
+from .extended import EVIDENCE_LEVELS
+from .extgraph import EXT_ICONS
 from .queries import LB_ICONS, TYPE_ICONS, VPC_ICON
 from .visual import EDGE_TYPES
 
-ICON_DIR = Path(__file__).parent / "static" / "icons" / "aws"
-ALLOWED_ICONS = frozenset({*TYPE_ICONS.values(), *LB_ICONS.values(), VPC_ICON})
-NODE_KINDS = ("vpc", "subnet", "res", "group", "ctx")
-CONTAINER_KINDS = ("vpc", "subnet")
+ICON_ROOT = Path(__file__).parent / "static" / "icons"
+ICON_DIR = ICON_ROOT / "aws"
+ALLOWED_ICONS = frozenset({*TYPE_ICONS.values(), *LB_ICONS.values(), VPC_ICON, *EXT_ICONS.values()})
+# Extended view: "area" boxes ("Regional services", "External") sit beside the VPC.
+NODE_KINDS = ("vpc", "subnet", "res", "group", "ctx", "area")
+CONTAINER_KINDS = ("vpc", "subnet", "area")
+# Extended view edges are drawn by their strongest evidence level.
+EXT_EDGE_TYPES = tuple(f"ev_{level}" for level in EVIDENCE_LEVELS)
+ALL_EDGE_TYPES = EDGE_TYPES + EXT_EDGE_TYPES
+VIEW_MODES = ("ip", "extended")
 LEAF_KINDS = ("res", "group")
 
 MAX_NODES = 5000
@@ -52,14 +64,20 @@ VPC_STROKE, VPC_FILL = "#8c4fff", "#f7f3ff"
 SUBNET_STROKE, SUBNET_FILL = "#7aa116", "#ffffff"
 IDLE_STROKE, GROUP_STROKE = "#e8a33a", "#2457c5"
 CTX_STROKE = "#5b6573"
+AREA_STROKE, AREA_FILL = "#5b6573", "#f6f7f9"
 TEXT = "#1f2933"
 FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
-FONT_SIZE = {"vpc": 14, "subnet": 11, "res": 10, "group": 10, "ctx": 10}
+FONT_SIZE = {"vpc": 14, "subnet": 11, "res": 10, "group": 10, "ctx": 10, "area": 12}
 EDGE_STYLES: dict[str, dict[str, Any]] = {
     "targets": {"color": "#2457c5", "width": 2, "dash": "", "head": "triangle"},
     "ecs_lb": {"color": "#2f8f4e", "width": 2, "dash": "", "head": "triangle"},
     "reach": {"color": "#b0469b", "width": 1.6, "dash": "3 3", "head": "vee"},
     "sg": {"color": "#8a94a3", "width": 1.2, "dash": "6 4", "head": "vee"},
+    # Extended view evidence levels (mirrors the ev-* styles in static/visual.js).
+    "ev_observed": {"color": "#1a7f37", "width": 3, "dash": "", "head": "triangle"},
+    "ev_configured": {"color": "#2457c5", "width": 2, "dash": "", "head": "triangle"},
+    "ev_permitted": {"color": "#c2410c", "width": 1.8, "dash": "7 4", "head": "vee"},
+    "ev_referenced": {"color": "#6b7280", "width": 1.5, "dash": "2 3", "head": "vee"},
 }
 
 
@@ -113,6 +131,7 @@ class ViewEdge:
 @dataclass
 class View:
     vpc_id: str = ""
+    mode: str = "ip"  # ip | extended
     show_vpc: bool = True
     show_subnets: bool = True
     expand_groups: bool = False
@@ -151,6 +170,7 @@ def parse_view(raw: str) -> View:
         raise ValueError("view is too large")
     view = View(
         vpc_id=_text(doc.get("vpc_id"), 64),
+        mode=doc.get("mode") if doc.get("mode") in VIEW_MODES else "ip",
         show_vpc=doc.get("show_vpc", True) is not False,
         show_subnets=doc.get("show_subnets", True) is not False,
         expand_groups=doc.get("expand_groups") is True,
@@ -193,11 +213,11 @@ def parse_view(raw: str) -> View:
         edge = ViewEdge(
             source=_text(e.get("source"), 200),
             target=_text(e.get("target"), 200),
-            type=e.get("type") if e.get("type") in EDGE_TYPES else "",
+            type=e.get("type") if e.get("type") in ALL_EDGE_TYPES else "",
             label=_text(e.get("label"), 200),
         )
         if not edge.type:
-            raise ValueError(f"edge type must be one of {', '.join(EDGE_TYPES)}")
+            raise ValueError(f"edge type must be one of {', '.join(ALL_EDGE_TYPES)}")
         ends = (
             (seen.get(edge.source) or members.get(edge.source)),
             (seen.get(edge.target) or members.get(edge.target)),
@@ -319,7 +339,8 @@ def _refit_context_boxes(view: View) -> None:
 
 def export_filename(view: View, ext: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "", view.vpc_id) or "diagram"
-    return f"iplens-{safe}.{ext}"
+    suffix = "-extended" if view.mode == "extended" else ""
+    return f"iplens-{safe}{suffix}.{ext}"
 
 
 def _depth(node: ViewNode, by_id: dict[str, ViewNode]) -> int:
@@ -341,7 +362,8 @@ def _ordered(view: View) -> list[ViewNode]:
 
 @cache
 def _icon_data_uri(name: str) -> str:
-    data = (ICON_DIR / name).read_bytes()
+    # Only names from ALLOWED_ICONS get here (checked when the view is parsed).
+    data = (ICON_ROOT / name if name.startswith("ext/") else ICON_DIR / name).read_bytes()
     return "data:image/svg+xml;base64," + base64.b64encode(data).decode("ascii")
 
 
@@ -459,25 +481,26 @@ def view_to_svg(view: View) -> str:
     for n in nodes:
         if n.kind not in CONTAINER_KINDS:
             continue
-        shown = view.show_vpc if n.kind == "vpc" else view.show_subnets
+        shown = {"vpc": view.show_vpc, "subnet": view.show_subnets}.get(n.kind, True)
         g = ET.SubElement(boxes, "g", {"class": n.kind, "data-id": n.id})
         if shown:
-            stroke, fill = (
-                (VPC_STROKE, VPC_FILL) if n.kind == "vpc" else (SUBNET_STROKE, SUBNET_FILL)
-            )
-            ET.SubElement(
-                g,
-                "rect",
-                {
-                    "x": _fmt(n.x),
-                    "y": _fmt(n.y),
-                    "width": _fmt(n.w),
-                    "height": _fmt(n.h),
-                    "fill": fill,
-                    "stroke": stroke,
-                    "stroke-width": "2" if n.kind == "vpc" else "1.5",
-                },
-            )
+            stroke, fill = {
+                "vpc": (VPC_STROKE, VPC_FILL),
+                "subnet": (SUBNET_STROKE, SUBNET_FILL),
+                "area": (AREA_STROKE, AREA_FILL),
+            }[n.kind]
+            attrs = {
+                "x": _fmt(n.x),
+                "y": _fmt(n.y),
+                "width": _fmt(n.w),
+                "height": _fmt(n.h),
+                "fill": fill,
+                "stroke": stroke,
+                "stroke-width": "1.5" if n.kind == "subnet" else "2",
+            }
+            if n.kind == "area":
+                attrs["stroke-dasharray"] = "8 5"
+            ET.SubElement(g, "rect", attrs)
             if n.icon:
                 _image(g, n.icon, n.x, n.y, 32, 32)
         lines = _lines(n.label)
@@ -648,6 +671,30 @@ DRAWIO_SHAPES = {
     LB_ICONS["network"]: f"shape=mxgraph.aws4.network_load_balancer;fillColor={_NETWORK};",
     LB_ICONS["gateway"]: f"shape=mxgraph.aws4.gateway_load_balancer;fillColor={_NETWORK};",
 }
+_INTEGRATION, _STORAGE, _SECURITY = "#E7157B", "#7AA116", "#DD344C"
+# Extended view service badges -> draw.io AWS 4 shapes.
+DRAWIO_SHAPES.update(
+    {
+        EXT_ICONS["sns"]: f"{_RES_ICON}sns;fillColor={_INTEGRATION};",
+        EXT_ICONS["sqs"]: f"{_RES_ICON}sqs;fillColor={_INTEGRATION};",
+        EXT_ICONS["dynamodb"]: f"{_RES_ICON}dynamodb;fillColor={_DATABASE};",
+        EXT_ICONS["events"]: f"{_RES_ICON}eventbridge;fillColor={_INTEGRATION};",
+        EXT_ICONS["s3"]: f"{_RES_ICON}s3;fillColor={_STORAGE};",
+        EXT_ICONS["apigateway"]: f"{_RES_ICON}api_gateway;fillColor={_INTEGRATION};",
+        EXT_ICONS["states"]: f"{_RES_ICON}step_functions;fillColor={_INTEGRATION};",
+        EXT_ICONS["secretsmanager"]: f"{_RES_ICON}secrets_manager;fillColor={_SECURITY};",
+        EXT_ICONS["kinesis"]: f"{_RES_ICON}kinesis;fillColor={_NETWORK};",
+        EXT_ICONS["tgw"]: f"shape=mxgraph.aws4.transit_gateway;fillColor={_NETWORK};",
+        EXT_ICONS[
+            "tgw-attachment"
+        ]: f"shape=mxgraph.aws4.transit_gateway_attachment;fillColor={_NETWORK};",
+        EXT_ICONS["pcx"]: f"shape=mxgraph.aws4.peering;fillColor={_NETWORK};",
+        EXT_ICONS["internet"]: f"shape=mxgraph.aws4.internet_gateway;fillColor={_NETWORK};",
+        EXT_ICONS["route53"]: f"{_RES_ICON}route_53;fillColor={_NETWORK};",
+        EXT_ICONS["resolver"]: f"shape=mxgraph.aws4.route_53_resolver;fillColor={_NETWORK};",
+        EXT_ICONS["other"]: f"{_RES_ICON}general;fillColor=#5B6573;",
+    }
+)
 _DRAWIO_GROUP = (
     "points=[[0,0],[0.25,0],[0.5,0],[0.75,0],[1,0],[1,0.25],[1,0.5],[1,0.75],[1,1],"
     "[0.75,1],[0.5,1],[0.25,1],[0,1],[0,0.75],[0,0.5],[0,0.25]];outlineConnect=0;"
@@ -674,7 +721,16 @@ DRAWIO_EDGE_STYLES = {
     "ecs_lb": "endArrow=block;endFill=1;strokeColor=#2F8F4E;strokeWidth=2;",
     "reach": "endArrow=open;dashed=1;dashPattern=3 3;strokeColor=#B0469B;strokeWidth=1.6;",
     "sg": "endArrow=open;dashed=1;dashPattern=6 4;strokeColor=#8A94A3;strokeWidth=1.2;",
+    "ev_observed": "endArrow=block;endFill=1;strokeColor=#1A7F37;strokeWidth=3;",
+    "ev_configured": "endArrow=block;endFill=1;strokeColor=#2457C5;strokeWidth=2;",
+    "ev_permitted": "endArrow=open;dashed=1;dashPattern=7 4;strokeColor=#C2410C;strokeWidth=1.8;",
+    "ev_referenced": "endArrow=open;dashed=1;dashPattern=2 3;strokeColor=#6B7280;strokeWidth=1.5;",
 }
+DRAWIO_AREA = (
+    "rounded=0;dashed=1;dashPattern=8 5;strokeColor=#5B6573;fillColor=#F6F7F9;html=1;"
+    "whiteSpace=wrap;verticalAlign=bottom;labelPosition=center;verticalLabelPosition=top;"
+    "align=center;fontSize=12;container=1;collapsible=0;recursiveResize=0;"
+)
 
 
 def _html_value(label: str) -> str:
@@ -686,6 +742,8 @@ def drawio_style(node: ViewNode, view: View) -> str:
         return DRAWIO_VPC + ("" if view.show_vpc else DRAWIO_HIDDEN_BOX)
     if node.kind == "subnet":
         return DRAWIO_SUBNET + ("" if view.show_subnets else DRAWIO_HIDDEN_BOX)
+    if node.kind == "area":
+        return DRAWIO_AREA
     if node.kind == "ctx":
         color = (node.color or CTX_STROKE).upper()
         return f"{DRAWIO_CTX}strokeColor={color};fontColor={color};"

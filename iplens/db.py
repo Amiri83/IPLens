@@ -254,6 +254,74 @@ CREATE TABLE IF NOT EXISTS scopes (
     config      TEXT NOT NULL
 );
 
+-- Extended view (opt-in "Crawl services", see extended.py), attached to a snapshot.
+-- Only resource names, ARNs and *matched* references are stored: environment variable
+-- values, IAM policy documents, secret values and message payloads never are.
+CREATE TABLE IF NOT EXISTS ext_crawls (
+    snapshot_id INTEGER PRIMARY KEY REFERENCES snapshots(id) ON DELETE CASCADE,
+    crawled_at  TEXT NOT NULL,
+    warnings    TEXT NOT NULL DEFAULT '[]',   -- JSON list
+    sources     TEXT NOT NULL DEFAULT '{}'    -- JSON {source: items found} of sources that ran
+);
+
+-- node_id is "<service>:<name>" (lambda:fn-a, sqs:queue-a, tgw:tgw-0example, ...).
+CREATE TABLE IF NOT EXISTS ext_nodes (
+    snapshot_id  INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    node_id      TEXT NOT NULL,
+    service      TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    arn          TEXT NOT NULL DEFAULT '',
+    area         TEXT NOT NULL DEFAULT 'regional',  -- regional | external
+    broad_access INTEGER NOT NULL DEFAULT 0,        -- IAM statements allowing Resource "*"
+    PRIMARY KEY (snapshot_id, node_id)
+);
+
+-- One row per evidence line. source/target are node ids, "vpc:<id>" or "eni:<id>".
+CREATE TABLE IF NOT EXISTS ext_edges (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    source      TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    evidence    TEXT NOT NULL,      -- observed | configured | permitted | referenced
+    label       TEXT NOT NULL DEFAULT '',
+    detail      TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, source, target, evidence, detail)
+);
+
+-- Notes about a subnet / node (route tables, NACLs, broad IAM access).
+CREATE TABLE IF NOT EXISTS ext_facts (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    subject     TEXT NOT NULL,      -- "subnet:<id>" or a node id
+    detail      TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, subject, detail)
+);
+
+-- Opt-in flow log analysis (flowlogs.py): only ENI<->ENI/port aggregates are stored,
+-- never raw flow records or the addresses of unknown peers.
+CREATE TABLE IF NOT EXISTS flow_runs (
+    snapshot_id    INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    vpc_id         TEXT NOT NULL,
+    ran_at         TEXT NOT NULL,
+    window_minutes INTEGER NOT NULL,
+    log_groups     TEXT NOT NULL DEFAULT '[]',  -- JSON list of log group names
+    bytes_scanned  INTEGER NOT NULL DEFAULT 0,
+    rows           INTEGER NOT NULL DEFAULT 0,  -- aggregate rows returned by the query
+    PRIMARY KEY (snapshot_id, vpc_id)
+);
+
+-- src_eni / dst_eni: an ENI id, "internet" (public peer) or "outside" (private, unknown).
+CREATE TABLE IF NOT EXISTS flow_aggregates (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    vpc_id      TEXT NOT NULL,
+    src_eni     TEXT NOT NULL,
+    dst_eni     TEXT NOT NULL,
+    protocol    TEXT NOT NULL,
+    port        INTEGER NOT NULL,
+    flows       INTEGER NOT NULL DEFAULT 0,
+    bytes       INTEGER NOT NULL DEFAULT 0,
+    packets     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (snapshot_id, vpc_id, src_eni, dst_eni, protocol, port)
+);
+
 CREATE TABLE IF NOT EXISTS visual_layouts (
     account_ref INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     vpc_id      TEXT NOT NULL,
