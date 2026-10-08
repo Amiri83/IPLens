@@ -487,6 +487,7 @@ def test_visual_data_edges_filter(app, client, snapshot_builder):
     assert {t["type"]: t["count"] for t in only_sg["edge_types"]} == {
         "targets": 1,
         "ecs_lb": 0,
+        "reach": 0,
         "sg": 1,
     }
     assert client.get("/visual/data.json?edges=").get_json()["edges"] == []
@@ -495,9 +496,13 @@ def test_visual_data_edges_filter(app, client, snapshot_builder):
 def test_visual_page_edge_toggles(app, client, snapshot_builder):
     _seed_edges(app, snapshot_builder)
     page = client.get("/visual").data.decode()
-    for etype in ("targets", "ecs_lb", "sg"):
+    for etype in ("targets", "ecs_lb", "reach"):
         assert f'name="edges" value="{etype}" checked' in page
+    assert 'name="edges" value="sg" >' in page  # SG refs are off by default
     assert '<input type="hidden" name="edges" value="">' in page
+    # the data endpoint still sends every type so ticking SG refs needs no refetch
+    every = client.get("/visual/data.json").get_json()
+    assert [t["selected"] for t in every["edge_types"]] == [True, True, True, True]
     assert 'id="layout"' in page and 'value="dagre"' in page
     page = client.get(f"/visual?vpc={VPC}&edges=&edges=sg").data.decode()
     assert 'name="edges" value="sg" checked' in page

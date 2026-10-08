@@ -116,7 +116,8 @@ def test_sg_reference_edges(db_path, snapshot_builder):
     )
     assert sg[(TASK_1, VPCE)]["label"] == "to vpce-0example0001"
     counts = {t["type"]: t["count"] for t in data["edge_types"]}
-    assert counts == {"targets": 5, "ecs_lb": 2, "sg": 4}
+    # the task SG's egress to the endpoint SG is not endpoint ingress: no reach edge
+    assert counts == {"targets": 5, "ecs_lb": 2, "reach": 0, "sg": 4}
     assert data["edges_truncated"] is False
 
 
@@ -126,10 +127,107 @@ def test_edge_type_filter(db_path, snapshot_builder):
         only_sg = queries.visual_data(conn, b.id, VPC, edge_types=("sg",))
         none = queries.visual_data(conn, b.id, VPC, edge_types=())
     assert {e["type"] for e in only_sg["edges"]} == {"sg"}
-    assert [t["selected"] for t in only_sg["edge_types"]] == [False, False, True]
+    assert [t["selected"] for t in only_sg["edge_types"]] == [False, False, False, True]
     # counts stay unfiltered so the UI can show what a hidden group holds
-    assert [t["count"] for t in none["edge_types"]] == [5, 2, 4]
+    assert [t["count"] for t in none["edge_types"]] == [5, 2, 0, 4]
     assert none["edges"] == []
+
+
+# -- endpoint reach -------------------------------------------------------------------
+
+
+def test_reach_edge_from_resource_security_group(db_path, snapshot_builder):
+    b = seed_edge_topology(db_path, snapshot_builder)
+    b.sg_ref("sg-000vpce", "ingress", "sg-000task", "tcp/443")
+    with closing(db_path) as conn:
+        data = queries.visual_data(conn, b.id, VPC)
+    reach = _edges(data, "reach")
+    assert set(reach) == {(TASK_1, VPCE), (TASK_2, VPCE)}
+    edge = reach[(TASK_1, VPCE)]
+    assert edge["label"] == "can reach (SG)"
+    assert edge["title"] == (
+        "example-cluster/example-svc can reach vpce-0example0001: "
+        "sg-000vpce allows tcp/443 from sg-000task on example-cluster/example-svc"
+    )
+    # reach is in addition to the SG reference edges
+    assert (TASK_1, VPCE) in _edges(data, "sg")
+
+
+def test_reach_edge_from_cidr_containing_resource_ip(db_path, snapshot_builder):
+    b = seed_edge_topology(db_path, snapshot_builder)
+    b.sg_cidr("sg-000vpce", "10.0.2.0/24")  # app-b: WEB_2, TASK_2, FN; not ALB_B (10.0.10.10)
+    with closing(db_path) as conn:
+        data = queries.visual_data(conn, b.id, VPC)
+    reach = _edges(data, "reach")
+    assert set(reach) == {(WEB_2, VPCE), (TASK_2, VPCE), (FN, VPCE)}
+    assert reach[(WEB_2, VPCE)]["title"] == (
+        "i-0example0002 can reach vpce-0example0001: "
+        "sg-000vpce allows tcp/443 from 10.0.2.0/24 (10.0.2.10)"
+    )
+
+
+@pytest.mark.parametrize(
+    "protocol, from_port, to_port",
+    [("-1", None, None), ("tcp", 0, 65535), ("tcp", 400, 500)],
+)
+def test_reach_edge_from_wide_cidr_rule(db_path, snapshot_builder, protocol, from_port, to_port):
+    b = seed_edge_topology(db_path, snapshot_builder)
+    b.sg_cidr("sg-000vpce", "10.0.1.10/32", protocol, from_port, to_port)
+    with closing(db_path) as conn:
+        data = queries.visual_data(conn, b.id, VPC)
+    assert set(_edges(data, "reach")) == {(WEB_1, VPCE)}
+
+
+def test_no_reach_edge_for_other_ports(db_path, snapshot_builder):
+    b = seed_edge_topology(db_path, snapshot_builder)
+    b.sg_ref("sg-000vpce", "ingress", "sg-000task", "tcp/22")
+    b.sg_ref("sg-000vpce", "ingress", "sg-0000web", "udp/443")
+    b.sg_cidr("sg-000vpce", "10.0.0.0/16", "tcp", 22)
+    b.sg_cidr("sg-000vpce", "10.0.0.0/16", "tcp", 8443)
+    b.sg_cidr("sg-000vpce", "10.0.0.0/16", "icmp", None)
+    with closing(db_path) as conn:
+        data = queries.visual_data(conn, b.id, VPC)
+    assert _edges(data, "reach") == {}
+    # the SG references themselves are still drawn as sg edges
+    assert (TASK_1, VPCE) in _edges(data, "sg")
+
+
+def test_no_reach_edge_for_cidr_not_containing_resource(db_path, snapshot_builder):
+    b = seed_edge_topology(db_path, snapshot_builder)
+    b.sg_cidr("sg-000vpce", "10.0.99.0/24")
+    with closing(db_path) as conn:
+        data = queries.visual_data(conn, b.id, VPC)
+    assert _edges(data, "reach") == {}
+
+
+def test_reach_edges_are_capped(db_path, snapshot_builder, monkeypatch):
+    monkeypatch.setattr(visual, "MAX_REACH_EDGES", 2)
+    b = seed_edge_topology(db_path, snapshot_builder)
+    b.sg_cidr("sg-000vpce", "10.0.0.0/16")
+    with closing(db_path) as conn:
+        data = queries.visual_data(conn, b.id, VPC)
+    assert len(_edges(data, "reach")) == 2
+    assert data["edges_truncated"] is True
+    truncated = {t["type"]: t["truncated"] for t in data["edge_types"]}
+    assert truncated == {"targets": False, "ecs_lb": False, "reach": True, "sg": False}
+
+
+@pytest.mark.parametrize(
+    "protocol, from_port, to_port, expected",
+    [
+        ("-1", None, None, True),
+        ("all", None, None, True),
+        ("tcp", 443, 443, True),
+        ("6", 443, 443, True),
+        ("tcp", 1, 1024, True),
+        ("tcp", 22, 22, False),
+        ("tcp", 444, 8443, False),
+        ("udp", 443, 443, False),
+        ("icmp", None, None, False),
+    ],
+)
+def test_allows_endpoint_port(protocol, from_port, to_port, expected):
+    assert visual.allows_endpoint_port(protocol, from_port, to_port) is expected
 
 
 def test_edges_into_collapsed_groups_keep_member_ids(db_path, snapshot_builder):
@@ -200,13 +298,22 @@ def test_ellipsize(text, limit, expected):
 @pytest.mark.parametrize(
     "values, expected",
     [
-        (None, ("targets", "ecs_lb", "sg")),
+        (None, ("targets", "ecs_lb", "reach", "sg")),
         ([""], ()),
         (["sg"], ("sg",)),
         (["", "targets", "sg"], ("targets", "sg")),
-        (["sg,targets"], ("targets", "sg")),
+        (["sg,targets,reach"], ("targets", "reach", "sg")),
         (["bogus", "ecs_lb"], ("ecs_lb",)),
     ],
 )
 def test_parse_edge_types(values, expected):
     assert visual.parse_edge_types(values) == expected
+
+
+def test_parse_edge_types_default():
+    assert visual.parse_edge_types(None, visual.DEFAULT_EDGE_TYPES) == (
+        "targets",
+        "ecs_lb",
+        "reach",
+    )
+    assert visual.parse_edge_types(["sg"], visual.DEFAULT_EDGE_TYPES) == ("sg",)

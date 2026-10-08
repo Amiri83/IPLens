@@ -38,7 +38,7 @@ from .db import closing, connect, init_db
 from .export import XLSX_MIMETYPE, ips_to_xlsx
 from .logging_setup import LEVELS, configure_logging, read_log
 from .settings import AUTH_MODES, REGIONS, Settings, SettingsStore
-from .visual import EDGE_TYPE_LABELS, EDGE_TYPES, parse_edge_types
+from .visual import DEFAULT_EDGE_TYPES, EDGE_TYPE_LABELS, EDGE_TYPES, parse_edge_types
 
 log = logging.getLogger(__name__)
 
@@ -346,10 +346,11 @@ def _register(app: Flask) -> None:
 
     # -- visual --------------------------------------------------------------------
 
-    def _edge_types() -> tuple[str, ...]:
-        # Absent means every edge type; the page form always sends an empty
-        # "edges" value so that unticking every box is distinguishable.
-        return parse_edge_types(request.args.getlist("edges") if "edges" in request.args else None)
+    def _edge_types(default: tuple[str, ...] = EDGE_TYPES) -> tuple[str, ...]:
+        # Absent means ``default``; the page form always sends an empty "edges"
+        # value so that unticking every box is distinguishable.
+        values = request.args.getlist("edges") if "edges" in request.args else None
+        return parse_edge_types(values, default)
 
     @app.get("/visual")
     def visual():
@@ -365,7 +366,9 @@ def _register(app: Flask) -> None:
             vpc=vpc,
             edge_types=EDGE_TYPES,
             edge_labels=EDGE_TYPE_LABELS,
-            edges_on=_edge_types(),
+            # The data endpoint still returns every type; the browser filters, so
+            # ticking "SG refs" later needs no refetch.
+            edges_on=_edge_types(DEFAULT_EDGE_TYPES),
         )
 
     @app.get("/visual/data.json")

@@ -4,6 +4,9 @@ Edges are derived from the stored snapshot only:
 
 - ``targets``: load balancer -> registered target (EC2 instance, IP, Lambda, ALB)
 - ``ecs_lb``: ECS service task ENI -> load balancer the service forwards through
+- ``reach``: resource -> VPC endpoint whose security group ingress allows tcp/443
+  (or all traffic) from a security group on the resource or from a CIDR containing
+  one of the resource's private IPs (drawn dashed)
 - ``sg``: a security group rule on one resource that names a security group held
   by another resource (drawn dashed)
 
@@ -14,17 +17,31 @@ ALB with four targets yields four edges rather than eight.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-EDGE_TYPES = ("targets", "ecs_lb", "sg")
-EDGE_TYPE_LABELS = {"targets": "LB→targets", "ecs_lb": "ECS→LB", "sg": "SG refs"}
+EDGE_TYPES = ("targets", "ecs_lb", "reach", "sg")
+EDGE_TYPE_LABELS = {
+    "targets": "LB→targets",
+    "ecs_lb": "ECS→LB",
+    "reach": "Endpoint reach",
+    "sg": "SG refs",
+}
+# Ticked on the Visual page when the URL names no edge types (SG refs are noisy).
+DEFAULT_EDGE_TYPES = ("targets", "ecs_lb", "reach")
 
 # Security groups shared by many ENIs can reference each other N×M times; stop there.
 MAX_SG_EDGES = 400
+# A wide CIDR rule (e.g. the VPC CIDR) lets every resource reach every endpoint.
+MAX_REACH_EDGES = 400
+
+# VPC interface endpoints are reached over HTTPS.
+ENDPOINT_PORT = 443
+REACH_LABEL = "can reach (SG)"
 
 # Maximum characters of a label line before it is cut with an ellipsis.
 LABEL_MAX = {"name": 24, "subnet": 32, "cidr": 40, "edge": 28}
@@ -40,14 +57,16 @@ def ellipsize(text: str | None, limit: int) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def parse_edge_types(values: Iterable[str] | None) -> tuple[str, ...]:
+def parse_edge_types(
+    values: Iterable[str] | None, default: tuple[str, ...] = EDGE_TYPES
+) -> tuple[str, ...]:
     """Edge types selected by an ``edges`` query parameter.
 
-    ``None`` (parameter absent) selects every type. Otherwise values may be repeated
+    ``None`` (parameter absent) selects ``default``. Otherwise values may be repeated
     and/or comma-separated; unknown names are ignored, so ``edges=`` selects none.
     """
     if values is None:
-        return EDGE_TYPES
+        return default
     wanted = {part.strip() for v in values for part in v.split(",")}
     return tuple(t for t in EDGE_TYPES if t in wanted)
 
@@ -61,6 +80,7 @@ class _Node:
     instance_id: str
     sgs: tuple[str, ...]
     name: str
+    ips: tuple[str, ...]
 
     @property
     def resource_key(self) -> tuple[str, str]:
@@ -120,6 +140,7 @@ def _load_nodes(
             instance_id=r["instance_id"] or "",
             sgs=tuple(json.loads(r["security_groups"] or "[]")),
             name=res["name"],
+            ips=tuple(res["ips"]),
         )
     return nodes
 
@@ -257,6 +278,104 @@ def _sg_edges(
     return False
 
 
+def allows_endpoint_port(protocol: str, from_port: int | None, to_port: int | None) -> bool:
+    """True if a rule for ``protocol`` and the port range admits tcp/ENDPOINT_PORT."""
+    proto = str(protocol).lower()
+    if proto in ("-1", "all"):
+        return True
+    if proto not in ("tcp", "6"):
+        return False
+    if from_port is None:
+        return True
+    return from_port <= ENDPOINT_PORT <= (from_port if to_port is None else to_port)
+
+
+def _ports_allow_endpoint(ports: str) -> bool:
+    """:func:`allows_endpoint_port` for an ``sg_refs.ports`` string ("tcp/400-500", "all")."""
+    proto, _, span = ports.partition("/")
+    if not span:
+        return allows_endpoint_port(proto, None, None)
+    lo, _, hi = span.partition("-")
+    return allows_endpoint_port(proto, int(lo), int(hi or lo))
+
+
+def _rule_ports(protocol: str, from_port: int | None, to_port: int | None) -> str:
+    if protocol in ("-1", "all"):
+        return "all"
+    if from_port is None:
+        return protocol
+    if from_port == to_port:
+        return f"{protocol}/{from_port}"
+    return f"{protocol}/{from_port}-{to_port}"
+
+
+def _reach_edges(
+    conn: sqlite3.Connection, snap_id: int, nodes: dict[str, _Node], edges: _EdgeSet
+) -> bool:
+    """Add resource -> VPC endpoint reach edges; True if MAX_REACH_EDGES cut the list short."""
+    endpoints: dict[tuple[str, str], list[_Node]] = {}
+    for n in nodes.values():
+        if n.owner_type == "vpc_endpoint":
+            endpoints.setdefault(n.resource_key, []).append(n)
+    if not endpoints:
+        return False
+
+    # Ingress rules admitting tcp/443, keyed by the security group that holds them.
+    from_sg: dict[str, list[tuple[str, str]]] = {}  # group -> [(source group, ports)]
+    for r in conn.execute(
+        "SELECT group_id, ref_group_id, ports FROM sg_refs "
+        "WHERE snapshot_id=? AND direction='ingress' ORDER BY group_id, ref_group_id, ports",
+        (snap_id,),
+    ):
+        if _ports_allow_endpoint(r["ports"]):
+            from_sg.setdefault(r["group_id"], []).append((r["ref_group_id"], r["ports"]))
+    from_cidr: dict[str, list[tuple[Any, str]]] = {}  # group -> [(network, ports)]
+    for r in conn.execute(
+        "SELECT group_id, cidr, ip_protocol, from_port, to_port FROM sg_cidr_rules "
+        "WHERE snapshot_id=? ORDER BY group_id, cidr, ip_protocol, from_port, to_port",
+        (snap_id,),
+    ):
+        if not allows_endpoint_port(r["ip_protocol"], r["from_port"], r["to_port"]):
+            continue
+        try:
+            net = ipaddress.ip_network(r["cidr"], strict=False)
+        except ValueError:
+            continue
+        ports = _rule_ports(r["ip_protocol"], r["from_port"], r["to_port"])
+        from_cidr.setdefault(r["group_id"], []).append((net, ports))
+
+    sources = [n for n in nodes.values() if n.owner_type != "vpc_endpoint"]
+    addrs = {n.eni_id: [ipaddress.ip_address(ip) for ip in n.ips] for n in sources}
+    added = 0
+    for enis in endpoints.values():
+        ep_sgs = sorted({sg for e in enis for sg in e.sgs})
+        sg_rules = [(sg, src, ports) for sg in ep_sgs for src, ports in from_sg.get(sg, [])]
+        cidr_rules = [(sg, net, ports) for sg in ep_sgs for net, ports in from_cidr.get(sg, [])]
+        if not sg_rules and not cidr_rules:
+            continue
+        for a in sources:
+            reasons = [
+                f"{sg} allows {ports} from {src} on {a.name}"
+                for sg, src, ports in sg_rules
+                if src in a.sgs
+            ]
+            reasons += [
+                f"{sg} allows {ports} from {net} ({ip})"
+                for sg, net, ports in cidr_rules
+                for ip in addrs[a.eni_id]
+                if ip in net
+            ]
+            if not reasons:
+                continue
+            if added >= MAX_REACH_EDGES:
+                return True
+            b = _nearest(enis, a.az)
+            for reason in reasons:
+                edges.add("reach", a, b, REACH_LABEL, f"{a.name} can reach {b.name}: {reason}")
+            added += 1
+    return False
+
+
 def visual_edges(
     conn: sqlite3.Connection,
     snap_id: int,
@@ -269,7 +388,8 @@ def visual_edges(
 
     ``resources`` maps ENI id -> resource node (as built for the Visual page) and
     ``by_ip`` maps private IP -> ENI id. Returns ``edges`` (only ``edge_types``),
-    per-type ``edge_types`` metadata with unfiltered counts, and ``edges_truncated``.
+    per-type ``edge_types`` metadata with unfiltered counts and a ``truncated`` flag,
+    and ``edges_truncated`` (true if any type was truncated).
     """
     nodes = _load_nodes(conn, snap_id, vpc_id, resources)
     lb_enis: dict[str, list[_Node]] = {}
@@ -280,7 +400,10 @@ def visual_edges(
     edges = _EdgeSet()
     _lb_edges(conn, snap_id, nodes, by_ip, lb_enis, edges)
     _ecs_edges(conn, snap_id, nodes, lb_enis, edges)
-    truncated = _sg_edges(conn, snap_id, nodes, edges)
+    truncated = {
+        "reach": _reach_edges(conn, snap_id, nodes, edges),
+        "sg": _sg_edges(conn, snap_id, nodes, edges),
+    }
 
     selected = set(edge_types)
     return {
@@ -291,8 +414,9 @@ def visual_edges(
                 "label": EDGE_TYPE_LABELS[t],
                 "count": edges.count(t),
                 "selected": t in selected,
+                "truncated": truncated.get(t, False),
             }
             for t in EDGE_TYPES
         ],
-        "edges_truncated": truncated,
+        "edges_truncated": any(truncated.values()),
     }
