@@ -28,6 +28,7 @@ from markupsafe import Markup
 
 from . import diagram, queries, viewstate
 from . import rules as rules_mod
+from . import scope as scope_mod
 from . import suggestions as sugg_mod
 from .accounts import (
     AUTH_MODE_LABELS,
@@ -57,6 +58,7 @@ GatewayFactory = Callable[[Account], AwsGateway]
 # Typed on the Discovery page to confirm deleting snapshots.
 DELETE_CONFIRMATION = "DELETE"
 HISTORY_ROWS = 50
+OUT_OF_SCOPE = "This resource is outside the active scope."
 # DNS-rebinding protection: only these Host header names are served.
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 
@@ -82,6 +84,17 @@ def account_label(account_id: str | None, alias: str | None, display_name: str =
     if name and account_id:
         return f"{name} ({account_id})"
     return name or account_id or "unknown account"
+
+
+def snapshot_label(snap: Any) -> str:
+    """Label from the snapshot's own frozen name / AWS account id / alias.
+
+    Never the account record's current name: a renamed or re-pointed account must
+    not relabel what was captured earlier.
+    """
+    keys = snap.keys() if hasattr(snap, "keys") else snap
+    name = snap["account_name"] if "account_name" in keys else ""
+    return account_label(snap["account_id"], snap["account_alias"], name or "")
 
 
 def utc_iso(value: Any) -> str | None:
@@ -221,12 +234,36 @@ def _snapshot_or_none():
     return queries.latest_snapshot(_db(), ref) if ref is not None else None
 
 
+def _scope_config() -> scope_mod.Scope:
+    """The active account's saved scope."""
+    if "scope_config" not in g:
+        g.scope_config = scope_mod.load(_db(), _active_ref())
+    return g.scope_config
+
+
+def _scope() -> scope_mod.ResolvedScope:
+    """The active account's scope applied to its latest snapshot."""
+    if "scope" not in g:
+        snap = _snapshot_or_none()
+        g.scope = (
+            scope_mod.resolve(_db(), snap["id"], _scope_config()) if snap else scope_mod.UNSCOPED
+        )
+    return g.scope
+
+
+def _in_scope_or_404(subnet_id: str | None) -> None:
+    if not _scope().subnet_ok(subnet_id):
+        abort(404, OUT_OF_SCOPE)
+
+
 def account_choice_label(acct: Account, snap: Any = None) -> str:
     """Selector label: the display name, else the alias / AWS account id seen last."""
     if acct.display_name:
         return acct.display_name
     if snap is not None and (snap["account_alias"] or snap["account_id"]):
         return account_label(snap["account_id"], snap["account_alias"])
+    if acct.aws_account_id:
+        return acct.aws_account_id
     return f"Account {acct.id}"
 
 
@@ -255,6 +292,16 @@ def _credential_flash(prefix: str, message: str, account_id: int) -> None:
     flash(
         Markup('{0}: {1} — <a href="{2}">edit account</a>').format(prefix, message, edit),
         "error",
+    )
+
+
+def _identity_flash(message: str, account_id: int) -> None:
+    edit = url_for("account_edit", account_id=account_id)
+    flash(
+        Markup('Warning: {0} — check the <a href="{1}">account settings</a>.').format(
+            message, edit
+        ),
+        "warn",
     )
 
 
@@ -288,21 +335,18 @@ def _register(app: Flask) -> None:
 
     @app.context_processor
     def _globals() -> dict[str, Any]:
-        names = {c["id"]: c["account"]["display_name"] for c in _account_choices()}
         active = _active()
-
-        def snap_label(snap: Any) -> str:
-            return account_label(
-                snap["account_id"], snap["account_alias"], names.get(snap["account_ref"], "")
-            )
-
+        choice = next((c for c in _account_choices() if active and c["id"] == active.id), None)
         return {
             "csrf_token": session.get("csrf", ""),
             "owner_labels": OWNER_LABELS,
             "active_account": active.public_dict() if active else None,
+            # The record's current label: only for "No data yet for <name>" and selectors.
+            "active_label": choice["label"] if choice else "",
             "account_choices": _account_choices(),
             "header_snap": _snapshot_or_none(),
-            "account_label": snap_label,
+            "account_label": snapshot_label,
+            "scope_count": _scope_config().count if active else 0,
         }
 
     @app.template_filter("pct")
@@ -318,8 +362,8 @@ def _register(app: Flask) -> None:
         snap = _snapshot_or_none()
         tree, owners = [], {}
         if snap:
-            tree = queries.vpc_tree(_db(), snap["id"])
-            owners = queries.owner_breakdown(_db(), snap["id"])
+            tree = queries.vpc_tree(_db(), snap["id"], _scope())
+            owners = queries.owner_breakdown(_db(), snap["id"], _scope())
         ref = _active_ref()
         history = queries.recent_snapshots(_db(), HISTORY_ROWS, ref) if ref is not None else []
         return render_template(
@@ -334,6 +378,14 @@ def _register(app: Flask) -> None:
 
     @app.post("/refresh")
     def refresh():
+        raw = request.form.get("account_id", "")
+        if raw:
+            # Discovery's account dropdown: collect that account and switch the views to it.
+            chosen = _accounts().get(int(raw)) if raw.isdigit() else None
+            if chosen is None:
+                abort(400, "unknown account")
+            _store().set_active_account_id(chosen.id)
+            g.pop("active_account", None)
         active = _active()
         if active is None:
             flash("Add an AWS account in Settings first.", "error")
@@ -341,7 +393,7 @@ def _register(app: Flask) -> None:
         try:
             account = _accounts().get(active.id, with_secret=True)
             gw = _ext()["gateway_factory"](account)
-            result = Collector(gw, _paths().db_path, account.id).run()
+            result = Collector(gw, _paths().db_path, account.id, account.display_name).run()
             with closing(_paths().db_path) as conn:
                 queries.prune_snapshots(conn)
         except Exception as exc:
@@ -360,6 +412,10 @@ def _register(app: Flask) -> None:
             f"{result.enis} ENIs, {result.ips} IPs"
         )
         flash(msg, "ok")
+        mismatch = _accounts().record_identity(account.id, result.account_id)
+        if mismatch:
+            log.warning("refresh of account=%s: %s", account.id, mismatch)
+            _identity_flash(mismatch, account.id)
         for w in result.warnings:
             flash(w, "warn")
         return redirect(url_for("overview"))
@@ -415,6 +471,7 @@ def _register(app: Flask) -> None:
         st = queries.get_subnet(_db(), snap["id"], subnet_id)
         if st is None:
             abort(404)
+        _in_scope_or_404(subnet_id)
         page = request.args.get("page", 0, type=int)
         grid = queries.subnet_grid(_db(), snap["id"], st, page)
         enis = queries.subnet_enis(_db(), snap["id"], subnet_id)
@@ -428,6 +485,7 @@ def _register(app: Flask) -> None:
         detail = queries.eni_detail(_db(), snap["id"], eni_id)
         if detail is None:
             abort(404)
+        _in_scope_or_404(detail["subnet_id"])
         return render_template("eni.html", snap=snap, e=detail)
 
     def _ip_filter() -> queries.IpFilter:
@@ -448,8 +506,8 @@ def _register(app: Flask) -> None:
         flt = _ip_filter()
         rows, tree = [], []
         if snap:
-            rows = queries.ip_list(_db(), snap["id"], flt)
-            tree = queries.vpc_tree(_db(), snap["id"])
+            rows = queries.ip_list(_db(), snap["id"], flt, _scope())
+            tree = queries.vpc_tree(_db(), snap["id"], _scope())
         return render_template(
             "ips.html",
             snap=snap,
@@ -464,7 +522,7 @@ def _register(app: Flask) -> None:
     def ips_export():
         snap = _snapshot_or_none()
         flt = _ip_filter()
-        rows = queries.ip_list(_db(), snap["id"], flt) if snap else []
+        rows = queries.ip_list(_db(), snap["id"], flt, _scope()) if snap else []
         body = ips_to_xlsx(rows, OWNER_LABELS)
         log.info("exported %d IP row(s) to xlsx", len(rows))
         name = f"iplens-ips-snapshot-{snap['id']}.xlsx" if snap else "iplens-ips.xlsx"
@@ -485,7 +543,7 @@ def _register(app: Flask) -> None:
     @app.get("/visual")
     def visual():
         snap = _snapshot_or_none()
-        tree = queries.vpc_tree(_db(), snap["id"]) if snap else []
+        tree = queries.vpc_tree(_db(), snap["id"], _scope()) if snap else []
         vpc = request.args.get("vpc", "")
         if tree and vpc not in {v.vpc_id for v in tree}:
             vpc = tree[0].vpc_id
@@ -585,7 +643,12 @@ def _register(app: Flask) -> None:
         if not snap:
             return jsonify({"snapshot_id": None, "vpcs": [], "vpc": None})
         data = queries.visual_data(
-            _db(), snap["id"], request.args.get("vpc", "").strip(), OWNER_LABELS, _edge_types()
+            _db(),
+            snap["id"],
+            request.args.get("vpc", "").strip(),
+            OWNER_LABELS,
+            _edge_types(),
+            _scope(),
         )
         if data is None:
             abort(404)
@@ -595,10 +658,37 @@ def _register(app: Flask) -> None:
 
     def _context():
         snap = _snapshot_or_none()
-        return (sugg_mod.build_context(_db(), snap["id"]) if snap else None), snap
+        return (sugg_mod.build_context(_db(), snap["id"], _scope()) if snap else None), snap
 
     def _account_names() -> dict[int, str]:
         return {c["id"]: c["label"] for c in _account_choices()}
+
+    def _rule_options() -> dict[str, Any]:
+        """Choices for the rule form from the active account's latest snapshot (unscoped:
+        rules are shared, so every subnet / VPC / load balancer can be picked)."""
+        snap = _snapshot_or_none()
+        if not snap:
+            return {"tree": [], "lbs": [], "ecs": [], "names": {}}
+        tree = queries.vpc_tree(_db(), snap["id"])
+        lbs = [
+            dict(r)
+            for r in _db().execute(
+                "SELECT name, lb_type, scheme, vpc_id FROM load_balancers WHERE snapshot_id=? "
+                "ORDER BY name",
+                (snap["id"],),
+            )
+        ]
+        ecs = [
+            f"{r['cluster']}/{r['service']}"
+            for r in _db().execute(
+                "SELECT cluster, service FROM ecs_services WHERE snapshot_id=? "
+                "ORDER BY cluster, service",
+                (snap["id"],),
+            )
+        ]
+        names = {v.vpc_id: v.name for v in tree if v.name}
+        names.update({s.subnet_id: s.name for v in tree for s in v.subnets if s.name})
+        return {"tree": tree, "lbs": lbs, "ecs": ecs, "names": names}
 
     @app.get("/rules")
     def rules_list():
@@ -613,6 +703,7 @@ def _register(app: Flask) -> None:
             kinds=rules_mod.RULE_KINDS,
             account_names=_account_names(),
             active_ref=ref,
+            names=_rule_options()["names"],
         )
 
     def _rule_from_form(rule_id: int | None) -> rules_mod.Rule:
@@ -624,9 +715,12 @@ def _register(app: Flask) -> None:
             enabled=f.get("enabled") == "on",
             description=f.get("description", ""),
             account_ref=int(f["account_ref"]) if f.get("account_ref", "").isdigit() else None,
+            # Multi-selects send repeated values; a typed list (comma/space) also works.
             params={
                 "percent": f.get("percent", ""),
-                "subnet_ids": f.get("subnet_ids", ""),
+                "subnet_ids": f.getlist("subnet_ids"),
+                "vpc_ids": f.getlist("vpc_ids"),
+                "lb_names": f.getlist("lb_names"),
                 "scope": f.get("scope", ""),
                 "pattern": f.get("pattern", ""),
                 "mode": f.get("mode", ""),
@@ -640,7 +734,9 @@ def _register(app: Flask) -> None:
             kinds=rules_mod.RULE_KINDS,
             scopes=rules_mod.INTERNAL_SCOPES,
             ecs_modes=rules_mod.ECS_MODES,
+            scope_labels=rules_mod.INTERNAL_SCOPE_LABELS,
             account_names=_account_names(),
+            options=_rule_options(),
         ), status
 
     @app.route("/rules/new", methods=["GET", "POST"])
@@ -725,6 +821,57 @@ def _register(app: Flask) -> None:
         return render_template(
             "suggestions.html", snap=snap, items=items, totals=sugg_mod.totals(items)
         )
+
+    # -- scope -------------------------------------------------------------------
+
+    @app.get("/scope")
+    def scope_page():
+        snap = _snapshot_or_none()
+        cfg = _scope_config()
+        tree = queries.vpc_tree(_db(), snap["id"]) if snap else []
+        scoped = queries.vpc_tree(_db(), snap["id"], _scope()) if snap else []
+        return render_template(
+            "scope.html",
+            snap=snap,
+            cfg=cfg,
+            tree=tree,
+            in_scope={"vpcs": len(scoped), "subnets": sum(len(v.subnets) for v in scoped)},
+            totals={"vpcs": len(tree), "subnets": sum(len(v.subnets) for v in tree)},
+            modes=scope_mod.MODES,
+        )
+
+    @app.post("/scope")
+    def scope_save():
+        ref = _active_or_400()
+        f = request.form
+        doc = {
+            "vpc_mode": f.get("vpc_mode", ""),
+            "vpcs": f.getlist("vpcs"),
+            "subnet_mode": f.get("subnet_mode", ""),
+            "subnets": f.getlist("subnets"),
+            "subnet_patterns": f.get("subnet_patterns", ""),
+            "cidr_mode": f.get("cidr_mode", ""),
+            "cidrs": f.get("cidrs", ""),
+        }
+        try:
+            cfg = scope_mod.validate(doc)
+        except ValueError as exc:
+            flash(f"Scope not saved: {exc}", "error")
+            return redirect(url_for("scope_page"))
+        with closing(_paths().db_path) as conn:
+            scope_mod.save(conn, ref, cfg)
+        log.info("scope saved (account=%s): %d filter(s)", ref, cfg.count)
+        flash(f"Scope saved: {cfg.count} filter(s)" if cfg.count else "Scope cleared", "ok")
+        return redirect(url_for("scope_page"))
+
+    @app.post("/scope/clear")
+    def scope_clear():
+        ref = _active_or_400()
+        with closing(_paths().db_path) as conn:
+            scope_mod.clear(conn, ref)
+        log.info("scope cleared (account=%s)", ref)
+        flash("Scope cleared: every VPC, subnet and IP is shown.", "ok")
+        return redirect(_safe_next(request.form.get("next")))
 
     # -- logs --------------------------------------------------------------------
 
@@ -863,10 +1010,16 @@ def _register(app: Flask) -> None:
             _credential_flash(prefix, msg, account_id)
         else:
             flash(result.message, "ok" if result.ok else "error")
+        mismatch = _accounts().record_identity(account_id, result.account_id)
+        if mismatch:
+            log.warning("connection test of account=%s: %s", account_id, mismatch)
+            _identity_flash(mismatch, account_id)
         return redirect(url_for("settings_page"))
 
     @app.errorhandler(404)
-    def _not_found(_e):
+    def _not_found(e):
+        if getattr(e, "description", "") == OUT_OF_SCOPE:
+            return render_template("error.html", message=OUT_OF_SCOPE, out_of_scope=True), 404
         return render_template("error.html", message="Not found"), 404
 
     @app.errorhandler(400)

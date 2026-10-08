@@ -143,3 +143,21 @@ table.history td:first-child { width: 4.5rem; }
 .log-ERROR td, .log-CRITICAL td { background: #fdf0ee; }
 .log-WARNING td { background: #fdf8ec; }
 pre.logmsg { margin: 0; white-space: pre-wrap; word-break: break-word; }
+
+/* Scope indicator in the header (--nav-warn on --nav-bg, as .ctx-warn). */
+header .scope-indicator { align-self: center; display: flex; gap: .3rem; align-items: center;
+                          font-size: 12px; white-space: nowrap; }
+header .scope-indicator a { color: var(--nav-warn); font-weight: 700; }
+header .scope-indicator button { padding: .1rem .45rem; font-size: 12px; }
+.refresh-form { gap: .5rem; align-items: center; }
+.refresh-form select { max-width: 320px; }
+.no-data button { margin: 0 .4rem; }
+.identity-warning { display: inline-block; margin-top: .25rem; white-space: normal; }
+ul.owner-list { margin: .3rem 0 0; padding-left: 1.2rem; }
+.scope-form fieldset { border: 1px solid var(--line); border-radius: 5px; margin: 0 0 .8rem;
+                       padding: .5rem .8rem .8rem; }
+.scope-form select[multiple] { min-width: 420px; max-width: 100%; }
+.scope-summary ul { margin: .4rem 0; }
+.rule-summary { color: var(--fg); }
+details.advanced > summary { cursor: pointer; font-weight: 600; margin: 1rem 0 .5rem; }
+.rule-form select[multiple] { min-width: 420px; max-width: 100%; }

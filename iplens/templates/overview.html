@@ -1,21 +1,25 @@
 {% extends "base.html" %}
-{% from "_macros.html" import usage_bar, legend %}
+{% from "_macros.html" import usage_bar, legend, no_data with context %}
 {% block title %}Discovery{% endblock %}
 {% block content %}
 <div class="row" style="justify-content: space-between">
   <h1>Discovery</h1>
-  <form method="post" action="{{ url_for('refresh') }}">
+  {% if account_choices %}
+  <form method="post" action="{{ url_for('refresh') }}" class="row refresh-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="refresh-account">Account</label>
+    <select id="refresh-account" name="account_id">
+      {% for c in account_choices %}
+        <option value="{{ c.id }}" {{ 'selected' if active_account and c.id == active_account.id }}>{{ c.label }} · {{ c.account.region }}</option>
+      {% endfor %}
+    </select>
     <button type="submit">Refresh from AWS</button>
   </form>
+  {% endif %}
 </div>
 
 {% if not snap %}
-  <div class="card">
-    No snapshot yet{% if active_account %} for this account{% endif %}. Configure accounts in
-    <a href="{{ url_for('settings_page') }}">Settings</a>, then press <b>Refresh from AWS</b>.
-    All AWS calls are read-only.
-  </div>
+  {{ no_data() }}
 {% else %}
   <div class="card" title="Snapshot #{{ snap.id }}">
     <b>{{ account_label(snap) }}</b> ·

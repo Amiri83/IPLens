@@ -74,7 +74,9 @@ def test_pages_render_without_snapshot(client):
     for url in ("/", "/ips", "/suggestions", "/rules", "/logs", "/settings", "/rules/new"):
         resp = client.get(url)
         assert resp.status_code == 200, url
-    assert b"No snapshot yet" in client.get("/").data
+    page = client.get("/").data.decode()
+    assert "No data yet for <b>Account 1</b>" in page
+    assert "viewing <b>Account 1</b> · no data yet" in page
 
 
 def test_post_requires_csrf(client):
@@ -236,7 +238,10 @@ def test_ecs_scale_down_rule_via_form(app, client):
     assert rule.params == {"mode": "allow", "pattern": "^sandbox/"}
     page = client.get(f"/rules/{rule.id}/edit").data.decode()
     assert '<option value="allow" selected>' in page
-    assert "allow: ^sandbox/" in client.get("/rules").data.decode()
+    assert (
+        "Only ECS services matching “^sandbox/” may be scaled down or deleted"
+        in client.get("/rules").data.decode()
+    )
 
 
 def test_rules_crud_and_yaml(app, client, seeded):
@@ -489,24 +494,28 @@ def test_header_shows_account_id_only_without_alias(app, client, snapshot_builde
         assert "(123456789012)" not in page
 
 
-def test_header_shows_alias_and_display_name_override_wins(app, client, snapshot_builder):
+def test_header_label_is_frozen_on_the_snapshot(app, client, snapshot_builder):
     snapshot_builder(_db(app), account_alias="example-alias")
     page = client.get("/rules").data.decode()
     assert "<b>example-alias (123456789012)</b> · us-east-1" in page
 
+    # renaming the account record never relabels what was already captured
     _post(
         client,
         "/accounts/1/edit",
         {"auth_mode": "env", "region": "us-east-1", "display_name": "Example Prod"},
     )
     page = client.get("/").data.decode()
-    assert "<b>Example Prod (123456789012)</b> · us-east-1" in page
-    assert "example-alias" not in page
+    assert "viewing <b>example-alias (123456789012)</b> · us-east-1" in page
     assert 'value="Example Prod"' in client.get("/accounts/1/edit").data.decode()
 
-    # clearing the override falls back to the alias again
-    _post(client, "/accounts/1/edit", {"auth_mode": "env", "region": "us-east-1"})
-    assert "<b>example-alias (123456789012)</b>" in client.get("/").data.decode()
+    # the next capture freezes the new display name, which beats the alias
+    snapshot_builder(_db(app), account_alias="example-alias")
+    page = client.get("/").data.decode()
+    assert "viewing <b>Example Prod (123456789012)</b> · us-east-1" in page
+    history = page.split("Recent snapshots", 1)[1]
+    assert "<td>Example Prod (123456789012)</td>" in history
+    assert "<td>example-alias (123456789012)</td>" in history
 
 
 def test_recent_snapshots_table_shows_account_not_snapshot_id(app, client, snapshot_builder):

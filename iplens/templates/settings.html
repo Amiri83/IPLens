@@ -17,7 +17,9 @@
     {% set a = c.account %}
     <tr>
       <td><b>{{ c.label }}</b>
-        {% if active_account and a.id == active_account.id %}<span class="badge ok">active</span>{% endif %}</td>
+        {% if active_account and a.id == active_account.id %}<span class="badge ok">active</span>{% endif %}
+        {% if a.aws_account_id %}<div class="muted mono small" title="AWS account id of the first successful connect">AWS {{ a.aws_account_id }}</div>{% endif %}
+        {% if a.identity_warning %}<div class="badge warn identity-warning">Warning: {{ a.identity_warning }}</div>{% endif %}</td>
       <td class="mono">{{ a.region }}</td>
       <td>{{ a.mode_label }}{% if a.auth_mode == 'profile' %} <span class="mono">{{ a.profile }}</span>{% endif %}</td>
       <td>

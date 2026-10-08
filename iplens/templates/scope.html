@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% from "_macros.html" import no_data with context %}
+{% block title %}Scope{% endblock %}
+{% block content %}
+<h1>Scope</h1>
+<p class="muted">The scope limits Discovery, the IP list, Visual, rules, suggestions and every
+  export to the VPCs, subnets and IP ranges chosen here. It is saved for this account only.</p>
+{% if not snap %}
+  {{ no_data() }}
+{% endif %}
+
+{% if cfg.count %}
+<div class="card scope-summary">
+  <b>Active scope: {{ cfg.count }} filter{{ '' if cfg.count == 1 else 's' }}</b>
+  {% if snap %}<span class="muted">· {{ in_scope.vpcs }} of {{ totals.vpcs }} VPCs and {{ in_scope.subnets }} of {{ totals.subnets }} subnets in scope</span>{% endif %}
+  <ul>{% for line in cfg.summary() %}<li>{{ line }}</li>{% endfor %}</ul>
+  <form class="inline" method="post" action="{{ url_for('scope_clear') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="next" value="{{ url_for('scope_page') }}">
+    <button type="submit" class="secondary">Clear scope</button>
+  </form>
+</div>
+{% else %}
+<div class="card muted">No scope: every VPC, subnet and IP of the snapshot is shown.</div>
+{% endif %}
+
+{% set vpc_ids = tree | map(attribute='vpc_id') | list %}
+{% set subnet_ids = [] %}{% for v in tree %}{% for s in v.subnets %}{% set _ = subnet_ids.append(s.subnet_id) %}{% endfor %}{% endfor %}
+<form class="card scope-form" method="post" action="{{ url_for('scope_save') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <fieldset>
+    <legend>VPCs</legend>
+    <label for="vpc_mode">Mode</label>
+    <select id="vpc_mode" name="vpc_mode">
+      {% for m in modes %}<option value="{{ m }}" {{ 'selected' if cfg.vpc_mode == m }}>{{ 'only these VPCs' if m == 'include' else 'all except these VPCs' }}</option>{% endfor %}
+    </select>
+    <label for="vpcs">VPCs from the latest snapshot (Ctrl/Cmd-click for several)</label>
+    <select id="vpcs" name="vpcs" multiple size="{{ [[vpc_ids | length + 1, 3] | max, 10] | min }}">
+      {% for v in tree %}<option value="{{ v.vpc_id }}" {{ 'selected' if v.vpc_id in cfg.vpcs }}>{{ v.vpc_id }}{% if v.name %} · {{ v.name }}{% endif %} ({{ v.cidrs | join(', ') }})</option>{% endfor %}
+      {% for id in cfg.vpcs if id not in vpc_ids %}<option value="{{ id }}" selected>{{ id }} (not in the latest snapshot)</option>{% endfor %}
+    </select>
+  </fieldset>
+
+  <fieldset>
+    <legend>Subnets</legend>
+    <label for="subnet_mode">Mode</label>
+    <select id="subnet_mode" name="subnet_mode">
+      {% for m in modes %}<option value="{{ m }}" {{ 'selected' if cfg.subnet_mode == m }}>{{ 'only matching subnets' if m == 'include' else 'all except matching subnets' }}</option>{% endfor %}
+    </select>
+    <label for="subnets">Subnets from the latest snapshot</label>
+    <select id="subnets" name="subnets" multiple size="{{ [[subnet_ids | length + 1, 3] | max, 12] | min }}">
+      {% for v in tree %}
+        <optgroup label="{{ v.vpc_id }}{% if v.name %} · {{ v.name }}{% endif %}">
+        {% for s in v.subnets %}<option value="{{ s.subnet_id }}" {{ 'selected' if s.subnet_id in cfg.subnets }}>{{ s.subnet_id }}{% if s.name %} · {{ s.name }}{% endif %} ({{ s.cidr }}, {{ s.az }})</option>{% endfor %}
+        </optgroup>
+      {% endfor %}
+      {% for id in cfg.subnets if id not in subnet_ids %}<option value="{{ id }}" selected>{{ id }} (not in the latest snapshot)</option>{% endfor %}
+    </select>
+    <label for="subnet_patterns">…and/or subnet Name wildcards, one per line (<span class="mono">*</span> any text, <span class="mono">?</span> one character; case-insensitive)</label>
+    <textarea id="subnet_patterns" name="subnet_patterns" rows="3" cols="40" class="mono" placeholder="example-private-*">{{ cfg.subnet_patterns | join('\n') }}</textarea>
+  </fieldset>
+
+  <fieldset>
+    <legend>IP ranges</legend>
+    <label for="cidr_mode">Mode</label>
+    <select id="cidr_mode" name="cidr_mode">
+      {% for m in modes %}<option value="{{ m }}" {{ 'selected' if cfg.cidr_mode == m }}>{{ 'only addresses in these ranges' if m == 'include' else 'all except addresses in these ranges' }}</option>{% endfor %}
+    </select>
+    <label for="cidrs">IPv4 CIDRs, one per line</label>
+    <textarea id="cidrs" name="cidrs" rows="3" cols="40" class="mono" placeholder="10.0.0.0/16">{{ cfg.cidrs | join('\n') }}</textarea>
+  </fieldset>
+
+  <p><button type="submit">Save scope</button>
+    <span class="muted">Leave everything empty for no scope.</span></p>
+</form>
+{% endblock %}

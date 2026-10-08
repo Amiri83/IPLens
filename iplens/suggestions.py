@@ -11,6 +11,7 @@ from typing import Any
 
 from .queries import SubnetStats, VpcNode, subnet_stats, vpc_tree
 from .rules import Rule
+from .scope import UNSCOPED, ResolvedScope
 
 # Services that support (free, IP-less) gateway endpoints.
 GATEWAY_CAPABLE = (".s3", ".dynamodb")
@@ -50,6 +51,8 @@ class Context:
     ecs_services: list[dict[str, Any]] = field(default_factory=list)
     ecs_task_enis: list[dict[str, Any]] = field(default_factory=list)
     taken_at: datetime | None = None
+    # Every subnet of the snapshot, in scope or not (rules tell "absent" from "out of scope").
+    all_subnet_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -76,19 +79,35 @@ class Suggestion:
         return KIND_LABELS.get(self.kind, self.kind)
 
 
-def build_context(conn: sqlite3.Connection, snap_id: int) -> Context:
+def build_context(
+    conn: sqlite3.Connection, snap_id: int, scope: ResolvedScope = UNSCOPED
+) -> Context:
+    """Everything suggestions and rules look at, limited to ``scope``.
+
+    Out of scope: ENIs in other subnets (or, with IP ranges, without an address in
+    range), Lambda functions without a subnet in scope (and every non-VPC function
+    once a scope is set), endpoints / load balancers / ECS services without anything
+    left in scope. IP counts only count in-scope addresses.
+    """
     enis = {}
     for r in conn.execute("SELECT * FROM enis WHERE snapshot_id=?", (snap_id,)):
         d = dict(r)
+        if not (scope.vpc_ok(d["vpc_id"]) and scope.subnet_ok(d["subnet_id"])):
+            continue
         d["security_groups"] = json.loads(d.get("security_groups") or "[]")
         enis[d["eni_id"]] = d
+    where, args = scope.sql("i")
+    cond = "".join(f" AND {w}" for w in where)
     counts = {
         r["eni_id"]: r["n"]
         for r in conn.execute(
-            "SELECT eni_id, COUNT(*) AS n FROM ips WHERE snapshot_id=? GROUP BY eni_id",
-            (snap_id,),
+            "SELECT i.eni_id, COUNT(*) AS n FROM ips i "  # noqa: S608 - fixed SQL fragments
+            f"WHERE i.snapshot_id=?{cond} GROUP BY i.eni_id",
+            (snap_id, *args),
         )
     }
+    if scope.ip_include or scope.ip_exclude:
+        enis = {k: v for k, v in enis.items() if counts.get(k)}
 
     def rows(table: str, *json_cols: str) -> list[dict[str, Any]]:
         out = []
@@ -102,17 +121,35 @@ def build_context(conn: sqlite3.Connection, snap_id: int) -> Context:
             out.append(d)
         return out
 
+    lambdas = rows("lambdas", "subnet_ids", "security_groups")
+    endpoints = rows("endpoints", "subnet_ids", "eni_ids")
+    load_balancers = rows("load_balancers")
+    ecs_services = rows("ecs_services")
+    ecs_task_enis = rows("ecs_task_enis")
+    if scope.active:
+        lambdas = [f for f in lambdas if any(scope.subnet_ok(s) for s in f["subnet_ids"])]
+        for ep in endpoints:
+            ep["subnet_ids"] = [s for s in ep["subnet_ids"] if scope.subnet_ok(s)]
+            ep["eni_ids"] = [e for e in ep["eni_ids"] if e in enis]
+        endpoints = [ep for ep in endpoints if ep["eni_ids"] or ep["subnet_ids"]]
+        load_balancers = [lb for lb in load_balancers if scope.vpc_ok(lb["vpc_id"])]
+        ecs_task_enis = [m for m in ecs_task_enis if m["eni_id"] in enis]
+        live = {(m["cluster"], m["service"]) for m in ecs_task_enis}
+        ecs_services = [s for s in ecs_services if (s["cluster"], s["service"]) in live]
+
     snap = conn.execute("SELECT taken_at FROM snapshots WHERE id=?", (snap_id,)).fetchone()
+    stats = subnet_stats(conn, snap_id)
     return Context(
-        subnets={s.subnet_id: s for s in subnet_stats(conn, snap_id)},
+        subnets={s.subnet_id: s for s in stats if scope.subnet_ok(s.subnet_id)},
+        all_subnet_ids={s.subnet_id for s in stats},
         enis=enis,
         eni_ip_count=counts,
-        vpcs=vpc_tree(conn, snap_id),
-        lambdas=rows("lambdas", "subnet_ids", "security_groups"),
-        endpoints=rows("endpoints", "subnet_ids", "eni_ids"),
-        load_balancers=rows("load_balancers"),
-        ecs_services=rows("ecs_services"),
-        ecs_task_enis=rows("ecs_task_enis"),
+        vpcs=vpc_tree(conn, snap_id, scope),
+        lambdas=lambdas,
+        endpoints=endpoints,
+        load_balancers=load_balancers,
+        ecs_services=ecs_services,
+        ecs_task_enis=ecs_task_enis,
         taken_at=_parse_ts(snap["taken_at"] if snap else None),
     )
 

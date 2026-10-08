@@ -133,6 +133,32 @@ def attribute_eni(eni: dict[str, Any]) -> Attribution:
     return Attribution("other", itype if itype not in ("", "interface") else "")
 
 
+LambdaKey = tuple[str, frozenset[str]]
+
+
+def lambda_eni_index(functions: list[dict[str, Any]]) -> dict[LambdaKey, list[str]]:
+    """``(subnet id, security group set) -> sorted function names`` from ListFunctions.
+
+    Lambda creates one Hyperplane ENI per unique subnet + security-group combination
+    and shares it between every function with that combination, so an ENI belongs to
+    all functions whose VpcConfig uses its subnet and exactly its security groups.
+    """
+    index: dict[LambdaKey, set[str]] = {}
+    for fn in functions:
+        cfg = fn.get("VpcConfig") or {}
+        sgs = frozenset(cfg.get("SecurityGroupIds") or [])
+        for subnet_id in cfg.get("SubnetIds") or []:
+            index.setdefault((subnet_id, sgs), set()).add(fn["FunctionName"])
+    return {key: sorted(names) for key, names in index.items()}
+
+
+def lambda_owners(
+    index: dict[LambdaKey, list[str]], subnet_id: str | None, security_groups: list[str]
+) -> list[str]:
+    """Every function sharing a Lambda ENI in ``subnet_id`` with ``security_groups``."""
+    return list(index.get((subnet_id or "", frozenset(security_groups)), []))
+
+
 def _from_description(desc: str) -> tuple[str, str]:
     for pattern, owner in _DESC_PATTERNS:
         m = pattern.match(desc)

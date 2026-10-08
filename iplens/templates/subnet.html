@@ -43,7 +43,7 @@
     <tr>
       <td class="mono"><a href="{{ url_for('eni', eni_id=e.eni_id) }}">{{ e.eni_id }}</a></td>
       <td>{{ owner_labels.get(e.owner_type, e.owner_type) }}</td>
-      <td class="mono">{{ e.owner_ref or '' }}</td>
+      <td class="mono">{{ e.owner_names | join(', ') if e.owner_names | length > 1 else (e.owner_ref or '') }}</td>
       <td><span class="badge {{ 'warn' if e.status == 'available' else '' }}">{{ e.status }}</span></td>
       <td>{{ e.ip_count }}</td>
       <td class="muted">{{ e.description }}</td>

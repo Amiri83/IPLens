@@ -1,9 +1,10 @@
 {% extends "base.html" %}
+{% from "_macros.html" import no_data with context %}
 {% block title %}Suggestions{% endblock %}
 {% block content %}
 <h1>Suggestions</h1>
 {% if not snap %}
-  <div class="card">No snapshot yet — refresh from the <a href="{{ url_for('overview') }}">Discovery</a>.</div>
+  {{ no_data() }}
 {% else %}
 <div class="card">
   <b>{{ totals.allowed }}</b> IPs could be freed by allowed suggestions ·

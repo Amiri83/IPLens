@@ -81,6 +81,7 @@ class _Node:
     sgs: tuple[str, ...]
     name: str
     ips: tuple[str, ...]
+    owners: tuple[str, ...] = ()
 
     @property
     def resource_key(self) -> tuple[str, str]:
@@ -141,6 +142,7 @@ def _load_nodes(
             sgs=tuple(json.loads(r["security_groups"] or "[]")),
             name=res["name"],
             ips=tuple(res["ips"]),
+            owners=tuple(res.get("owners") or ()),
         )
     return nodes
 
@@ -158,8 +160,10 @@ def _lb_edges(
     for n in nodes.values():
         if n.instance_id:
             by_instance.setdefault(n.instance_id, []).append(n)
-        if n.owner_type == "lambda" and n.owner_ref:
-            by_lambda.setdefault(n.owner_ref, []).append(n)
+        if n.owner_type == "lambda":
+            # A shared Lambda ENI is a target of every function that uses it.
+            for fn in n.owners or ((n.owner_ref,) if n.owner_ref else ()):
+                by_lambda.setdefault(fn, []).append(n)
 
     for r in conn.execute(
         "SELECT lb_name, target_group, target_type, target_id, port FROM lb_targets "

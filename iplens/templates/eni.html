@@ -5,7 +5,11 @@
 <h1><span class="mono">{{ e.eni_id }}</span> {{ e.name or '' }}</h1>
 <div class="card">
   <table>
-    <tr><th>Owner</th><td>{{ owner_labels.get(e.owner_type, e.owner_type) }} {% if e.owner_ref %}<span class="mono">{{ e.owner_ref }}</span>{% endif %}</td></tr>
+    <tr><th>Owner</th><td>{{ owner_labels.get(e.owner_type, e.owner_type) }}
+      {% if e.owner_names | length > 1 %}
+        — shared by {{ e.owner_names | length }} functions (same subnet and security groups):
+        <ul class="owner-list">{% for n in e.owner_names %}<li class="mono">{{ n }}</li>{% endfor %}</ul>
+      {% elif e.owner_ref %}<span class="mono">{{ e.owner_ref }}</span>{% endif %}</td></tr>
     <tr><th>Status</th><td><span class="badge {{ 'warn' if e.status == 'available' else '' }}">{{ e.status }}</span>{% if e.status == 'available' %} not attached (idle){% endif %}</td></tr>
     <tr><th>Interface type</th><td class="mono">{{ e.interface_type or '' }}</td></tr>
     <tr><th>Requester</th><td class="mono">{{ e.requester_id or '' }}{% if e.requester_managed %} <span class="badge">AWS-managed</span>{% endif %}</td></tr>

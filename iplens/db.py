@@ -25,7 +25,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     secret_enc        TEXT,                   -- encrypted secret access key
     session_token_enc TEXT,                   -- encrypted session token (temporary)
     expires_at        TEXT,                   -- ISO UTC expiry of temporary credentials
-    memory_only       INTEGER NOT NULL DEFAULT 0
+    memory_only       INTEGER NOT NULL DEFAULT 0,
+    aws_account_id    TEXT,                   -- AWS account id of the first successful connect
+    last_seen_account_id TEXT                 -- AWS account id of the latest successful connect
 );
 
 -- account_ref is the IPLens account record (accounts.id); account_id is the AWS account id.
@@ -35,6 +37,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     region      TEXT NOT NULL,
     account_id  TEXT,
     account_alias TEXT,             -- IAM account alias; '' if none or not permitted
+    account_name TEXT,              -- account display name, frozen at capture time
     status      TEXT NOT NULL,
     error       TEXT,
     warnings    TEXT,
@@ -77,6 +80,7 @@ CREATE TABLE IF NOT EXISTS enis (
     owner_type        TEXT NOT NULL,
     owner_ref         TEXT,
     name              TEXT,
+    owner_names       TEXT,          -- JSON list of every owning resource (shared Lambda ENIs)
     PRIMARY KEY (snapshot_id, eni_id)
 );
 
@@ -202,6 +206,12 @@ CREATE TABLE IF NOT EXISTS visual_prefs (
     show_subnets INTEGER NOT NULL DEFAULT 1
 );
 
+-- Per-account scope: the VPCs / subnets / IP ranges every view shows (JSON, see scope.py).
+CREATE TABLE IF NOT EXISTS scopes (
+    account_ref INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    config      TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS visual_layouts (
     account_ref INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     vpc_id      TEXT NOT NULL,
@@ -223,6 +233,10 @@ _ADDED_COLUMNS = (
     ("snapshots", "account_alias", "TEXT"),
     ("snapshots", "account_ref", "INTEGER REFERENCES accounts(id) ON DELETE CASCADE"),
     ("rules", "account_ref", "INTEGER"),
+    ("snapshots", "account_name", "TEXT"),
+    ("accounts", "aws_account_id", "TEXT"),
+    ("accounts", "last_seen_account_id", "TEXT"),
+    ("enis", "owner_names", "TEXT"),
 )
 
 # Single-account settings rows from before multi-account support.
@@ -237,6 +251,7 @@ _LEGACY_AUTH_KEYS = (
 _LEGACY_AUTH_MODES = ("env", "profile", "keys")
 ACTIVE_ACCOUNT_KEY = "active_account"
 _MIGRATED_KEY = "accounts_migrated"
+_REGROUPED_KEY = "snapshots_regrouped"
 
 
 def init_db(db_path: Path | str) -> None:
@@ -249,6 +264,7 @@ def init_db(db_path: Path | str) -> None:
         # After the ALTERs: on an old database the column only exists from here on.
         conn.execute("CREATE INDEX IF NOT EXISTS ix_snapshots_account ON snapshots(account_ref)")
         migrate_accounts(conn)
+        regroup_snapshots(conn)
 
 
 def migrate_accounts(conn: sqlite3.Connection) -> int | None:
@@ -288,6 +304,86 @@ def migrate_accounts(conn: sqlite3.Connection) -> int | None:
     conn.executemany("DELETE FROM settings WHERE key=?", [(k,) for k in _LEGACY_AUTH_KEYS])
     conn.execute("INSERT INTO settings(key, value) VALUES(?, '1')", (_MIGRATED_KEY,))
     return account_id
+
+
+def regroup_snapshots(conn: sqlite3.Connection) -> list[int]:
+    """One-off data migration: one account record per distinct AWS account id.
+
+    Before snapshot-frozen labels, one account record could collect from several
+    AWS accounts (its credentials were edited), so its snapshots mix account ids.
+    Snapshots are re-grouped by their stored ``account_id``:
+
+    * a record keeps the AWS account of its newest successful snapshot (its current
+      credentials resolve there); that id becomes the record's ``aws_account_id``;
+    * every other AWS account id goes to the record that already owns it, else to a
+      new record (``env`` auth, the snapshot's region, the IAM alias as display name;
+      its credentials must be configured before it can refresh). Visual layouts of
+      the VPCs seen in moved snapshots are copied along;
+    * snapshots without an account id (failed collections) stay where they are;
+    * snapshots without a frozen ``account_name`` get their record's display name.
+
+    Returns the ids of the records created. Runs once per database.
+    """
+    if conn.execute("SELECT 1 FROM settings WHERE key=?", (_REGROUPED_KEY,)).fetchone():
+        return []
+    own: dict[int, str] = {}  # account record -> its AWS account id
+    for rec in conn.execute("SELECT id FROM accounts ORDER BY id").fetchall():
+        newest = conn.execute(
+            "SELECT account_id FROM snapshots WHERE account_ref=? AND status='ok' "
+            "AND COALESCE(account_id, '') != '' ORDER BY id DESC LIMIT 1",
+            (rec["id"],),
+        ).fetchone()
+        if newest:
+            own[rec["id"]] = newest["account_id"]
+    # AWS account id -> record for snapshots that must move (first record that owns it).
+    owner: dict[str, int] = {}
+    for rec_id, aws_id in own.items():
+        owner.setdefault(aws_id, rec_id)
+    created: list[int] = []
+    rows = conn.execute(
+        "SELECT id, account_ref, account_id, account_alias, region FROM snapshots "
+        "WHERE COALESCE(account_id, '') != '' ORDER BY id DESC"
+    ).fetchall()
+    for snap in rows:
+        if snap["account_ref"] is not None and own.get(snap["account_ref"]) == snap["account_id"]:
+            continue  # two records of one AWS account (e.g. two regions) stay apart
+        target = owner.get(snap["account_id"])
+        if target is None:
+            cur = conn.execute(
+                "INSERT INTO accounts(display_name, region, auth_mode, aws_account_id, "
+                "last_seen_account_id) VALUES(?, ?, 'env', ?, ?)",
+                (
+                    snap["account_alias"] or "",
+                    snap["region"],
+                    snap["account_id"],
+                    snap["account_id"],
+                ),
+            )
+            target = owner[snap["account_id"]] = int(cur.lastrowid or 0)
+            own[target] = snap["account_id"]
+            created.append(target)
+        if snap["account_ref"] is not None:
+            conn.execute(
+                "INSERT OR IGNORE INTO visual_layouts(account_ref, vpc_id, positions) "
+                "SELECT ?, l.vpc_id, l.positions FROM visual_layouts l "
+                "JOIN vpcs v ON v.vpc_id = l.vpc_id AND v.snapshot_id = ? "
+                "WHERE l.account_ref = ?",
+                (target, snap["id"], snap["account_ref"]),
+            )
+        conn.execute("UPDATE snapshots SET account_ref=? WHERE id=?", (target, snap["id"]))
+    for rec_id, aws_id in own.items():
+        conn.execute(
+            "UPDATE accounts SET aws_account_id = COALESCE(NULLIF(aws_account_id, ''), ?), "
+            "last_seen_account_id = COALESCE(NULLIF(last_seen_account_id, ''), ?) WHERE id=?",
+            (aws_id, aws_id, rec_id),
+        )
+    conn.execute(
+        "UPDATE snapshots SET account_name = COALESCE("
+        "(SELECT display_name FROM accounts a WHERE a.id = snapshots.account_ref), '') "
+        "WHERE account_name IS NULL"
+    )
+    conn.execute("INSERT INTO settings(key, value) VALUES(?, '1')", (_REGROUPED_KEY,))
+    return created
 
 
 @contextmanager

@@ -5,6 +5,20 @@
     <span class="reserved" style="width: {{ s.pct(s.reserved) }}%"></span>
   </div>
 {%- endmacro %}
+{# Import "with context": needs active_account, active_label and csrf_token. #}
+{% macro no_data() -%}
+  {% if active_account %}
+  <form class="card no-data" method="post" action="{{ url_for('refresh') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="account_id" value="{{ active_account.id }}">
+    No data yet for <b>{{ active_label }}</b> —
+    <button type="submit">Refresh</button>
+    <span class="muted">(read-only AWS calls; other accounts' data is never shown here)</span>
+  </form>
+  {% else %}
+  <div class="card no-data">No AWS account yet — add one in <a href="{{ url_for('settings_page') }}">Settings</a>.</div>
+  {% endif %}
+{%- endmacro %}
 {% macro legend() -%}
   <div class="legend">
     <span><i style="background: var(--used)"></i>used</span>
