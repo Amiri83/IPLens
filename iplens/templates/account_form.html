@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit account' if a.id else 'Add account' }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('settings_page') }}" class="back-link">← Settings</a></p>
+<h1>{{ 'Edit account' if a.id else 'Add account' }}</h1>
+{# Secret values are never rendered: stored ones are shown as "stored", masked or as their expiry. #}
+<form class="card" method="post" autocomplete="off"
+      action="{{ url_for('account_edit', account_id=a.id) if a.id else url_for('account_new') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+  <label for="display_name">Display name <span class="muted">(optional)</span></label>
+  <input id="display_name" name="display_name" value="{{ a.display_name }}" size="40"
+         maxlength="{{ max_name }}" placeholder="e.g. example-prod">
+  <div class="muted">Shown in the header as <i>name (account id)</i>; overrides the IAM account
+    alias. Leave blank to use the alias, or just the account id if there is none.</div>
+
+  <label for="region">Region</label>
+  <div class="row">
+    <div><select id="region" name="region">
+      {% for r in regions %}<option value="{{ r }}" {{ 'selected' if r == a.region }}>{{ r }}</option>{% endfor %}
+      {% if a.region not in regions %}<option value="{{ a.region }}" selected>{{ a.region }}</option>{% endif %}
+    </select></div>
+    <div><input name="region_custom" placeholder="or type a region code" size="20" aria-label="Custom region"></div>
+  </div>
+
+  <h2>Credentials</h2>
+  {% for m in modes %}
+  <label><input type="radio" name="auth_mode" value="{{ m }}" {{ 'checked' if a.auth_mode == m }} onchange="showAuth()">
+    {{ mode_labels[m] }}</label>
+  {% endfor %}
+
+  <fieldset data-mode="env">
+    <p class="note">Uses the <b>process environment</b> IPLens was started with (<span class="mono">AWS_*</span>
+      variables, then the default chain: shared config, SSO cache, instance/container role). No
+      credentials are stored by IPLens.</p>
+  </fieldset>
+
+  <fieldset data-mode="profile">
+    <label for="profile">Named profile</label>
+    <select id="profile" name="profile">
+      <option value="">— choose a profile —</option>
+      {% for p in profiles %}
+        <option value="{{ p.name }}" {{ 'selected' if p.name == a.profile }}>{{ p.label }}</option>
+      {% endfor %}
+      {% if a.profile and not profile_known %}
+        <option value="{{ a.profile }}" selected>{{ a.profile }} (not found)</option>
+      {% endif %}
+    </select>
+    <div class="muted">From <span class="mono">~/.aws/config</span> and <span class="mono">~/.aws/credentials</span>
+      (including SSO profiles; run <span class="mono">aws sso login</span> first).
+      {% if not profiles %}No profiles found.{% endif %}</div>
+  </fieldset>
+
+  <fieldset data-mode="keys">
+    <label for="access_key_id">Access key ID</label>
+    <input id="access_key_id" name="access_key_id" class="mono" size="30" spellcheck="false"
+           placeholder="{{ a.access_key_id if a.auth_mode == 'keys' and a.access_key_id else 'AKIA…' }}">
+    {% if a.auth_mode == 'keys' and a.access_key_id %}<span class="muted">stored: <span class="mono">{{ a.access_key_id }}</span> — leave blank to keep</span>{% endif %}
+    <label for="secret_access_key">Secret access key</label>
+    <input id="secret_access_key" name="secret_access_key" type="password" class="mono" size="50"
+           autocomplete="new-password"
+           placeholder="{{ '•••••••• (stored, leave blank to keep)' if a.auth_mode == 'keys' and a.has_secret else '' }}">
+  </fieldset>
+
+  <fieldset data-mode="temporary">
+    {% if a.auth_mode == 'temporary' and a.access_key_id %}
+      <p>Current: <span class="mono">{{ a.access_key_id }}</span> ·
+        <span class="badge {{ 'err' if a.problem else 'warn' }}">{{ a.problem or a.status }}</span>
+        <span class="muted">— leave the box empty to keep them</span></p>
+    {% endif %}
+    <label for="temporary_paste">Paste temporary credentials</label>
+    <textarea id="temporary_paste" name="temporary_paste" rows="6" cols="80" class="mono secret-paste"
+              spellcheck="false" autocapitalize="off" autocomplete="off"
+              placeholder="ASIA… secret… session-token…   (three fields)
+export AWS_ACCESS_KEY_ID=…   (export block)
+{&quot;Credentials&quot;: {…, &quot;Expiration&quot;: …}}   (aws sts get-session-token JSON)"></textarea>
+    <div class="muted">Accepts three whitespace-separated fields (key id, secret, session token), an
+      <span class="mono">export AWS_…</span> block, or the JSON output of
+      <span class="mono">aws sts get-session-token</span> (its <span class="mono">Expiration</span> is used for the expiry).</div>
+  </fieldset>
+
+  <fieldset data-mode="keys temporary">
+    <label><input type="checkbox" name="memory_only" {{ 'checked' if a.memory_only }}>
+      Memory only — keep these credentials in memory and never write them to disk
+      <span class="muted">(lost when IPLens restarts)</span></label>
+    <div class="muted">Otherwise the secret{{ ' and session token are' if a.auth_mode == 'temporary' else ' is' }} stored
+      Fernet-encrypted in the IPLens database.</div>
+  </fieldset>
+
+  <p><button type="submit">Save</button></p>
+</form>
+<script>
+function showAuth() {
+  const mode = document.querySelector('input[name=auth_mode]:checked').value;
+  document.querySelectorAll('fieldset[data-mode]').forEach(fs => {
+    fs.style.display = fs.dataset.mode.split(' ').includes(mode) ? '' : 'none';
+  });
+}
+showAuth();
+</script>
+{% endblock %}

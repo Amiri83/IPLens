@@ -23,6 +23,16 @@
     <button type="button" class="secondary" id="zoom-fit" title="Fit to screen">Fit</button>
     <button type="button" class="secondary" id="expand-all">Expand groups</button>
     <button type="button" class="secondary" id="collapse-all">Collapse groups</button>
+    <button type="button" class="secondary" id="reset-layout" title="Forget dragged positions for this VPC">Reset layout</button>
+  </div>
+  <fieldset class="edge-filters">
+    <legend>Borders</legend>
+    <label class="edge-filter"><input type="checkbox" id="show-vpc" {{ 'checked' if prefs.show_vpc }}> VPC</label>
+    <label class="edge-filter"><input type="checkbox" id="show-subnets" {{ 'checked' if prefs.show_subnets }}> Subnets</label>
+  </fieldset>
+  <div class="row export-buttons" style="gap: .4rem">
+    <button type="button" class="secondary" id="export-svg">Export SVG</button>
+    <button type="button" class="secondary" id="export-drawio">Export draw.io</button>
   </div>
   <fieldset class="edge-filters">
     <legend>Connections</legend>
@@ -39,16 +49,45 @@
     (more than 10 resources of one type in a subnet) to expand or collapse it. Solid lines are
     load balancer targets and ECS services; dashed lines are security group based: endpoint reach
     (the endpoint's security group allows tcp/443 from the resource) and SG references.
+    Drag resources to rearrange them: positions are saved for this account and VPC and override
+    the automatic layout until you press <b>Reset layout</b>. Border toggles are remembered per
+    account. Exports contain the diagram exactly as currently shown.
   </div>
 </form>
 <div class="cy-wrap">
   <div id="cy" class="card"
        data-src="{{ url_for('visual_data', vpc=vpc) }}"
+       data-vpc="{{ vpc }}"
        data-icons="{{ url_for('static', filename='icons/aws/') }}"
-       data-eni-url="{{ url_for('eni', eni_id='__ENI__') }}"></div>
+       data-eni-url="{{ url_for('eni', eni_id='__ENI__') }}"
+       data-csrf="{{ csrf_token }}"
+       data-prefs-url="{{ url_for('visual_prefs') }}"
+       data-layout-url="{{ url_for('visual_layout_save') }}"
+       data-reset-url="{{ url_for('visual_layout_reset') }}"
+       data-export-svg="{{ url_for('visual_export_svg') }}"
+       data-export-drawio="{{ url_for('visual_export_drawio') }}"></div>
   <div id="cy-tip" class="cy-tip" role="tooltip" hidden></div>
 </div>
+<script type="application/json" id="visual-positions">{{ positions | tojson }}</script>
 <p class="muted" id="cy-status"></p>
+<p class="muted small" id="cy-note" aria-live="polite"></p>
+<section class="card visual-legend" aria-labelledby="legend-title">
+  <h2 id="legend-title">Legend</h2>
+  <div class="legend-grid">
+    {% for label, icon in legend_icons %}
+      <span class="legend-item"><img src="{{ url_for('static', filename='icons/aws/' ~ icon) }}" alt="" width="22" height="22"> {{ label }}</span>
+    {% endfor %}
+  </div>
+  <div class="legend-grid">
+    <span class="legend-item"><i class="box-swatch box-vpc"></i> VPC</span>
+    <span class="legend-item"><i class="box-swatch box-subnet"></i> Subnet</span>
+    <span class="legend-item"><i class="node-swatch node-idle"></i> Idle ENI (available)</span>
+    <span class="legend-item"><i class="node-swatch node-group"></i> Group (click to expand)</span>
+    {% for t in edge_types %}
+      <span class="legend-item"><i class="edge-swatch edge-{{ t }}"></i> {{ edge_labels[t] }}</span>
+    {% endfor %}
+  </div>
+</section>
 <p class="muted small">Icons: AWS Architecture Icons, © Amazon Web Services, Inc. or its affiliates.
   Layout: dagre (MIT).</p>
 <script src="{{ url_for('static', filename='vendor/cytoscape.min.js') }}"></script>

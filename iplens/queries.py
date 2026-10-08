@@ -16,22 +16,82 @@ AWS_RESERVED_TAIL = 1
 GRID_PAGE_SIZE = 1024
 
 
-def latest_snapshot(conn: sqlite3.Connection) -> sqlite3.Row | None:
+def latest_snapshot(conn: sqlite3.Connection, account_ref: int | None = None) -> sqlite3.Row | None:
+    """Newest successful snapshot of ``account_ref`` (any account when None)."""
+    if account_ref is None:
+        sql, args = "SELECT * FROM snapshots WHERE status='ok' ORDER BY id DESC LIMIT 1", ()
+    else:
+        sql = "SELECT * FROM snapshots WHERE status='ok' AND account_ref=? ORDER BY id DESC LIMIT 1"
+        args = (account_ref,)
+    return conn.execute(sql, args).fetchone()
+
+
+def recent_snapshots(
+    conn: sqlite3.Connection, limit: int = 10, account_ref: int | None = None
+) -> list[sqlite3.Row]:
+    if account_ref is None:
+        return conn.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return conn.execute(
-        "SELECT * FROM snapshots WHERE status='ok' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+        "SELECT * FROM snapshots WHERE account_ref=? ORDER BY id DESC LIMIT ?", (account_ref, limit)
+    ).fetchall()
 
 
-def recent_snapshots(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row]:
-    return conn.execute("SELECT * FROM snapshots ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+def protected_snapshot_ids(conn: sqlite3.Connection) -> set[int]:
+    """The latest successful snapshot of every account: never deleted by history actions."""
+    rows = conn.execute(
+        "SELECT MAX(id) AS id FROM snapshots WHERE status='ok' GROUP BY account_ref"
+    ).fetchall()
+    return {r["id"] for r in rows}
 
 
 def prune_snapshots(conn: sqlite3.Connection, keep: int = 10) -> int:
-    cur = conn.execute(
-        "DELETE FROM snapshots WHERE id NOT IN (SELECT id FROM snapshots ORDER BY id DESC LIMIT ?)",
-        (keep,),
-    )
-    return cur.rowcount
+    """Keep the newest ``keep`` snapshots per account (and each account's latest good one)."""
+    keep_ids = protected_snapshot_ids(conn) | {
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM (SELECT id, ROW_NUMBER() OVER "
+            "(PARTITION BY account_ref ORDER BY id DESC) AS n FROM snapshots) WHERE n <= ?",
+            (keep,),
+        )
+    }
+    return _delete_snapshots(conn, _all_snapshot_ids(conn) - keep_ids)
+
+
+def _all_snapshot_ids(conn: sqlite3.Connection, account_ref: int | None = None) -> set[int]:
+    if account_ref is None:
+        rows = conn.execute("SELECT id FROM snapshots WHERE status != 'running'")
+    else:
+        rows = conn.execute(
+            "SELECT id FROM snapshots WHERE status != 'running' AND account_ref=?", (account_ref,)
+        )
+    return {r["id"] for r in rows}
+
+
+def _delete_snapshots(conn: sqlite3.Connection, ids: set[int]) -> int:
+    # Child tables are removed by ON DELETE CASCADE.
+    conn.executemany("DELETE FROM snapshots WHERE id=?", [(i,) for i in sorted(ids)])
+    return len(ids)
+
+
+def delete_snapshots(
+    conn: sqlite3.Connection, ids: set[int], account_ref: int
+) -> tuple[int, set[int]]:
+    """Delete the selected snapshots of one account; returns (deleted, kept ids).
+
+    The account's latest successful snapshot and collections still running are kept.
+    """
+    candidates = _all_snapshot_ids(conn, account_ref) & ids
+    kept = candidates & protected_snapshot_ids(conn)
+    return _delete_snapshots(conn, candidates - kept), kept
+
+
+def clear_history(conn: sqlite3.Connection, account_ref: int | None = None) -> int:
+    """Delete every snapshot except each account's latest successful one.
+
+    ``account_ref=None`` clears the history of all accounts.
+    """
+    ids = _all_snapshot_ids(conn, account_ref) - protected_snapshot_ids(conn)
+    return _delete_snapshots(conn, ids)
 
 
 @dataclass

@@ -11,19 +11,21 @@
 <p class="muted">Rules encode company policy. Suggestions that would break an enabled rule are shown greyed out as blocked.</p>
 
 <table>
-  <thead><tr><th>Name</th><th>Kind</th><th>Parameters</th><th>Status</th><th>Current violations</th><th></th></tr></thead>
+  <thead><tr><th>Name</th><th>Kind</th><th>Parameters</th><th>Scope</th><th>Status</th><th>Current violations</th><th></th></tr></thead>
   <tbody>
   {% for r in rules %}
     <tr class="{{ '' if r.enabled else 'blocked' }}">
       <td><b>{{ r.name }}</b><div class="muted">{{ r.description }}</div></td>
       <td>{{ r.kind_label }}<div class="muted mono">{{ r.kind }}</div></td>
       <td class="mono">{{ r.summary() }}</td>
+      <td>{% if r.account_ref is none %}all accounts{% else %}{{ account_names.get(r.account_ref, 'deleted account #%d' % r.account_ref) }}{% endif %}</td>
       <td><span class="badge {{ 'ok' if r.enabled else '' }}">{{ 'enabled' if r.enabled else 'disabled' }}</span></td>
       <td>
         {% set v = violations.get(r.id, []) %}
         {% if v %}
           <span class="badge err">{{ v | length }}</span>
           <ul>{% for item in v[:10] %}<li>{{ item }}</li>{% endfor %}{% if v | length > 10 %}<li class="muted">… {{ v | length - 10 }} more</li>{% endif %}</ul>
+        {% elif not r.applies_to(active_ref) %}<span class="muted">other account</span>
         {% elif r.enabled %}<span class="badge ok">none</span>{% endif %}
       </td>
       <td style="white-space: nowrap">
@@ -36,7 +38,7 @@
       </td>
     </tr>
   {% else %}
-    <tr><td colspan="6" class="muted">No rules yet.</td></tr>
+    <tr><td colspan="7" class="muted">No rules yet.</td></tr>
   {% endfor %}
   </tbody>
 </table>

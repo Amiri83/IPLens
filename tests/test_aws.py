@@ -1,12 +1,22 @@
+from datetime import UTC, datetime, timedelta
+
 import boto3
 import pytest
-from botocore.exceptions import ProfileNotFound
+from botocore.exceptions import ClientError, ProfileNotFound
 from moto import mock_aws
 
-from iplens.aws import AwsGateway, ReadOnlyViolation, build_session, check_connection
-from iplens.settings import Settings
+from iplens.accounts import Account, CredentialError
+from iplens.aws import (
+    AwsGateway,
+    ReadOnlyViolation,
+    build_session,
+    check_connection,
+    is_credential_failure,
+)
 
 FAKE_SECRET = "example/secret/value/for/tests/only/0000"
+FAKE_TEMP_KEY_ID = "ASIAEXAMPLEEXAMPLE00"
+FAKE_SESSION_TOKEN = "FakeSessionTokenForTestsOnly0000000000000000000000Example"
 
 
 @mock_aws
@@ -31,7 +41,7 @@ def test_read_only_guard_allows_paginators():
 
 def test_build_session_keys_and_env():
     s = build_session(
-        Settings(
+        Account(
             auth_mode="keys",
             region="eu-west-1",
             access_key_id="AKIAEXAMPLE000000000",
@@ -41,9 +51,38 @@ def test_build_session_keys_and_env():
     creds = s.get_credentials()
     assert creds.access_key == "AKIAEXAMPLE000000000"
     assert s.region_name == "eu-west-1"
-    assert build_session(Settings(auth_mode="env", region="us-west-2")).region_name == "us-west-2"
+    assert build_session(Account(auth_mode="env", region="us-west-2")).region_name == "us-west-2"
     with pytest.raises(ValueError):
-        build_session(Settings(auth_mode="keys", access_key_id="AKIAEXAMPLE000000000"))
+        build_session(Account(auth_mode="keys", access_key_id="AKIAEXAMPLE000000000"))
+
+
+def test_build_session_temporary_uses_session_token():
+    s = build_session(
+        Account(
+            auth_mode="temporary",
+            access_key_id=FAKE_TEMP_KEY_ID,
+            secret_access_key=FAKE_SECRET,
+            session_token=FAKE_SESSION_TOKEN,
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    creds = s.get_credentials()
+    assert (creds.access_key, creds.token) == (FAKE_TEMP_KEY_ID, FAKE_SESSION_TOKEN)
+
+
+def test_build_session_refuses_expired_or_lost_credentials():
+    expired = Account(
+        auth_mode="temporary",
+        access_key_id=FAKE_TEMP_KEY_ID,
+        secret_access_key=FAKE_SECRET,
+        session_token=FAKE_SESSION_TOKEN,
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    with pytest.raises(CredentialError, match="credentials expired, paste new ones"):
+        build_session(expired)
+    lost = Account(auth_mode="keys", access_key_id=FAKE_TEMP_KEY_ID, memory_only=True)
+    with pytest.raises(CredentialError, match="paste them again"):
+        build_session(lost)
 
 
 def test_build_session_profile(tmp_path, monkeypatch):
@@ -53,29 +92,57 @@ def test_build_session_profile(tmp_path, monkeypatch):
     # botocore lets AWS_DEFAULT_REGION / AWS_REGION override the profile's region.
     monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
-    s = build_session(Settings(auth_mode="profile", profile="example-readonly", region=""))
+    s = build_session(Account(auth_mode="profile", profile="example-readonly", region=""))
     assert s.profile_name == "example-readonly"
     assert s.region_name == "us-east-2"
     with pytest.raises(ProfileNotFound):
-        build_session(Settings(auth_mode="profile", profile="missing", region="us-east-1"))
+        build_session(Account(auth_mode="profile", profile="missing", region="us-east-1"))
 
 
 @mock_aws
 def test_check_connection_ok():
-    ok, msg = check_connection(Settings(auth_mode="env", region="us-east-1"))
-    assert ok
-    assert "123456789012" in msg
+    result = check_connection(Account(auth_mode="env", region="us-east-1"))
+    assert result.ok and not result.credentials_problem
+    assert "123456789012" in result.message
 
 
 def test_check_connection_failure_does_not_leak_secret():
-    def boom(_settings):
+    def boom(_account):
         raise ValueError("bad")
 
-    ok, msg = check_connection(
-        Settings(
+    result = check_connection(
+        Account(
             auth_mode="keys", access_key_id="AKIAEXAMPLE000000000", secret_access_key=FAKE_SECRET
         ),
         boom,
     )
-    assert not ok
-    assert FAKE_SECRET not in msg
+    assert not result.ok
+    assert FAKE_SECRET not in result.message
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        ("ExpiredToken", True),
+        ("InvalidClientTokenId", True),
+        ("ExpiredTokenException", True),
+        ("AccessDenied", False),
+    ],
+)
+def test_is_credential_failure(code, expected):
+    exc = ClientError({"Error": {"Code": code, "Message": "example"}}, "DescribeVpcs")
+    assert is_credential_failure(exc) is expected
+    assert is_credential_failure(CredentialError("example"))
+    assert not is_credential_failure(RuntimeError("example"))
+
+
+def test_check_connection_flags_expired_token():
+    def expired(_account):
+        raise ClientError(
+            {"Error": {"Code": "ExpiredToken", "Message": "The security token is expired"}},
+            "GetCallerIdentity",
+        )
+
+    result = check_connection(Account(auth_mode="env"), expired)
+    assert not result.ok and result.credentials_problem
+    assert result.message == "Connection failed: credentials expired, paste new ones"

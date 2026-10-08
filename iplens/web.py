@@ -26,23 +26,37 @@ from flask import (
 )
 from markupsafe import Markup
 
-from . import queries
+from . import diagram, queries, viewstate
 from . import rules as rules_mod
 from . import suggestions as sugg_mod
+from .accounts import (
+    AUTH_MODE_LABELS,
+    AUTH_MODES,
+    EXPIRED_MESSAGE,
+    Account,
+    AccountStore,
+    CredentialError,
+    MemoryVault,
+    discover_profiles,
+)
 from .attribution import OWNER_LABELS, OWNER_TYPES
-from .aws import AwsGateway, check_connection
+from .aws import AwsGateway, check_connection, is_credential_failure
 from .collector import Collector
 from .config import AppPaths, default_paths
 from .crypto import SecretBox
 from .db import closing, connect, init_db
 from .export import XLSX_MIMETYPE, ips_to_xlsx
 from .logging_setup import LEVELS, configure_logging, read_log
-from .settings import AUTH_MODES, REGIONS, Settings, SettingsStore
+from .queries import LB_ICONS, TYPE_ICONS
+from .settings import MAX_DISPLAY_NAME, REGIONS, Settings, SettingsStore
 from .visual import DEFAULT_EDGE_TYPES, EDGE_TYPE_LABELS, EDGE_TYPES, parse_edge_types
 
 log = logging.getLogger(__name__)
 
-GatewayFactory = Callable[[Settings], AwsGateway]
+GatewayFactory = Callable[[Account], AwsGateway]
+# Typed on the Discovery page to confirm deleting snapshots.
+DELETE_CONFIRMATION = "DELETE"
+HISTORY_ROWS = 50
 # DNS-rebinding protection: only these Host header names are served.
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 
@@ -124,7 +138,9 @@ def create_app(
     paths = default_paths(home).ensure()
     init_db(paths.db_path)
     box = SecretBox.from_path(paths.key_path)
-    store = SettingsStore(paths.db_path, box)
+    store = SettingsStore(paths.db_path)
+    # Memory-only credentials live in this process for the lifetime of the app.
+    account_store = AccountStore(paths.db_path, box, MemoryVault())
 
     app = Flask(__name__)
     app.config.update(
@@ -137,7 +153,8 @@ def create_app(
     app.extensions["iplens"] = {
         "paths": paths,
         "store": store,
-        "gateway_factory": gateway_factory or AwsGateway.from_settings,
+        "accounts": account_store,
+        "gateway_factory": gateway_factory or AwsGateway.from_account,
         "port": port,
     }
     apply_log_dir(app, store.load())
@@ -159,6 +176,10 @@ def _store() -> SettingsStore:
     return _ext()["store"]
 
 
+def _accounts() -> AccountStore:
+    return _ext()["accounts"]
+
+
 def log_dir_for(paths: AppPaths, settings: Settings) -> Path:
     return Path(settings.log_dir).expanduser() if settings.log_dir else paths.default_log_dir
 
@@ -177,8 +198,64 @@ def _db():
     return g.db
 
 
+def _active() -> Account | None:
+    """The active account; falls back to (and persists) the first one if unset or gone."""
+    if "active_account" not in g:
+        store = _accounts()
+        acct = store.get(_store().active_account_id())
+        if acct is None:
+            acct = next(iter(store.list()), None)
+            _store().set_active_account_id(acct.id if acct else None)
+        g.active_account = acct
+    return g.active_account
+
+
+def _active_ref() -> int | None:
+    acct = _active()
+    return acct.id if acct else None
+
+
 def _snapshot_or_none():
-    return queries.latest_snapshot(_db())
+    """Latest successful snapshot of the active account (None without an account)."""
+    ref = _active_ref()
+    return queries.latest_snapshot(_db(), ref) if ref is not None else None
+
+
+def account_choice_label(acct: Account, snap: Any = None) -> str:
+    """Selector label: the display name, else the alias / AWS account id seen last."""
+    if acct.display_name:
+        return acct.display_name
+    if snap is not None and (snap["account_alias"] or snap["account_id"]):
+        return account_label(snap["account_id"], snap["account_alias"])
+    return f"Account {acct.id}"
+
+
+def _account_choices() -> list[dict[str, Any]]:
+    if "account_choices" not in g:
+        g.account_choices = [
+            {
+                "id": acct.id,
+                "label": account_choice_label(acct, queries.latest_snapshot(_db(), acct.id)),
+                "account": acct.public_dict(),
+            }
+            for acct in _accounts().list()
+        ]
+    return g.account_choices
+
+
+def _safe_next(target: str | None) -> str:
+    """Only same-site paths ("/..."), never "//host", a scheme or a backslash trick."""
+    if target and target.startswith("/") and not target.startswith("//") and "\\" not in target:
+        return target
+    return url_for("overview")
+
+
+def _credential_flash(prefix: str, message: str, account_id: int) -> None:
+    edit = url_for("account_edit", account_id=account_id)
+    flash(
+        Markup('{0}: {1} — <a href="{2}">edit account</a>').format(prefix, message, edit),
+        "error",
+    )
 
 
 def _register(app: Flask) -> None:
@@ -211,17 +288,19 @@ def _register(app: Flask) -> None:
 
     @app.context_processor
     def _globals() -> dict[str, Any]:
-        settings = _store().load()
+        names = {c["id"]: c["account"]["display_name"] for c in _account_choices()}
+        active = _active()
 
         def snap_label(snap: Any) -> str:
             return account_label(
-                snap["account_id"], snap["account_alias"], settings.account_display_name
+                snap["account_id"], snap["account_alias"], names.get(snap["account_ref"], "")
             )
 
         return {
             "csrf_token": session.get("csrf", ""),
             "owner_labels": OWNER_LABELS,
-            "current_settings": settings.public_dict(),
+            "active_account": active.public_dict() if active else None,
+            "account_choices": _account_choices(),
             "header_snap": _snapshot_or_none(),
             "account_label": snap_label,
         }
@@ -241,31 +320,41 @@ def _register(app: Flask) -> None:
         if snap:
             tree = queries.vpc_tree(_db(), snap["id"])
             owners = queries.owner_breakdown(_db(), snap["id"])
+        ref = _active_ref()
+        history = queries.recent_snapshots(_db(), HISTORY_ROWS, ref) if ref is not None else []
         return render_template(
             "overview.html",
             snap=snap,
             tree=tree,
             owners=owners,
-            history=queries.recent_snapshots(_db(), 5),
+            history=history,
+            protected=queries.protected_snapshot_ids(_db()),
+            confirm_word=DELETE_CONFIRMATION,
         )
 
     @app.post("/refresh")
     def refresh():
+        active = _active()
+        if active is None:
+            flash("Add an AWS account in Settings first.", "error")
+            return redirect(url_for("settings_page"))
         try:
-            settings = _store().load(with_secret=True)
-            gw = _ext()["gateway_factory"](settings)
-            result = Collector(gw, _paths().db_path).run()
+            account = _accounts().get(active.id, with_secret=True)
+            gw = _ext()["gateway_factory"](account)
+            result = Collector(gw, _paths().db_path, account.id).run()
             with closing(_paths().db_path) as conn:
                 queries.prune_snapshots(conn)
-        except Exception:
+        except Exception as exc:
             # Full details (type, message, traceback) go to the log file only;
             # raw errors can carry ARNs, account ids or request ids.
-            log.exception("refresh failed")
-            flash("Refresh failed. See the log for details.", "error")
+            log.exception("refresh failed (account=%s)", active.id)
+            if is_credential_failure(exc):
+                msg = str(exc) if isinstance(exc, CredentialError) else EXPIRED_MESSAGE
+                _credential_flash("Refresh failed", msg, active.id)
+            else:
+                flash("Refresh failed. See the log for details.", "error")
             return redirect(url_for("overview"))
-        label = account_label(
-            result.account_id, result.account_alias, settings.account_display_name
-        )
+        label = account_label(result.account_id, result.account_alias, account.display_name)
         msg = (
             f"Refreshed {label} · {gw.region}: {result.vpcs} VPCs, {result.subnets} subnets, "
             f"{result.enis} ENIs, {result.ips} IPs"
@@ -273,6 +362,47 @@ def _register(app: Flask) -> None:
         flash(msg, "ok")
         for w in result.warnings:
             flash(w, "warn")
+        return redirect(url_for("overview"))
+
+    # -- snapshot history ------------------------------------------------------------
+
+    def _confirmed() -> bool:
+        if request.form.get("confirm", "").strip() == DELETE_CONFIRMATION:
+            return True
+        flash(f"Type {DELETE_CONFIRMATION} to confirm.", "error")
+        return False
+
+    @app.post("/snapshots/delete")
+    def snapshots_delete():
+        ref = _active_ref()
+        if ref is None or not _confirmed():
+            return redirect(url_for("overview"))
+        ids = {int(v) for v in request.form.getlist("snapshot_id") if v.isdigit()}
+        if not ids:
+            flash("Select at least one snapshot.", "error")
+            return redirect(url_for("overview"))
+        with closing(_paths().db_path) as conn:
+            deleted, kept = queries.delete_snapshots(conn, ids, ref)
+        log.info("deleted %d snapshot(s) of account=%s", deleted, ref)
+        flash(f"Deleted {deleted} snapshot(s).", "ok")
+        if kept:
+            flash("The latest snapshot of each account is always kept.", "warn")
+        return redirect(url_for("overview"))
+
+    @app.post("/snapshots/clear")
+    def snapshots_clear():
+        ref = _active_ref()
+        if ref is None or not _confirmed():
+            return redirect(url_for("overview"))
+        every = request.form.get("scope") == "all"
+        with closing(_paths().db_path) as conn:
+            deleted = queries.clear_history(conn, None if every else ref)
+        log.info(
+            "cleared history (%s): %d snapshot(s)",
+            "all accounts" if every else f"account={ref}",
+            deleted,
+        )
+        flash(f"Cleared history: deleted {deleted} snapshot(s), kept the latest per account.", "ok")
         return redirect(url_for("overview"))
 
     # -- subnet grid / ENI / IP table ----------------------------------------
@@ -359,6 +489,8 @@ def _register(app: Flask) -> None:
         vpc = request.args.get("vpc", "")
         if tree and vpc not in {v.vpc_id for v in tree}:
             vpc = tree[0].vpc_id
+        ref = _active_ref()
+        prefs = viewstate.get_prefs(_db(), ref) if ref is not None else viewstate.DEFAULT_PREFS
         return render_template(
             "visual.html",
             snap=snap,
@@ -369,7 +501,83 @@ def _register(app: Flask) -> None:
             # The data endpoint still returns every type; the browser filters, so
             # ticking "SG refs" later needs no refetch.
             edges_on=_edge_types(DEFAULT_EDGE_TYPES),
+            prefs=prefs,
+            positions=viewstate.get_layout(_db(), ref, vpc) if ref is not None and vpc else {},
+            legend_icons=_legend_icons(),
         )
+
+    def _legend_icons() -> list[tuple[str, str]]:
+        icons = [(OWNER_LABELS.get(t, t), f) for t, f in TYPE_ICONS.items() if t != "elb"]
+        lbs = [("ALB", LB_ICONS["application"]), ("NLB", LB_ICONS["network"])]
+        lbs.append(("GWLB", LB_ICONS["gateway"]))
+        return icons[:1] + lbs + icons[1:]
+
+    def _visual_vpc() -> str:
+        vpc = request.form.get("vpc", "").strip()
+        if not vpc or len(vpc) > 64:
+            abort(400, "invalid VPC id")
+        return vpc
+
+    def _active_or_400() -> int:
+        ref = _active_ref()
+        if ref is None:
+            abort(400, "no active account")
+        return ref
+
+    @app.post("/visual/prefs")
+    def visual_prefs():
+        ref = _active_or_400()
+        with closing(_paths().db_path) as conn:
+            viewstate.save_prefs(
+                conn,
+                ref,
+                show_vpc=request.form.get("show_vpc") == "1",
+                show_subnets=request.form.get("show_subnets") == "1",
+            )
+        return "", 204
+
+    @app.post("/visual/layout")
+    def visual_layout_save():
+        ref = _active_or_400()
+        vpc = _visual_vpc()
+        try:
+            positions = viewstate.parse_positions(request.form.get("positions", ""))
+        except ValueError as exc:
+            abort(400, str(exc))
+        with closing(_paths().db_path) as conn:
+            viewstate.save_layout(conn, ref, vpc, positions)
+        return "", 204
+
+    @app.post("/visual/layout/reset")
+    def visual_layout_reset():
+        ref = _active_or_400()
+        vpc = _visual_vpc()
+        with closing(_paths().db_path) as conn:
+            viewstate.reset_layout(conn, ref, vpc)
+        log.info("visual layout reset (account=%s, %s)", ref, vpc)
+        return "", 204
+
+    def _export(ext: str, render: Callable[[diagram.View], str], mimetype: str) -> Response:
+        try:
+            view = diagram.parse_view(request.form.get("view", ""))
+        except ValueError as exc:
+            abort(400, f"invalid view: {exc}")
+        name = diagram.export_filename(view, ext)
+        body = render(view)
+        log.info("exported %s: %d node(s), %d edge(s)", name, len(view.nodes), len(view.edges))
+        return Response(
+            body,
+            mimetype=mimetype,
+            headers={"Content-Disposition": f"attachment; filename={name}"},
+        )
+
+    @app.post("/visual/export.svg")
+    def visual_export_svg():
+        return _export("svg", diagram.view_to_svg, "image/svg+xml")
+
+    @app.post("/visual/export.drawio")
+    def visual_export_drawio():
+        return _export("drawio", diagram.view_to_drawio, "application/vnd.jgraph.mxfile")
 
     @app.get("/visual/data.json")
     def visual_data():
@@ -389,13 +597,22 @@ def _register(app: Flask) -> None:
         snap = _snapshot_or_none()
         return (sugg_mod.build_context(_db(), snap["id"]) if snap else None), snap
 
+    def _account_names() -> dict[int, str]:
+        return {c["id"]: c["label"] for c in _account_choices()}
+
     @app.get("/rules")
     def rules_list():
         rules = rules_mod.list_rules(_db())
         ctx, _snap = _context()
-        violations = {r.id: r.violations(ctx) for r in rules} if ctx else {}
+        ref = _active_ref()
+        violations = {r.id: r.violations(ctx) for r in rules if r.applies_to(ref)} if ctx else {}
         return render_template(
-            "rules.html", rules=rules, violations=violations, kinds=rules_mod.RULE_KINDS
+            "rules.html",
+            rules=rules,
+            violations=violations,
+            kinds=rules_mod.RULE_KINDS,
+            account_names=_account_names(),
+            active_ref=ref,
         )
 
     def _rule_from_form(rule_id: int | None) -> rules_mod.Rule:
@@ -406,6 +623,7 @@ def _register(app: Flask) -> None:
             kind=f.get("kind", ""),
             enabled=f.get("enabled") == "on",
             description=f.get("description", ""),
+            account_ref=int(f["account_ref"]) if f.get("account_ref", "").isdigit() else None,
             params={
                 "percent": f.get("percent", ""),
                 "subnet_ids": f.get("subnet_ids", ""),
@@ -422,6 +640,7 @@ def _register(app: Flask) -> None:
             kinds=rules_mod.RULE_KINDS,
             scopes=rules_mod.INTERNAL_SCOPES,
             ecs_modes=rules_mod.ECS_MODES,
+            account_names=_account_names(),
         ), status
 
     @app.route("/rules/new", methods=["GET", "POST"])
@@ -501,7 +720,8 @@ def _register(app: Flask) -> None:
         ctx, snap = _context()
         items: list[sugg_mod.Suggestion] = []
         if ctx:
-            items = sugg_mod.generate(ctx, rules_mod.list_rules(_db()))
+            rules = rules_mod.applicable(rules_mod.list_rules(_db()), _active_ref())
+            items = sugg_mod.generate(ctx, rules)
         return render_template(
             "suggestions.html", snap=snap, items=items, totals=sugg_mod.totals(items)
         )
@@ -525,56 +745,124 @@ def _register(app: Flask) -> None:
             log_dir=log_dir,
         )
 
-    # -- settings ----------------------------------------------------------------
+    # -- settings and accounts ---------------------------------------------------------
 
     @app.get("/settings")
     def settings_page():
         return render_template(
             "settings.html",
-            s=_store().load().public_dict(),
-            modes=AUTH_MODES,
-            regions=REGIONS,
+            s=_store().load(),
+            accounts=_account_choices(),
             default_log_dir=_paths().default_log_dir,
         )
 
     @app.post("/settings")
     def settings_save():
-        f = request.form
-        clear = f.get("clear_secret") == "on"
-        # The form shows a masked key id; blank means "keep the stored one".
-        key_id = f.get("access_key_id", "").strip()
-        if not key_id and not clear:
-            key_id = _store().load().access_key_id
-        try:
-            _store().save(
-                auth_mode=f.get("auth_mode", "env"),
-                region=f.get("region_custom", "").strip() or f.get("region", ""),
-                profile=f.get("profile", ""),
-                access_key_id=key_id,
-                secret_access_key=f.get("secret_access_key") or None,
-                clear_secret=clear,
-                log_dir=f.get("log_dir", ""),
-                account_display_name=f.get("account_display_name", ""),
-            )
-        except ValueError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("settings_page"))
-        settings = _store().load()
-        new_dir = apply_log_dir(current_app, settings)
-        log.info(
-            "settings saved: auth_mode=%s region=%s log_dir=%s",
-            settings.auth_mode,
-            settings.region,
-            new_dir,
-        )
+        _store().save(log_dir=request.form.get("log_dir", ""))
+        new_dir = apply_log_dir(current_app, _store().load())
+        log.info("settings saved: log_dir=%s", new_dir)
         flash("Settings saved", "ok")
         return redirect(url_for("settings_page"))
 
-    @app.post("/settings/test")
-    def settings_test():
-        settings = _store().load(with_secret=True)
-        ok, msg = check_connection(settings, _ext()["gateway_factory"])
-        flash(msg, "ok" if ok else "error")
+    @app.post("/accounts/active")
+    def account_activate():
+        raw = request.form.get("account_id", "")
+        acct = _accounts().get(int(raw)) if raw.isdigit() else None
+        if acct is None:
+            abort(400, "unknown account")
+        _store().set_active_account_id(acct.id)
+        log.info("active account set to %s", acct.id)
+        return redirect(_safe_next(request.form.get("next")))
+
+    def _account_form(acct: Account, status: int = 200):
+        profiles = discover_profiles()
+        return render_template(
+            "account_form.html",
+            a=acct.public_dict(),
+            modes=AUTH_MODES,
+            mode_labels=AUTH_MODE_LABELS,
+            regions=REGIONS,
+            profiles=profiles,
+            profile_known=acct.profile in {p.name for p in profiles},
+            max_name=MAX_DISPLAY_NAME,
+        ), status
+
+    def _save_account(account_id: int | None):
+        f = request.form
+        fields: dict[str, Any] = {
+            "display_name": f.get("display_name", ""),
+            "region": f.get("region_custom", "").strip() or f.get("region", ""),
+            "auth_mode": f.get("auth_mode", "env"),
+            "profile": f.get("profile", ""),
+            "memory_only": f.get("memory_only") == "on",
+        }
+        try:
+            new_id = _accounts().save(
+                account_id,
+                **fields,
+                access_key_id=f.get("access_key_id", ""),
+                secret_access_key=f.get("secret_access_key") or None,
+                paste=f.get("temporary_paste") or None,
+            )
+        except ValueError as exc:
+            # Messages never quote secrets, and the form is re-rendered without them.
+            flash(str(exc), "error")
+            shown = _accounts().get(account_id) or Account()
+            for key, value in fields.items():
+                if key != "auth_mode" or value in AUTH_MODES:
+                    setattr(shown, key, value)
+            return _account_form(shown, 400)
+        if _accounts().get(_store().active_account_id()) is None:
+            _store().set_active_account_id(new_id)
+        acct = _accounts().get(new_id)
+        log.info(
+            "account %s: id=%s auth_mode=%s region=%s memory_only=%s",
+            "created" if account_id is None else "updated",
+            new_id,
+            acct.auth_mode,
+            acct.region,
+            acct.memory_only,
+        )
+        flash("Account saved", "ok")
+        return redirect(url_for("settings_page"))
+
+    @app.route("/accounts/new", methods=["GET", "POST"])
+    def account_new():
+        if request.method == "GET":
+            return _account_form(Account())
+        return _save_account(None)
+
+    @app.route("/accounts/<int:account_id>/edit", methods=["GET", "POST"])
+    def account_edit(account_id: int):
+        acct = _accounts().get(account_id)
+        if acct is None:
+            abort(404)
+        if request.method == "GET":
+            return _account_form(acct)
+        return _save_account(account_id)
+
+    @app.post("/accounts/<int:account_id>/delete")
+    def account_delete(account_id: int):
+        if not _accounts().delete(account_id):
+            abort(404)
+        if _store().active_account_id() == account_id:
+            first = next(iter(_accounts().list()), None)
+            _store().set_active_account_id(first.id if first else None)
+        log.info("account deleted: id=%s", account_id)
+        flash("Account deleted together with its snapshots", "ok")
+        return redirect(url_for("settings_page"))
+
+    @app.post("/accounts/<int:account_id>/test")
+    def account_test(account_id: int):
+        acct = _accounts().get(account_id, with_secret=True)
+        if acct is None:
+            abort(404)
+        result = check_connection(acct, _ext()["gateway_factory"])
+        if result.credentials_problem:
+            prefix, _sep, msg = result.message.partition(": ")
+            _credential_flash(prefix, msg, account_id)
+        else:
+            flash(result.message, "ok" if result.ok else "error")
         return redirect(url_for("settings_page"))
 
     @app.errorhandler(404)

@@ -185,20 +185,24 @@ def _task_eni_ids(task: dict[str, Any]) -> list[str]:
 
 
 class Collector:
-    def __init__(self, gateway: AwsGateway, db_path: Path):
+    def __init__(self, gateway: AwsGateway, db_path: Path, account_ref: int | None = None):
         self.gw = gateway
         self.db_path = db_path
+        self.account_ref = account_ref  # IPLens account record the snapshot belongs to
 
     def run(self) -> CollectResult:
         region = self.gw.region or ""
         started = datetime.now(UTC).isoformat(timespec="seconds")
         with closing(self.db_path) as conn:
             cur = conn.execute(
-                "INSERT INTO snapshots(taken_at, region, status) VALUES(?, ?, 'running')",
-                (started, region),
+                "INSERT INTO snapshots(taken_at, region, status, account_ref) "
+                "VALUES(?, ?, 'running', ?)",
+                (started, region, self.account_ref),
             )
             snap_id = int(cur.lastrowid or 0)
-        log.info("collection started snapshot=%s region=%s", snap_id, region)
+        log.info(
+            "collection started snapshot=%s account=%s region=%s", snap_id, self.account_ref, region
+        )
         try:
             result = self._collect(snap_id)
         except Exception as exc:

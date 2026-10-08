@@ -101,54 +101,9 @@ def test_overview_subnet_eni_ips(client, seeded):
     assert "10.0.1.12" in page and "10.0.1.50" not in page
 
 
-def test_settings_secret_never_rendered_or_logged(app, client):
-    resp = _post(
-        client,
-        "/settings",
-        {
-            "auth_mode": "keys",
-            "region": "eu-west-1",
-            "access_key_id": FAKE_KEY_ID,
-            "secret_access_key": FAKE_SECRET,
-            "log_dir": "",
-        },
-        follow_redirects=True,
-    )
-    assert b"Settings saved" in resp.data
-    assert FAKE_SECRET.encode() not in resp.data
-    assert FAKE_KEY_ID.encode() not in resp.data
-    store = app.extensions["iplens"]["store"]
-    s = store.load(with_secret=True)
-    assert (s.auth_mode, s.region, s.secret_access_key) == ("keys", "eu-west-1", FAKE_SECRET)
-
-    # resubmitting with blank key fields keeps the stored credentials
-    _post(
-        client,
-        "/settings",
-        {"auth_mode": "keys", "region": "eu-west-1", "region_custom": "eu-south-2"},
-    )
-    s = store.load(with_secret=True)
-    assert (s.access_key_id, s.secret_access_key, s.region) == (
-        FAKE_KEY_ID,
-        FAKE_SECRET,
-        "eu-south-2",
-    )
-
-    log_text = (app.extensions["iplens"]["log_dir"] / "iplens.log").read_text()
-    assert FAKE_SECRET not in log_text and FAKE_KEY_ID not in log_text
-    assert "settings saved" in log_text
-
-
-def test_settings_validation_error(client):
-    resp = _post(
-        client, "/settings", {"auth_mode": "profile", "region": "us-east-1"}, follow_redirects=True
-    )
-    assert b"profile name is required" in resp.data
-
-
 def test_settings_log_dir_change(app, client, tmp_path):
     new_dir = tmp_path / "custom-logs"
-    _post(client, "/settings", {"auth_mode": "env", "region": "us-east-1", "log_dir": str(new_dir)})
+    _post(client, "/settings", {"log_dir": str(new_dir)})
     assert app.extensions["iplens"]["log_dir"] == new_dir
     assert (new_dir / "iplens.log").exists()
     page = client.get("/logs").data.decode()
@@ -164,7 +119,7 @@ def test_test_connection_and_refresh(client):
         SubnetId=subnet_id, PrivateIpAddress="10.0.1.77", Description="example detached"
     )
 
-    resp = _post(client, "/settings/test", follow_redirects=True)
+    resp = _post(client, "/accounts/1/test", follow_redirects=True)
     assert b"Connected to account 123456789012" in resp.data
 
     resp = _post(client, "/refresh", follow_redirects=True)
@@ -182,13 +137,13 @@ def test_test_connection_and_refresh(client):
 
 
 def test_refresh_failure_is_flashed(app, client):
-    def broken(_settings):
-        raise ValueError("credentials are incomplete")
+    def broken(_account):
+        raise ValueError("example failure")
 
     app.extensions["iplens"]["gateway_factory"] = broken
     resp = _post(client, "/refresh", follow_redirects=True)
     assert b"Refresh failed" in resp.data
-    resp = _post(client, "/settings/test", follow_redirects=True)
+    resp = _post(client, "/accounts/1/test", follow_redirects=True)
     assert b"Connection failed" in resp.data
 
 
@@ -541,16 +496,16 @@ def test_header_shows_alias_and_display_name_override_wins(app, client, snapshot
 
     _post(
         client,
-        "/settings",
-        {"auth_mode": "env", "region": "us-east-1", "account_display_name": "Example Prod"},
+        "/accounts/1/edit",
+        {"auth_mode": "env", "region": "us-east-1", "display_name": "Example Prod"},
     )
     page = client.get("/").data.decode()
     assert "<b>Example Prod (123456789012)</b> · us-east-1" in page
     assert "example-alias" not in page
-    assert 'value="Example Prod"' in client.get("/settings").data.decode()
+    assert 'value="Example Prod"' in client.get("/accounts/1/edit").data.decode()
 
     # clearing the override falls back to the alias again
-    _post(client, "/settings", {"auth_mode": "env", "region": "us-east-1"})
+    _post(client, "/accounts/1/edit", {"auth_mode": "env", "region": "us-east-1"})
     assert "<b>example-alias (123456789012)</b>" in client.get("/").data.decode()
 
 

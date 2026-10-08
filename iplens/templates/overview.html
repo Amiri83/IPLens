@@ -12,8 +12,9 @@
 
 {% if not snap %}
   <div class="card">
-    No snapshot yet. Configure credentials in <a href="{{ url_for('settings_page') }}">Settings</a>,
-    then press <b>Refresh from AWS</b>. All AWS calls are read-only.
+    No snapshot yet{% if active_account %} for this account{% endif %}. Configure accounts in
+    <a href="{{ url_for('settings_page') }}">Settings</a>, then press <b>Refresh from AWS</b>.
+    All AWS calls are read-only.
   </div>
 {% else %}
   <div class="card" title="Snapshot #{{ snap.id }}">
@@ -66,11 +67,16 @@
 
 {% if history %}
   <h2>Recent snapshots</h2>
-  <table>
-    <thead><tr><th>Account</th><th>Region</th><th>Taken</th><th>Status</th><th>Notes</th></tr></thead>
+  <form method="post" action="{{ url_for('snapshots_delete') }}" id="history-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <table class="history">
+    <thead><tr><th><span class="sr-only">Select</span></th><th>Account</th><th>Region</th><th>Taken</th><th>Status</th><th>Notes</th></tr></thead>
     <tbody>
     {% for h in history %}
       <tr title="Snapshot #{{ h.id }}">
+        <td>{% if h.id in protected %}<span class="badge ok" title="The latest snapshot of an account is always kept">latest</span>
+          {% elif h.status == 'running' %}<span class="muted">–</span>
+          {% else %}<input type="checkbox" name="snapshot_id" value="{{ h.id }}" aria-label="Select snapshot">{% endif %}</td>
         <td>{% if h.account_id or h.account_alias %}{{ account_label(h) }}{% else %}<span class="muted">–</span>{% endif %}</td>
         <td class="mono">{{ h.region }}</td><td>{{ h.taken_at | localtime }}</td>
         <td><span class="badge {{ 'ok' if h.status == 'ok' else 'err' if h.status == 'failed' else '' }}">{{ h.status }}</span></td>
@@ -78,5 +84,23 @@
     {% endfor %}
     </tbody>
   </table>
+  <div class="card row history-actions">
+    <div><label for="confirm-delete">Type <span class="mono">{{ confirm_word }}</span> to confirm</label>
+      <input id="confirm-delete" name="confirm" size="10" autocomplete="off" spellcheck="false"></div>
+    <div><button type="submit" class="danger">Delete selected</button></div>
+  </div>
+  </form>
+  <form method="post" action="{{ url_for('snapshots_clear') }}" class="card row history-actions">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div><label for="clear-scope">Clear history</label>
+      <select id="clear-scope" name="scope">
+        <option value="account" selected>this account</option>
+        <option value="all">all accounts</option>
+      </select></div>
+    <div><label for="confirm-clear">Type <span class="mono">{{ confirm_word }}</span> to confirm</label>
+      <input id="confirm-clear" name="confirm" size="10" autocomplete="off" spellcheck="false"></div>
+    <div><button type="submit" class="danger">Clear history</button></div>
+    <div class="muted" style="flex: 1 1 100%">Deletes every snapshot except the latest successful one of each account.</div>
+  </form>
 {% endif %}
 {% endblock %}

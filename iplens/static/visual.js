@@ -18,11 +18,19 @@
   const container = document.getElementById("cy");
   if (!container || typeof cytoscape === "undefined") return;
   const status = document.getElementById("cy-status");
+  const note = document.getElementById("cy-note");
   const tip = document.getElementById("cy-tip");
   const layoutSelect = document.getElementById("layout");
   const edgeBoxes = Array.from(document.querySelectorAll('input[type="checkbox"][name="edges"]'));
   const iconBase = container.dataset.icons;
   const eniUrl = container.dataset.eniUrl;
+  const csrf = container.dataset.csrf;
+  const vpcId = container.dataset.vpc;
+  const showVpcBox = document.getElementById("show-vpc");
+  const showSubnetsBox = document.getElementById("show-subnets");
+  const SAVE_DELAY_MS = 400;
+  // Dragged positions for this account + VPC: {node id: {x, y}}.
+  let saved = JSON.parse(document.getElementById("visual-positions").textContent || "{}");
 
   // -- labels (names arrive pre-truncated as label_*; tooltips show the full text) ----
 
@@ -70,6 +78,7 @@
         label: resourceLabel(r),
         title: resourceTitle(r),
         icon: iconBase + r.icon,
+        iconFile: r.icon,
         eni: r.eni_id,
         ...extra,
       },
@@ -86,8 +95,10 @@
         label: `${vpc.label_name}\n${vpc.vpc_id} · ${vpc.label_cidrs}`,
         title: [vpc.name || vpc.vpc_id, vpc.vpc_id, ...vpc.cidrs].join("\n"),
         icon: iconBase + data.icons.vpc,
+        iconFile: data.icons.vpc,
       },
       classes: "vpc",
+      grabbable: false,  // dragging the whole VPC would only look like panning
     }];
     vpc.subnets.forEach((s, si) => {
       const sid = "subnet:" + s.subnet_id;
@@ -103,7 +114,7 @@
             data: {
               id: item.id, parent: sid, order: i, label: groupLabel(item, false),
               title: `${item.name}\n${item.ip_count} IPs`,
-              icon: iconBase + item.icon, raw: item,
+              icon: iconBase + item.icon, iconFile: item.icon, raw: item,
             },
             classes: "group",
           });
@@ -158,6 +169,7 @@
         group: "edges",
         data: {
           id: "edge:" + i,
+          etype: m.type,
           source: m.source,
           target: m.target,
           label: m.n > 1 ? `${m.label} ×${m.n}` : m.label,
@@ -277,6 +289,112 @@
     });
   }
 
+  // -- saved positions, borders and server state ----------------------------------------
+
+  function post(url, fields) {
+    const body = new URLSearchParams({ csrf_token: csrf, ...fields });
+    return fetch(url, { method: "POST", body: body, credentials: "same-origin" }).then((r) => {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+    });
+  }
+
+  function leaves(cy) {
+    return cy.nodes().filter((n) => !n.isParent() && !n.hasClass("hidden"));
+  }
+
+  function applySaved(cy) {
+    cy.batch(() => {
+      leaves(cy).forEach((n) => {
+        const p = saved[n.id()];
+        if (p) n.position({ x: p.x, y: p.y });
+      });
+    });
+  }
+
+  let saveTimer = null;
+  function savePositions(cy) {
+    // Merge, so members of a collapsed group keep their saved spot.
+    leaves(cy).forEach((n) => {
+      const p = n.position();
+      saved[n.id()] = { x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10 };
+    });
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      post(container.dataset.layoutUrl, { vpc: vpcId, positions: JSON.stringify(saved) })
+        .then(() => { note.textContent = "Layout saved for this account and VPC."; })
+        .catch((err) => { note.textContent = `Could not save the layout (${err.message}).`; });
+    }, SAVE_DELAY_MS);
+  }
+
+  function applyBorders(cy) {
+    cy.batch(() => {
+      cy.nodes(".vpc").toggleClass("noborder", !showVpcBox.checked);
+      cy.nodes(".subnet").toggleClass("noborder", !showSubnetsBox.checked);
+    });
+  }
+
+  function saveBorders() {
+    post(container.dataset.prefsUrl, {
+      show_vpc: showVpcBox.checked ? "1" : "0",
+      show_subnets: showSubnetsBox.checked ? "1" : "0",
+    }).catch((err) => { note.textContent = `Could not save the border setting (${err.message}).`; });
+  }
+
+  // -- export -------------------------------------------------------------------------
+
+  function nodeKind(n) {
+    if (n.hasClass("vpc")) return "vpc";
+    if (n.hasClass("subnet")) return "subnet";
+    return n.hasClass("group") ? "group" : "res";
+  }
+
+  // The diagram exactly as drawn: visible nodes with absolute boxes, visible edges.
+  function currentView(cy) {
+    const nodes = cy.nodes().filter((n) => n.visible()).map((n) => {
+      const bb = n.boundingBox({ includeLabels: false, includeOverlays: false });
+      return {
+        id: n.id(),
+        kind: nodeKind(n),
+        parent: n.parent().nonempty() ? n.parent().id() : null,
+        label: n.data("label") || "",
+        x: bb.x1, y: bb.y1, w: bb.w, h: bb.h,
+        icon: n.data("iconFile") || "",
+        idle: n.hasClass("idle"),
+      };
+    });
+    const edges = cy.edges().filter((e) => e.visible()).map((e) => ({
+      source: e.source().id(),
+      target: e.target().id(),
+      type: e.data("etype"),
+      label: e.data("label") || "",
+    }));
+    return {
+      vpc_id: vpcId,
+      show_vpc: showVpcBox.checked,
+      show_subnets: showSubnetsBox.checked,
+      nodes: nodes,
+      edges: edges,
+    };
+  }
+
+  // A hidden form POST: the attachment response downloads without leaving the page.
+  function download(url, view) {
+    const form = document.createElement("form");
+    form.method = "post";
+    form.action = url;
+    form.hidden = true;
+    [["csrf_token", csrf], ["view", JSON.stringify(view)]].forEach(([name, value]) => {
+      const input = document.createElement("input");
+      input.type = "hidden";
+      input.name = name;
+      input.value = value;
+      form.appendChild(input);
+    });
+    document.body.appendChild(form);
+    form.submit();
+    form.remove();
+  }
+
   function runLayout(cy, edges) {
     if (layoutSelect.value === "dagre" && typeof dagre !== "undefined") {
       try {
@@ -336,6 +454,11 @@
       "text-max-width": 300, "min-width": SUBNET_MIN_W,
     } },
     { selector: ".subnet.empty", style: { "width": SUBNET_MIN_W, "height": 50 } },
+    // Border toggles: the box disappears, its label stays.
+    { selector: ".vpc.noborder", style: {
+      "border-width": 0, "background-opacity": 0, "background-image-opacity": 0,
+    } },
+    { selector: ".subnet.noborder", style: { "border-width": 0, "background-opacity": 0 } },
     { selector: ".res, .group", style: {
       "shape": "round-rectangle", "width": 44, "height": 44,
       "background-color": "#ffffff", "background-image": "data(icon)",
@@ -405,17 +528,19 @@
       layout: { name: "preset" },
       minZoom: 0.05,
       maxZoom: 3,
-      autoungrabify: true,
       boxSelectionEnabled: false,
     });
+    applyBorders(cy);
     let focused = null;  // id of the node whose edges are highlighted
     const refreshEdges = () => {
       syncEdges(cy, edges);  // re-adds every edge, so the highlight is re-applied
       applyFocus(cy, focused);
     };
+    // Saved (dragged) positions always win over the automatic layout.
     const relayout = () => {
       refreshEdges();
       runLayout(cy, edges);
+      applySaved(cy);
     };
     relayout();
     cy.fit(undefined, 30);
@@ -466,7 +591,30 @@
     });
     layoutSelect.addEventListener("change", () => {
       runLayout(cy, edges);
+      applySaved(cy);
       cy.fit(undefined, 30);
+    });
+    cy.on("dragfree", "node", () => savePositions(cy));
+    cy.on("grab", "node", hideTip);
+    document.getElementById("reset-layout").addEventListener("click", () => {
+      post(container.dataset.resetUrl, { vpc: vpcId })
+        .then(() => {
+          saved = {};
+          runLayout(cy, edges);
+          cy.fit(undefined, 30);
+          note.textContent = "Layout reset.";
+        })
+        .catch((err) => { note.textContent = `Could not reset the layout (${err.message}).`; });
+    });
+    [showVpcBox, showSubnetsBox].forEach((box) => box.addEventListener("change", () => {
+      applyBorders(cy);
+      saveBorders();
+    }));
+    document.getElementById("export-svg").addEventListener("click", () => {
+      download(container.dataset.exportSvg, currentView(cy));
+    });
+    document.getElementById("export-drawio").addEventListener("click", () => {
+      download(container.dataset.exportDrawio, currentView(cy));
     });
     edgeBoxes.forEach((box) => box.addEventListener("change", () => {
       refreshEdges();

@@ -3,58 +3,59 @@
 {% block content %}
 <p><a href="{{ url_for('overview') }}" class="back-link">← Back</a></p>
 <h1>Settings</h1>
+
+<div class="row" style="justify-content: space-between">
+  <h2 style="margin-top: 0">Accounts</h2>
+  <a class="btn" href="{{ url_for('account_new') }}">Add account</a>
+</div>
+<p class="muted">Snapshots, the IP list, the Visual page and suggestions always show the
+  <b>active</b> account (selector in the top bar). Rules are shared and can be limited to one account.</p>
+<table class="accounts">
+  <thead><tr><th>Account</th><th>Region</th><th>Auth</th><th>Credentials</th><th></th></tr></thead>
+  <tbody>
+  {% for c in accounts %}
+    {% set a = c.account %}
+    <tr>
+      <td><b>{{ c.label }}</b>
+        {% if active_account and a.id == active_account.id %}<span class="badge ok">active</span>{% endif %}</td>
+      <td class="mono">{{ a.region }}</td>
+      <td>{{ a.mode_label }}{% if a.auth_mode == 'profile' %} <span class="mono">{{ a.profile }}</span>{% endif %}</td>
+      <td>
+        {% if a.auth_mode == 'env' %}<span class="muted">process environment</span>
+        {% elif a.auth_mode == 'profile' %}<span class="muted">~/.aws profile</span>
+        {% else %}
+          {% if a.access_key_id %}<span class="mono">{{ a.access_key_id }}</span>{% endif %}
+          {% if a.memory_only %}<span class="badge">memory only</span>{% else %}<span class="badge">encrypted</span>{% endif %}
+          {% if a.problem %}<span class="badge err">{{ a.problem }}</span>
+          {% elif a.auth_mode == 'temporary' %}<span class="badge warn">{{ a.status }}</span>{% endif %}
+        {% endif %}
+      </td>
+      <td style="white-space: nowrap">
+        <a class="btn secondary" href="{{ url_for('account_edit', account_id=a.id) }}">Edit</a>
+        <form class="inline" method="post" action="{{ url_for('account_test', account_id=a.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary">Test</button>
+        </form>
+        <form class="inline" method="post" action="{{ url_for('account_delete', account_id=a.id) }}"
+              onsubmit="return confirm('Delete this account and all of its snapshots?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="danger" type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">No accounts yet — <a href="{{ url_for('account_new') }}">add one</a>.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="muted small">Test calls sts:GetCallerIdentity and ec2:DescribeVpcs with the account's saved credentials.</p>
+
 <form class="card" method="post" action="{{ url_for('settings_save') }}" autocomplete="off">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <h2 style="margin-top: 0">AWS credentials</h2>
-  <label><input type="radio" name="auth_mode" value="env" {{ 'checked' if s.auth_mode == 'env' }} onchange="showAuth()">
-    Environment / default chain <span class="muted">(AWS_* env vars, SSO, instance role…)</span></label>
-  <label><input type="radio" name="auth_mode" value="profile" {{ 'checked' if s.auth_mode == 'profile' }} onchange="showAuth()">
-    Named profile <span class="muted">(~/.aws/config)</span></label>
-  <label><input type="radio" name="auth_mode" value="keys" {{ 'checked' if s.auth_mode == 'keys' }} onchange="showAuth()">
-    Access key + secret <span class="muted">(secret stored encrypted)</span></label>
-
-  <fieldset data-mode="profile">
-    <label for="profile">Profile name</label>
-    <input id="profile" name="profile" value="{{ s.profile }}" placeholder="example-readonly">
-  </fieldset>
-  <fieldset data-mode="keys">
-    <label for="access_key_id">Access key ID</label>
-    <input id="access_key_id" name="access_key_id" class="mono" size="30"
-           placeholder="{{ s.access_key_id or 'AKIA…' }}">
-    <span class="muted">{% if s.access_key_id %}stored: <span class="mono">{{ s.access_key_id }}</span> — leave blank to keep{% endif %}</span>
-    <label for="secret_access_key">Secret access key</label>
-    <input id="secret_access_key" name="secret_access_key" type="password" class="mono" size="50"
-           placeholder="{{ '•••••••• (stored, leave blank to keep)' if s.has_secret else '' }}">
-    {% if s.has_secret %}<label><input type="checkbox" name="clear_secret"> Remove stored key and secret</label>{% endif %}
-  </fieldset>
-
-  <h2>Region</h2>
-  <div class="row">
-    <div><select name="region">
-      {% for r in regions %}<option value="{{ r }}" {{ 'selected' if r == s.region }}>{{ r }}</option>{% endfor %}
-      {% if s.region not in regions %}<option value="{{ s.region }}" selected>{{ s.region }}</option>{% endif %}
-    </select></div>
-    <div><input name="region_custom" placeholder="or type a region code" size="20"></div>
-  </div>
-
-  <h2>Display</h2>
-  <label for="account_display_name">Account display name <span class="muted">(optional)</span></label>
-  <input id="account_display_name" name="account_display_name" value="{{ s.account_display_name }}"
-         size="40" maxlength="64" placeholder="e.g. example-prod">
-  <div class="muted">Shown in the header as <i>name (account id)</i>; overrides the IAM account
-    alias. Leave blank to use the alias, or just the account id if there is none.</div>
-
-  <h2>Logging</h2>
+  <h2 style="margin-top: 0">Logging</h2>
   <label for="log_dir">Log directory</label>
   <input id="log_dir" name="log_dir" value="{{ s.log_dir }}" size="60" class="mono" placeholder="{{ default_log_dir }}">
-
   <p><button type="submit">Save</button></p>
-</form>
-
-<form method="post" action="{{ url_for('settings_test') }}" class="card">
-  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <button type="submit" class="secondary">Test connection</button>
-  <span class="muted">Calls sts:GetCallerIdentity and ec2:DescribeVpcs with the saved settings.</span>
 </form>
 
 <div class="card muted">
@@ -65,13 +66,4 @@
   <span class="mono">elasticloadbalancing:DescribeTargetGroups, elasticloadbalancing:DescribeTargetHealth,
   ec2:DescribeSecurityGroups</span> (connections on the Visual page).
 </div>
-<script>
-function showAuth() {
-  const mode = document.querySelector('input[name=auth_mode]:checked').value;
-  document.querySelectorAll('fieldset[data-mode]').forEach(fs => {
-    fs.style.display = fs.dataset.mode === mode ? '' : 'none';
-  });
-}
-showAuth();
-</script>
 {% endblock %}

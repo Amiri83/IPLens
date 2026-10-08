@@ -18,6 +18,12 @@
   <label for="description">Description</label>
   <input id="description" name="description" value="{{ rule.description }}" size="80">
 
+  <label for="account_ref">Applies to</label>
+  <select id="account_ref" name="account_ref">
+    <option value="">All accounts</option>
+    {% for id, label in account_names.items() %}<option value="{{ id }}" {{ 'selected' if rule.account_ref == id }}>{{ label }}</option>{% endfor %}
+  </select>
+
   <label><input type="checkbox" name="enabled" {{ 'checked' if rule.enabled }}> Enabled</label>
 
   <fieldset data-kinds="min_free_pct">
