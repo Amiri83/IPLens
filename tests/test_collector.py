@@ -9,7 +9,7 @@ from moto import mock_aws
 
 from iplens import queries
 from iplens.aws import AwsGateway
-from iplens.collector import Collector, sg_ref_rows, target_ref
+from iplens.collector import Collector, sg_cidr_rows, sg_ref_rows, target_ref
 from iplens.db import closing
 
 REGION = "us-east-1"
@@ -460,6 +460,91 @@ def test_sg_refs_collected(aws_env, db_path):
     assert (web_sg, "ingress", alb_sg, "tcp/80") in refs
 
 
+def test_sg_cidr_rules_collected(aws_env, db_path):
+    ec2 = boto3.client("ec2", region_name=REGION)
+    vpce_sg = ec2.create_security_group(
+        GroupName="example-vpce-sg", Description="example", VpcId=aws_env["vpc_id"]
+    )["GroupId"]
+    ec2.authorize_security_group_ingress(
+        GroupId=vpce_sg,
+        IpPermissions=[
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 443,
+                "ToPort": 443,
+                "IpRanges": [{"CidrIp": "10.0.1.0/24"}, {"CidrIp": "10.0.2.0/24"}],
+            },
+            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "10.0.3.0/24"}]},
+        ],
+    )
+    result = Collector(_gateway(), db_path).run()
+    assert result.warnings == []
+    with closing(db_path) as conn:
+        rules = {
+            tuple(r)
+            for r in conn.execute(
+                "SELECT cidr, ip_protocol, from_port, to_port FROM sg_cidr_rules "
+                "WHERE snapshot_id=? AND group_id=?",
+                (result.snapshot_id, vpce_sg),
+            )
+        }
+    assert rules == {
+        ("10.0.1.0/24", "tcp", 443, 443),
+        ("10.0.2.0/24", "tcp", 443, 443),
+        ("10.0.3.0/24", "-1", None, None),
+    }
+
+
+def test_endpoint_reach_from_collected_rules(aws_env, db_path):
+    """End to end: endpoint SG ingress collected from EC2 -> reach edges on the Visual page."""
+    ec2 = boto3.client("ec2", region_name=REGION)
+
+    def sg(name: str) -> str:
+        return ec2.create_security_group(
+            GroupName=name, Description="example", VpcId=aws_env["vpc_id"]
+        )["GroupId"]
+
+    def eni(subnet: str, ip: str, group: str, description: str = "example") -> str:
+        return ec2.create_network_interface(
+            SubnetId=subnet, PrivateIpAddress=ip, Groups=[group], Description=description
+        )["NetworkInterface"]["NetworkInterfaceId"]
+
+    app_sg, ssh_sg, other_sg, vpce_sg = (
+        sg(n) for n in ("example-app", "example-ssh", "example-other", "example-vpce")
+    )
+    app = eni(aws_env["sa"], "10.0.1.60", app_sg)  # allowed by SG
+    by_cidr = eni(aws_env["sb"], "10.0.2.60", other_sg)  # allowed by CIDR
+    ssh_only = eni(aws_env["sa"], "10.0.1.70", ssh_sg)  # allowed on tcp/22 only
+    vpce = eni(aws_env["sa"], "10.0.1.80", vpce_sg, "VPC Endpoint Interface vpce-0example0001")
+    ec2.authorize_security_group_ingress(
+        GroupId=vpce_sg,
+        IpPermissions=[
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 443,
+                "ToPort": 443,
+                "UserIdGroupPairs": [{"GroupId": app_sg}],
+                "IpRanges": [{"CidrIp": "10.0.2.48/28"}],
+            },
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 22,
+                "ToPort": 22,
+                "UserIdGroupPairs": [{"GroupId": ssh_sg}],
+                "IpRanges": [{"CidrIp": "10.0.1.64/28"}],
+            },
+        ],
+    )
+    result = Collector(_gateway(), db_path).run()
+    with closing(db_path) as conn:
+        data = queries.visual_data(conn, result.snapshot_id, aws_env["vpc_id"])
+    reach = {(e["source"], e["target"]) for e in data["edges"] if e["type"] == "reach"}
+    assert (app, vpce) in reach
+    assert (by_cidr, vpce) in reach
+    assert (ssh_only, vpce) not in reach
+    assert {target for _, target in reach} == {vpce}
+
+
 def test_lb_target_permission_denied_is_a_warning(aws_env, db_path, monkeypatch):
     _alb_target_groups(aws_env)
     gw = _gateway()
@@ -533,6 +618,32 @@ def test_sg_ref_rows():
         ("sg-0000web", "egress", "sg-000vpce", "all"),
         ("sg-0000web", "egress", "sg-000vpce", "icmp"),
         ("sg-0000web", "ingress", "sg-0000alb", "tcp/8000-8100"),
+    ]
+
+
+def test_sg_cidr_rows():
+    groups = [
+        {
+            "GroupId": "sg-000vpce",
+            "IpPermissions": [
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 443,
+                    "ToPort": 443,
+                    "IpRanges": [{"CidrIp": "10.0.0.0/16"}, {"CidrIp": "10.0.1.0/24"}],
+                    "UserIdGroupPairs": [{"GroupId": "sg-0000web"}],
+                },
+                {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "10.0.2.0/24"}]},
+                {"IpProtocol": "icmp", "FromPort": -1, "ToPort": -1, "IpRanges": [{}]},
+            ],
+            # egress CIDR rules are not stored
+            "IpPermissionsEgress": [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}],
+        }
+    ]
+    assert sg_cidr_rows(groups) == [
+        ("sg-000vpce", "10.0.0.0/16", "tcp", 443, 443),
+        ("sg-000vpce", "10.0.1.0/24", "tcp", 443, 443),
+        ("sg-000vpce", "10.0.2.0/24", "-1", None, None),
     ]
 
 

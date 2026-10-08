@@ -127,6 +127,23 @@ def sg_ref_rows(groups: Iterable[dict[str, Any]]) -> list[tuple[str, str, str, s
     return sorted(out)
 
 
+def sg_cidr_rows(
+    groups: Iterable[dict[str, Any]],
+) -> list[tuple[str, str, str, int | None, int | None]]:
+    """``(group_id, cidr, ip_protocol, from_port, to_port)`` for every IPv4 CIDR ingress rule."""
+    out: set[tuple[str, str, str, int | None, int | None]] = set()
+    for g in groups:
+        for perm in g.get("IpPermissions", []):
+            proto = str(perm.get("IpProtocol", "-1"))
+            lo, hi = perm.get("FromPort"), perm.get("ToPort")
+            if lo == -1:
+                lo = hi = None
+            for rng in perm.get("IpRanges", []):
+                if rng.get("CidrIp"):
+                    out.add((g["GroupId"], rng["CidrIp"], proto, lo, hi))
+    return sorted(out, key=lambda r: (r[0], r[1], r[2], r[3] or 0, r[4] or 0))
+
+
 def _ecs_service_row(cluster: str, svc: dict[str, Any]) -> dict[str, Any]:
     stamps = [
         d.get("updatedAt") or d.get("createdAt")
@@ -436,6 +453,12 @@ class Collector:
                 conn.execute(
                     "INSERT OR IGNORE INTO sg_refs(snapshot_id, group_id, direction, "
                     "ref_group_id, ports) VALUES(?,?,?,?,?)",
+                    (snap_id, *row),
+                )
+            for row in sg_cidr_rows(security_groups):
+                conn.execute(
+                    "INSERT OR IGNORE INTO sg_cidr_rules(snapshot_id, group_id, cidr, "
+                    "ip_protocol, from_port, to_port) VALUES(?,?,?,?,?,?)",
                     (snap_id, *row),
                 )
             conn.execute(

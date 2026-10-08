@@ -115,6 +115,7 @@ label.edge-filter { display: inline-flex; align-items: center; gap: .35rem; marg
 .edge-swatch { display: inline-block; width: 26px; height: 0; border-top: 2px solid; }
 .edge-swatch.edge-targets { border-color: #2457c5; }
 .edge-swatch.edge-ecs_lb { border-color: #2f8f4e; }
+.edge-swatch.edge-reach { border-top: 2px dashed #b0469b; }
 .edge-swatch.edge-sg { border-top: 2px dashed #8a94a3; }
 
 .log-ERROR td, .log-CRITICAL td { background: #fdf0ee; }

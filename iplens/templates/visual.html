@@ -34,9 +34,11 @@
     {% endfor %}
   </fieldset>
   <div class="muted" style="flex: 1 1 100%">
-    Scroll to zoom, drag to pan, hover for full names. Click a resource to open its ENI; click a
-    group (more than 10 resources of one type in a subnet) to expand or collapse it. Solid lines are
-    load balancer targets and ECS services; dashed lines are security group references.
+    Scroll to zoom, drag to pan, hover for full names. Click a resource to highlight its
+    connections (click the background to clear); double-click it to open its ENI. Click a group
+    (more than 10 resources of one type in a subnet) to expand or collapse it. Solid lines are
+    load balancer targets and ECS services; dashed lines are security group based: endpoint reach
+    (the endpoint's security group allows tcp/443 from the resource) and SG references.
   </div>
 </form>
 <div class="cy-wrap">

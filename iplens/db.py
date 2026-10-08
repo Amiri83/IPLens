@@ -157,6 +157,17 @@ CREATE TABLE IF NOT EXISTS sg_refs (
     PRIMARY KEY (snapshot_id, group_id, direction, ref_group_id, ports)
 );
 
+-- Security group ingress rules that allow an IPv4 CIDR (IpRanges).
+CREATE TABLE IF NOT EXISTS sg_cidr_rules (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    group_id    TEXT NOT NULL,
+    cidr        TEXT NOT NULL,
+    ip_protocol TEXT NOT NULL,     -- "tcp", "udp", "icmp", "-1" (all), ...
+    from_port   INTEGER,           -- NULL when the rule has no port range
+    to_port     INTEGER,
+    PRIMARY KEY (snapshot_id, group_id, cidr, ip_protocol, from_port, to_port)
+);
+
 CREATE TABLE IF NOT EXISTS rules (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL UNIQUE,

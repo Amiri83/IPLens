@@ -217,7 +217,7 @@
          enforces the minimum box width;
        - item i -> item i+COLS wraps a subnet's resources into rows of COLS;
        - subnet k-SUBNETS_PER_ROW -> subnet k wraps subnets into rows.
-     SG edges are left out: they are numerous and often cyclic. */
+     SG and reach edges are left out: they are numerous and often cyclic. */
   function dagreLayout(cy, edges) {
     const g = new dagre.graphlib.Graph({ compound: true, multigraph: true });
     g.setGraph({ rankdir: "TB", nodesep: 30, ranksep: 40, marginx: 20, marginy: 20 });
@@ -290,6 +290,23 @@
     gridLayout(cy);
   }
 
+  // -- focus (single click): highlight one node's edges, dim the rest ------------------
+
+  // Only leaves are dimmed: opacity on a subnet/VPC box would also fade its children.
+  function applyFocus(cy, nodeId) {
+    cy.batch(() => {
+      cy.elements(".dim, .focus").removeClass("dim focus");
+      const node = nodeId ? cy.getElementById(nodeId) : cy.collection();
+      if (node.empty() || node.hasClass("hidden")) return;
+      const edges = node.connectedEdges();
+      const lit = node.union(edges.connectedNodes());
+      cy.nodes(".res, .group").difference(lit).addClass("dim");
+      cy.edges().difference(edges).addClass("dim");
+      node.addClass("focus");
+      edges.addClass("focus");
+    });
+  }
+
   function toggleGroup(cy, group, expand) {
     const members = cy.nodes(".member").filter((n) => n.data("memberOf") === group.id());
     const expanded = expand === undefined ? members.hasClass("hidden") : expand;
@@ -345,7 +362,16 @@
       "target-arrow-color": "#8a94a3", "target-arrow-shape": "vee", "opacity": 0.85,
       "color": "#535e6b",
     } },
-    { selector: "edge:selected, edge.hover", style: { "width": 3, "opacity": 1, "z-index": 10 } },
+    { selector: "edge.edge-reach", style: {
+      "line-style": "dashed", "line-dash-pattern": [3, 3], "width": 1.6, "line-color": "#b0469b",
+      "target-arrow-color": "#b0469b", "target-arrow-shape": "vee", "color": "#7a2f6b",
+    } },
+    { selector: "node.dim", style: { "opacity": 0.2 } },
+    { selector: "edge.dim", style: { "opacity": 0.08, "text-opacity": 0 } },
+    { selector: "node.focus", style: { "overlay-color": "#2457c5", "overlay-opacity": 0.12 } },
+    { selector: "edge:selected, edge.hover, edge.focus", style: {
+      "width": 3, "opacity": 1, "z-index": 10,
+    } },
   ];
 
   // -- tooltip ------------------------------------------------------------------------
@@ -382,19 +408,35 @@
       autoungrabify: true,
       boxSelectionEnabled: false,
     });
+    let focused = null;  // id of the node whose edges are highlighted
+    const refreshEdges = () => {
+      syncEdges(cy, edges);  // re-adds every edge, so the highlight is re-applied
+      applyFocus(cy, focused);
+    };
     const relayout = () => {
-      syncEdges(cy, edges);
+      refreshEdges();
       runLayout(cy, edges);
     };
     relayout();
     cy.fit(undefined, 30);
 
-    cy.on("tap", "node.res", (evt) => {
+    // "onetap" fires only after the double-click window (multiClickDebounceTime) has
+    // passed without a second tap, so a double-click never also toggles the highlight.
+    cy.on("onetap", "node.res", (evt) => {
+      focused = focused === evt.target.id() ? null : evt.target.id();
+      applyFocus(cy, focused);
+    });
+    cy.on("dbltap", "node.res", (evt) => {
       window.location.href = eniUrl.replace("__ENI__", encodeURIComponent(evt.target.data("eni")));
     });
-    cy.on("tap", "node.group", (evt) => {
+    cy.on("onetap", "node.group", (evt) => {
       toggleGroup(cy, evt.target);
       relayout();
+    });
+    cy.on("onetap", (evt) => {
+      if (evt.target !== cy || !focused) return;
+      focused = null;
+      applyFocus(cy, null);
     });
     cy.on("mouseover", "node.res, node.group", () => { container.style.cursor = "pointer"; });
     cy.on("mouseout", "node", () => { container.style.cursor = ""; });
@@ -427,7 +469,7 @@
       cy.fit(undefined, 30);
     });
     edgeBoxes.forEach((box) => box.addEventListener("change", () => {
-      syncEdges(cy, edges);
+      refreshEdges();
       rememberEdgeFilter();
     }));
 
@@ -436,9 +478,10 @@
       if (el) el.textContent = `(${t.count})`;
     });
     const nRes = data.vpc.subnets.reduce((a, s) => a + s.resource_count, 0);
+    const cut = (data.edge_types || []).filter((t) => t.truncated).map((t) => t.label);
     status.textContent = `${data.vpc.subnets.length} subnet(s) · ${nRes} resource ENI(s) · ` +
       `${edges.length} connection(s) · snapshot #${data.snapshot_id}` +
-      (data.edges_truncated ? " · SG references truncated" : "");
+      (cut.length ? ` · truncated: ${cut.join(", ")}` : "");
   }
 
   fetch(container.dataset.src, { credentials: "same-origin" })

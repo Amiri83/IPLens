@@ -262,6 +262,29 @@ class SnapshotBuilder:
             )
         return self
 
+    def sg_cidr(
+        self,
+        group_id: str,
+        cidr: str,
+        ip_protocol: str = "tcp",
+        from_port: int | None = 443,
+        to_port: int | None = None,
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO sg_cidr_rules(snapshot_id, group_id, cidr, ip_protocol, from_port, "
+                "to_port) VALUES(?,?,?,?,?,?)",
+                (
+                    self.id,
+                    group_id,
+                    cidr,
+                    ip_protocol,
+                    from_port,
+                    from_port if to_port is None else to_port,
+                ),
+            )
+        return self
+
 
 @pytest.fixture
 def snapshot_builder():
