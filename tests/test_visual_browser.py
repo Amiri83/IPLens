@@ -1,8 +1,10 @@
 """Extended view in a real browser (Playwright + Chromium): changing the layout lays the
-diagram out afresh, Fit shows every visible node, and no layout raises. Skipped when
-Playwright or its Chromium is not installed (``pip install playwright`` and
-``python -m playwright install chromium``; or point ``IPLENS_CHROMIUM`` at a Chromium /
-Chrome for Testing executable). Placeholders only: 10.0.x.x, 123456789012, example names."""
+diagram out afresh, Fit shows every visible node, and no layout raises. Playwright is part of
+the ``dev`` extras; its Chromium comes from ``python -m playwright install chromium``, from
+``IPLENS_CHROMIUM`` (a Chromium / Chrome for Testing executable) or from
+``/opt/pw-browsers/chromium``. Without a browser the test is skipped, unless
+``IPLENS_REQUIRE_BROWSER=1`` (CI / QA) turns that into a failure so it never skips silently.
+Placeholders only: 10.0.x.x, 123456789012, example names."""
 
 from __future__ import annotations
 
@@ -11,13 +13,26 @@ import socket
 import threading
 
 import pytest
+from werkzeug import serving
 
 from iplens import viewstate
 from iplens.db import closing
 from iplens.web import create_app
 
-sync_api = pytest.importorskip("playwright.sync_api")
-serving = pytest.importorskip("werkzeug.serving")
+REQUIRED = os.environ.get("IPLENS_REQUIRE_BROWSER", "") not in ("", "0")
+FALLBACK_CHROMIUM = "/opt/pw-browsers/chromium"
+
+
+def _unavailable(reason: str):
+    if REQUIRED:
+        pytest.fail(f"IPLENS_REQUIRE_BROWSER is set but {reason}", pytrace=False)
+    pytest.skip(reason, allow_module_level=True)
+
+
+try:
+    from playwright import sync_api
+except ImportError:
+    _unavailable('Playwright is not installed (pip install -e ".[dev]")')
 
 VPC = "vpc-0example0000001"
 SUBNETS = ("subnet-0000000a", "subnet-0000000b", "subnet-0000000c")
@@ -32,9 +47,19 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+def _chromium() -> str | None:
+    """IPLENS_CHROMIUM, else the system-wide fallback, else Playwright's own download."""
+    exe = os.environ.get("IPLENS_CHROMIUM")
+    if exe:
+        return exe
+    if os.path.isfile(FALLBACK_CHROMIUM) and os.access(FALLBACK_CHROMIUM, os.X_OK):
+        return FALLBACK_CHROMIUM
+    return None
+
+
 @pytest.fixture(scope="module")
 def browser():
-    exe = os.environ.get("IPLENS_CHROMIUM") or None
+    exe = _chromium()
     with sync_api.sync_playwright() as pw:
         try:
             # A small /dev/shm (containers) crashes the renderer otherwise.
@@ -42,7 +67,7 @@ def browser():
                 executable_path=exe, headless=True, args=["--disable-dev-shm-usage"]
             )
         except Exception as exc:  # no browser downloaded / not runnable here
-            pytest.skip(f"Chromium is not available: {exc}")
+            _unavailable(f"Chromium is not available: {exc}")
         yield b
         b.close()
 

@@ -1,15 +1,62 @@
 # IPLens
 Local web app for private IPv4 usage visibility &amp; optimization across one or more AWS accounts
 
-## Quick start
+## Install
+
+Requires Python 3.11+. The PyPI distribution is `aws-iplens`; the command it installs is `iplens`.
+
+```bash
+pipx install aws-iplens        # or: python3 -m pip install aws-iplens
+iplens --version
+```
+
+From a checkout (development):
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-.venv/bin/iplens            # http://127.0.0.1:8077
 ```
 
-Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (default `~/.iplens`).
+## Run
+
+```bash
+iplens                         # http://127.0.0.1:8077
+iplens --port 8080             # another port
+iplens --home /path/to/data    # another data directory (default: $IPLENS_HOME or ~/.iplens)
+```
+
+Open the printed URL in a browser. AWS credentials are configured per account in the UI
+(Settings → Accounts); see below.
+
+## Data location
+
+Everything lives in one directory: `--home`, else `$IPLENS_HOME`, else `~/.iplens` (created with
+mode `0700`). Delete it to reset IPLens completely.
+
+| path | contents |
+|---|---|
+| `iplens.db` | SQLite: accounts, snapshots, crawled services, rules, settings, view preferences |
+| `secret.key` | Fernet key that encrypts stored AWS secrets (mode `0600`) |
+| `flask.secret` | session signing key |
+| `logs/` | application log (the log directory can be changed in Settings) |
+| `tf-cache/` | Terraform working data of repo syncs (only when Terraform sync is used) |
+
+## Security
+
+- **Local only.** The server binds to `127.0.0.1` by default and rejects requests whose `Host`
+  header is not a local name (DNS-rebinding protection). Do not expose it with `--host 0.0.0.0`
+  on a shared network: it has no login.
+- **Read-only AWS access.** Every AWS call goes through an allowlist guard (see
+  [Read-only by construction](#read-only-by-construction)); IPLens never changes your account.
+- **Secrets.** Access keys and session tokens are Fernet-encrypted in SQLite (or kept in memory
+  only), never logged and never rendered back. Environment variable values, policy documents and
+  secret values seen while crawling are matched in memory and never stored.
+- **Web.** Every form POST needs a per-session CSRF token; session cookies are `HttpOnly` and
+  `SameSite=Strict`. All front-end assets are vendored: the browser makes no external requests.
+- **Releases** are published from GitHub Actions with PyPI Trusted Publishing (OIDC); no API
+  token is stored in the repository.
+
+## Using IPLens
 
 1. **Settings → Accounts** – add one entry per AWS account (display name, region, auth mode) and
    use **Test**. Auth modes: environment/default chain, named profile (dropdown of
@@ -156,11 +203,24 @@ rules:
 ## Development
 
 ```bash
+.venv/bin/python -m playwright install chromium   # once, for the browser test
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/python -m build                         # sdist + wheel into dist/
 ```
 
 AWS is mocked with moto in tests; fixtures use placeholder data only.
+`tests/test_visual_browser.py` drives the Visual page in headless Chromium (Playwright's own
+download, `$IPLENS_CHROMIUM`, or `/opt/pw-browsers/chromium`). Locally it is skipped when no
+browser is available; with `IPLENS_REQUIRE_BROWSER=1` (set in CI) that is a failure instead.
+
+### Releasing
+
+The version lives only in `pyproject.toml` (`iplens --version` reads the installed package
+metadata). Bump it, merge, then push a matching tag, e.g. `v1.0.0`:
+`.github/workflows/publish.yml` checks that the tag equals the version, runs the tests, builds and
+publishes to PyPI via Trusted Publishing (environment `pypi`).
 
 ## Vendored front-end assets
 

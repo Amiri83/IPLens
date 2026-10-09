@@ -79,6 +79,16 @@ def test_pages_render_without_snapshot(client):
     assert "viewing <b>Account 1</b> · no data yet" in page
 
 
+def test_favicon_linked_and_served(client):
+    page = client.get("/").data.decode()
+    assert '<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">' in page
+    resp = client.get("/static/favicon.svg")
+    assert resp.status_code == 200
+    assert resp.mimetype == "image/svg+xml"
+    assert b"<svg" in resp.data and b"href" not in resp.data  # self-contained, no external refs
+    resp.close()
+
+
 def test_post_requires_csrf(client):
     assert client.post("/refresh").status_code == 400
     assert client.post("/settings", data={"csrf_token": "wrong"}).status_code == 400
