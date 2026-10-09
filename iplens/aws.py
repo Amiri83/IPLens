@@ -4,8 +4,10 @@ Every client created through :class:`AwsGateway` has a botocore ``before-call``
 hook that rejects any API operation whose name does not start with
 ``Describe``, ``List`` or ``Get``, except for the explicit read-only
 :data:`READ_ONLY_ALLOWLIST` (CloudWatch Logs queries used by the opt-in flow log
-analysis, and ``sts:AssumeRole`` for the role an S3 Terraform backend names: its
-session is only used to read the state object). IPLens never mutates AWS.
+analysis, ``sts:AssumeRole`` for the role an S3 Terraform backend names: its
+session is only used to read the state object, and the ownership sources
+``tag:GetResources``, ``cloudformation:ListStacks`` / ``ListStackResources`` and
+``cloudtrail:LookupEvents``). IPLens never mutates AWS.
 """
 
 from __future__ import annotations
@@ -35,6 +37,13 @@ READ_ONLY_ALLOWLIST = frozenset(
         # Terraform S3 backends with a role_arn: the temporary session only reads the
         # state object (s3:ListObjectsV2 / s3:GetObject) and is never stored.
         ("sts", "AssumeRole"),
+        # AWS-first ownership (iplens.ownership). The first three already carry a read-only
+        # prefix; they are listed so that the ownership sources stay explicit here.
+        ("resourcegroupstaggingapi", "GetResources"),
+        ("cloudformation", "ListStacks"),
+        ("cloudformation", "ListStackResources"),
+        # Opt-in: the creator of a still unowned resource (management events, read-only).
+        ("cloudtrail", "LookupEvents"),
     }
 )
 

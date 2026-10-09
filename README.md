@@ -75,9 +75,26 @@ Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (defau
    *Kafka: <cluster or bootstrap host>* nodes. Crawled nodes linked to nothing in the VPC shown are
    listed in the **Not linked** side panel (click one to draw it, or **Show all crawled nodes**).
    Icons and labels are larger in the Extended view, and Fit never zooms out below a readable size.
-5. Define **Rules** (GUI or YAML import/export) and review **Suggestions**; anything a rule forbids is
+5. **Ownership** – who manages each resource, AWS-first; the first match wins:
+   **CloudFormation** stack (`cloudformation:ListStacks` / `ListStackResources`) > **IaC tag** (the
+   project / repo tag key) > **Terraform** state (optional enrichment, **off by default**) >
+   **CloudTrail** creator (opt-in `cloudtrail:LookupEvents` for resources still unowned: a role /
+   user matching a *CI role name pattern* → "IaC (unknown repo)", anyone else → "manual") >
+   **unmanaged**. Tags of every resource come from `tag:GetResources` (paginated). The source and
+   value are shown in the IP List (column and filter), on ENI pages and in the Visual page's
+   **Group by owner / team**. The Ownership page (formerly the Terraform / drift page) counts
+   resources per source and lists the unmanaged ones and **tag gaps** (resources missing the
+   configured environment / project tag); Terraform sync, drift and "managed elsewhere" markers are
+   kept in its collapsed, optional Terraform section. **Settings → Ownership** picks the project /
+   repo, environment, team and owner tag keys from dropdowns of the tag keys seen in the account,
+   the CI role patterns, and the two optional sources. Only the values of those tag keys are stored
+   (other tags by key only); CloudTrail keeps the creating role / user *name*, never its ARN or
+   session name. **CloudTrail event history only covers the last 90 days**: older resources stay
+   unmanaged; at most 50 unowned resources are looked up per Refresh. With the Terraform
+   enrichment off, Refresh no longer re-syncs Terraform repos (the Sync buttons still work).
+6. Define **Rules** (GUI or YAML import/export) and review **Suggestions**; anything a rule forbids is
    greyed out together with the IPs it would have saved.
-6. **Logs** shows the application log file.
+7. **Logs** shows the application log file.
 
 ## Read-only by construction
 
@@ -98,6 +115,9 @@ shows the account id only, or the *Account display name* set in Settings).
 `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth` and
 `ec2:DescribeSecurityGroups` add load balancer → target and security group reference
 connections to the Visual page; without them those connections are left out.
+Ownership: `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources`
+and, when enabled in Settings, `cloudtrail:LookupEvents` (all read-only and listed explicitly in
+the guard's allowlist); a missing permission becomes a Refresh warning and that source is skipped.
 
 Extended view (each source optional; a missing permission or disabled feature becomes a crawl
 warning): `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:ListTables`,

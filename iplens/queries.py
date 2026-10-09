@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import environment, terraform
+from . import environment, ownership, terraform
 from .scope import UNSCOPED, ResolvedScope
 from .visual import EDGE_TYPES, visual_edges
 
@@ -322,7 +322,12 @@ def _eni_dict(row: sqlite3.Row) -> dict[str, Any]:
     return d
 
 
-def eni_detail(conn: sqlite3.Connection, snap_id: int, eni_id: str) -> dict[str, Any] | None:
+def eni_detail(
+    conn: sqlite3.Connection,
+    snap_id: int,
+    eni_id: str,
+    own: ownership.OwnershipConfig | None = None,
+) -> dict[str, Any] | None:
     row = conn.execute(
         "SELECT * FROM enis WHERE snapshot_id=? AND eni_id=?", (snap_id, eni_id)
     ).fetchone()
@@ -341,6 +346,7 @@ def eni_detail(conn: sqlite3.Connection, snap_id: int, eni_id: str) -> dict[str,
     names = sg_names(conn, snap_id)
     d["tags"] = resource_tags(tag_index(conn, snap_id), d)
     d["tf"] = terraform.ownership(tf_index, terraform.resource_keys(d))
+    _add_ownership(d, ownership.load_index(conn, snap_id, own, tf_index))
     d["subnet_tf"] = terraform.ownership(tf_index, [("subnet", d["subnet_id"] or "")])
     d["sg_details"] = [
         {
@@ -369,9 +375,18 @@ class IpFilter:
     tag_value: str = ""  # ...with this value (any value when empty)
     tf: str = ""  # TF_MANAGED | TF_UNMANAGED | a Terraform root name
     env: str = ""  # an environment, or environment.FILTER_NOT_SET
+    own: str = ""  # an ownership source, or ownership.FILTER_UNMANAGED
 
 
 TF_MANAGED, TF_UNMANAGED = "managed", "unmanaged"
+
+
+def _add_ownership(row: dict[str, Any], idx: ownership.OwnershipIndex) -> None:
+    """``owner`` (source / value, see :mod:`iplens.ownership`) and ``own_labels`` (the
+    configured project / environment / team / owner tag values) of an ENI row."""
+    keys = terraform.resource_keys(row)
+    row["owner"] = idx.resolve(keys, row.get("tags")).as_dict()
+    row["own_labels"] = idx.labels(keys, row.get("tags"))
 
 
 # -- resource context: tags, security group names, Terraform ownership ---------------
@@ -445,6 +460,8 @@ def tf_label(m: dict[str, str]) -> str:
 
 def _row_matches(row: dict[str, Any], flt: IpFilter) -> bool:
     if not environment.matches(row["environment"], flt.env):
+        return False
+    if not ownership.matches(row["owner"], flt.own):
         return False
     if flt.tag_key:
         if flt.tag_key not in row["tags"]:
@@ -554,6 +571,7 @@ def ip_list(
     flt: IpFilter | None = None,
     scope: ResolvedScope = UNSCOPED,
     env_keys: Sequence[str] = environment.DEFAULT_TAG_KEYS,
+    own: ownership.OwnershipConfig | None = None,
 ) -> list[dict[str, Any]]:
     """Every private IP of a snapshot in ``scope`` matching ``flt``, ordered by address.
 
@@ -562,7 +580,7 @@ def ip_list(
     ENI's ``security_groups`` (ids), the resource's ``tags``, ``tf`` (Terraform
     roots/addresses managing the ENI or its owning resource; empty = unmanaged) and
     its ``environment`` / ``env_source`` (:mod:`iplens.environment`, tag keys
-    ``env_keys``).
+    ``env_keys``), plus ``owner`` / ``own_labels`` (:mod:`iplens.ownership`, ``own``).
     """
     flt = flt or IpFilter()
     where = ["i.snapshot_id = ?"]
@@ -597,6 +615,7 @@ def ip_list(
     tags = tag_index(conn, snap_id)
     tf_index = terraform.load_index(conn)
     envs = environment.EnvResolver(conn, snap_id, env_keys, tags=tags, tf_index=tf_index)
+    owners = ownership.load_index(conn, snap_id, own, tf_index)
     for r in rows:
         r["owner_names"] = owner_names(r)
         r["resource_name"] = resource_name(r)
@@ -604,6 +623,7 @@ def ip_list(
         r["tags"] = resource_tags(tags, r)
         r["tf"] = terraform.ownership(tf_index, terraform.resource_keys(r))
         r["environment"], r["env_source"] = envs.for_row(r)
+        _add_ownership(r, owners)
     return [r for r in rows if _row_matches(r, flt)]
 
 
@@ -687,6 +707,8 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
                 "tf": r["tf"],
                 "environment": r["environment"],
                 "env_source": r["env_source"],
+                "owner": r["owner"],
+                "team": r["own_labels"]["team"],
                 "status": r["status"] or "",
                 "icon": _icon_for(r),
                 "ips": [],
@@ -751,6 +773,7 @@ def visual_data(
     edge_types: tuple[str, ...] = EDGE_TYPES,
     scope: ResolvedScope = UNSCOPED,
     env_keys: Sequence[str] = environment.DEFAULT_TAG_KEYS,
+    own: ownership.OwnershipConfig | None = None,
 ) -> dict[str, Any] | None:
     """Nested VPC -> subnets -> resource nodes, plus resource edges, for the Visual page.
 
@@ -768,7 +791,7 @@ def visual_data(
 
     by_subnet: dict[str, list[dict[str, Any]]] = {}
     by_ip: dict[str, str] = {}
-    for r in ip_list(conn, snap_id, IpFilter(vpc=vpc.vpc_id), scope, env_keys):
+    for r in ip_list(conn, snap_id, IpFilter(vpc=vpc.vpc_id), scope, env_keys, own):
         by_subnet.setdefault(r["subnet_id"], []).append(r)
         by_ip[r["ip"]] = r["eni_id"]
 

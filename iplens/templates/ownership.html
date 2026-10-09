@@ -1,11 +1,93 @@
 {% extends "base.html" %}
-{% block title %}Terraform{% endblock %}
+{% from "_macros.html" import no_data with context %}
+{% block title %}Ownership{% endblock %}
 {% block content %}
+<h1>Ownership</h1>
+<p class="muted">Who manages each resource of the active account, first match wins:
+  <b>CloudFormation</b> stack &gt; <b>IaC tag</b>
+  (<span class="mono">{{ own.project_key or 'no project / repo tag key set' }}</span>) &gt;
+  <b>Terraform</b> state ({{ 'enabled' if own.tf_enabled else 'optional, off' }}) &gt;
+  <b>CloudTrail</b> creator ({{ 'enabled' if own.cloudtrail else 'optional, off' }}) &gt; <b>unmanaged</b>.
+  Tag keys, CI role patterns and the optional sources are set in
+  <a href="{{ url_for('settings_page') }}#ownership">Settings → Ownership</a>.</p>
+
+{% if report is none %}
+  {{ no_data() }}
+{% else %}
+  <p class="muted">Snapshot from {{ snap.taken_at | localtime }} ({{ snap.region }}): {{ report.total }} resource(s) —
+    the collected VPCs, subnets, security groups, load balancers, functions, endpoints, ECS services, instances and
+    NAT gateways plus every resource <span class="mono">tag:GetResources</span> and the CloudFormation stacks returned.
+    Default VPCs, their subnets and <span class="mono">default</span> security groups are not counted.</p>
+  {% for w in own_warnings %}<div class="flash warn">{{ w }}</div>{% endfor %}
+  {% if own.cloudtrail %}
+  <p class="muted small">CloudTrail lookups cover the last {{ cloudtrail_days }} days of event history only
+    (at most {{ cloudtrail_max }} unowned resources per Refresh): resources created earlier stay unmanaged.</p>
+  {% endif %}
+
+  <h2>By source</h2>
+  <table class="own-counts">
+    <thead><tr><th>Source</th><th>Resources</th></tr></thead>
+    <tbody>
+    {% for c in report.counts %}
+      <tr{% if (c.source == 'terraform' and not own.tf_enabled) or (c.source.startswith('cloudtrail') and not own.cloudtrail) %} class="muted"{% endif %}>
+        <td>{{ c.label }}{% if c.source == 'terraform' and not own.tf_enabled %} <span class="small">(enrichment off)</span>{% endif %}
+          {% if c.source.startswith('cloudtrail') and not own.cloudtrail %} <span class="small">(lookup off)</span>{% endif %}</td>
+        <td>{{ c.count }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Unmanaged <span class="badge">{{ report.unmanaged | length }}</span></h2>
+  <p class="muted small">No CloudFormation stack, no <span class="mono">{{ own.project_key or 'project / repo' }}</span> tag{% if own.tf_enabled %}, in no Terraform root{% endif %}{% if own.cloudtrail %} and no creator found in CloudTrail{% endif %}.</p>
+  <table class="own-unmanaged">
+    <thead><tr><th>Type</th><th>Resource</th></tr></thead>
+    <tbody>
+    {% for r in report.unmanaged %}
+      <tr><td>{{ r.label }}</td><td class="mono">{{ r.resource_id }}</td></tr>
+    {% else %}
+      <tr><td colspan="2" class="muted">None.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <h2>Tag gaps <span class="badge">{{ report.tag_gaps | length }}</span></h2>
+  {% if report.gap_keys %}
+  <p class="muted small">Resources missing the configured
+    {% for k in report.gap_keys %}<span class="mono">{{ k }}</span>{{ ' / ' if not loop.last }}{% endfor %} tag.</p>
+  <table class="own-gaps">
+    <thead><tr><th>Type</th><th>Resource</th><th>Missing</th><th>Owner</th></tr></thead>
+    <tbody>
+    {% for r in report.tag_gaps %}
+      <tr><td>{{ r.label }}</td><td class="mono">{{ r.resource_id }}</td>
+        <td class="mono small">{{ r.missing | join(', ') }}</td><td class="small">{{ r.owner }}</td></tr>
+    {% else %}
+      <tr><td colspan="4" class="muted">None.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No environment or project / repo tag key is configured.</p>
+  {% endif %}
+{% endif %}
+
+<details class="card" id="terraform" {{ 'open' if own.tf_enabled }}>
+  <summary><b>Terraform (optional enrichment)</b> —
+    {% if own.tf_enabled %}<span class="badge ok">enabled</span>{% else %}<span class="badge">off</span>{% endif %}</summary>
+  <form method="post" action="{{ url_for('ownership_terraform_toggle') }}" class="row">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="enabled" value="{{ '0' if own.tf_enabled else '1' }}">
+    <p class="muted" style="margin: 0">Terraform state is an optional ownership source, after CloudFormation and IaC tags.
+      {% if own.tf_enabled %}Mapped repos are re-synced with every Refresh.{% else %}While off, Terraform roots are not used
+      for ownership and Refresh does not sync repos; drift below is still available.{% endif %}</p>
+    <button type="submit" class="secondary">{{ 'Disable' if own.tf_enabled else 'Enable' }} Terraform enrichment</button>
+  </form>
+
 <div class="row" style="justify-content: space-between">
-  <h1>Terraform</h1>
+  <h2>Terraform roots of this account</h2>
   <form method="post" action="{{ url_for('terraform_sync') }}" data-job="tfsync">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <input type="hidden" name="next" value="{{ url_for('terraform_page') }}">
+    <input type="hidden" name="next" value="{{ url_for('ownership_page') }}#terraform">
     <button type="submit">Sync all repos</button>
   </form>
 </div>
@@ -13,7 +95,6 @@
   them and the latest snapshot. Repos and their account mapping are managed in
   <a href="{{ url_for('settings_page') }}#tfrepos">Settings</a>.</p>
 
-<h2>Roots of this account</h2>
 <table class="tf-status">
   <thead><tr><th>Root</th><th>Environment</th><th>Repository</th><th>Status</th><th>Resource ids</th><th>Synced</th></tr></thead>
   <tbody>
@@ -147,6 +228,7 @@
   </details>
   {% endif %}
 </section>
+</details>
 {% endblock %}
 
 {% macro mark_button(kind, value) -%}

@@ -10,6 +10,12 @@
         — shared by {{ e.owner_names | length }} functions (same subnet and security groups):
         <ul class="owner-list">{% for n in e.owner_names %}<li class="mono">{{ n }}</li>{% endfor %}</ul>
       {% elif e.owner_ref %}<span class="mono">{{ e.owner_ref }}</span>{% endif %}</td></tr>
+    <tr><th>Ownership</th><td class="ownership">{% if e.owner.source %}<b>{{ e.owner.label }}</b>: {{ e.owner.value }}
+        {% if e.owner.detail %}<span class="muted small">({{ 'Terraform address' if e.owner.source == 'terraform' else 'created by' }} <span class="mono">{{ e.owner.detail }}</span>)</span>{% endif %}
+      {% else %}<span class="muted">unmanaged — no CloudFormation stack, project / repo tag{% if own.tf_enabled %}, Terraform root{% endif %}{% if own.cloudtrail %} or CloudTrail creator{% endif %}</span>{% endif %}
+      {% for name, label in own_fields.items() if name != 'project' and own.key(name) %}
+        <div class="small">{{ label }} (<span class="mono">{{ own.key(name) }}</span>): {% if e.own_labels[name] %}{{ e.own_labels[name] }}{% else %}<span class="muted">not set</span>{% endif %}</div>
+      {% endfor %}</td></tr>
     <tr><th>Status</th><td><span class="badge {{ 'warn' if e.status == 'available' else '' }}">{{ e.status }}</span>{% if e.status == 'available' %} not attached (idle){% endif %}</td></tr>
     <tr><th>Interface type</th><td class="mono">{{ e.interface_type or '' }}</td></tr>
     <tr><th>Requester</th><td class="mono">{{ e.requester_id or '' }}{% if e.requester_managed %} <span class="badge">AWS-managed</span>{% endif %}</td></tr>

@@ -61,7 +61,41 @@
   <label for="env_tag_keys">Environment tag keys</label>
   <input id="env_tag_keys" name="env_tag_keys" value="{{ s.env_tag_keys_text }}" size="40" class="mono" placeholder="Environment, env, stage">
   <p class="muted small">A resource's environment comes from the Terraform repo root × environment that manages it;
-    otherwise from the first of these tag keys found on the resource, its subnet or its VPC (case-insensitive).</p>
+    otherwise from the Ownership environment tag key below, then the first of these tag keys found on the resource,
+    its subnet or its VPC (case-insensitive).</p>
+
+  <h2 id="ownership">Ownership</h2>
+  <input type="hidden" name="own_form" value="1">
+  <p class="muted small">Who manages each resource, first match wins: <b>CloudFormation</b> stack
+    (<span class="mono">cloudformation:ListStacks / ListStackResources</span>) &gt; <b>IaC tag</b> (the project / repo
+    tag key) &gt; <b>Terraform</b> state (only with the enrichment below) &gt; <b>CloudTrail</b> creator (a CI role →
+    "IaC (unknown repo)", anyone else → "manual") &gt; <b>unmanaged</b>. Tags come from
+    <span class="mono">tag:GetResources</span>. Only the values of these tag keys are kept; other tags are kept
+    by key only (for the lists below).</p>
+  <div class="row">
+    {% for name, label in own_fields.items() %}
+    <div><label for="own_{{ name }}_key">{{ label }} tag key</label>
+      <select id="own_{{ name }}_key" name="own_{{ name }}_key" class="mono">
+        <option value="" {{ 'selected' if not own_keys[name] }}>(not used)</option>
+        {% for k in tag_key_choices %}<option value="{{ k }}" {{ 'selected' if k == own_keys[name] }}>{{ k }}{% if k not in seen_tag_keys %} (not seen){% endif %}</option>{% endfor %}
+      </select></div>
+    {% endfor %}
+  </div>
+  <p class="muted small">{% if seen_tag_keys %}{{ seen_tag_keys | length }} tag key(s) seen in the active account's latest snapshot.
+    {% else %}No tag keys seen yet: Refresh the active account to fill these lists.{% endif %}
+    A newly chosen key applies to every resource from the next Refresh.</p>
+  <label for="ci_patterns">CI role name patterns</label>
+  <textarea id="ci_patterns" name="ci_patterns" rows="2" cols="60" class="mono" placeholder="*github*, deploy-*, ci-*">{{ s.ci_patterns | join(', ') }}</textarea>
+  <p class="muted small">Glob patterns (case-insensitive), comma or newline separated. A CloudTrail creator whose
+    role / IAM user name matches one is a CI pipeline ("IaC (unknown repo)"); any other creator is "manual".</p>
+  <label class="check"><input type="checkbox" name="cloudtrail_lookup" value="1" {{ 'checked' if s.cloudtrail_lookup }}>
+    Look up the creator of still unowned resources in CloudTrail (<span class="mono">cloudtrail:LookupEvents</span>)</label>
+  <p class="muted small">Opt-in, at most {{ cloudtrail_max }} resources per Refresh. CloudTrail event history only
+    covers the last {{ cloudtrail_days }} days: older resources stay unmanaged. Only the creating role / user name is
+    kept, never its ARN or session name.</p>
+  <label class="check"><input type="checkbox" name="tf_enrichment" value="1" {{ 'checked' if s.tf_enrichment }}>
+    Terraform enrichment: use loaded / synced Terraform state as an ownership source</label>
+  <p class="muted small">Off by default. When on, mapped Terraform repos are also re-synced with every Refresh.</p>
   <h2>Terraform sync</h2>
   <label for="tf_timeout">Timeout per terraform command (seconds)</label>
   <input id="tf_timeout" name="tf_timeout" value="{{ s.tf_timeout }}" size="6" inputmode="numeric" pattern="[0-9]+">
@@ -135,8 +169,9 @@
     <span class="mono">terraform workspace select</span> and <span class="mono">terraform show -json</span>
     with the mapped account's credentials and <span class="mono">TF_DATA_DIR</span> in the IPLens data
     directory: the repository is never modified, and plan / apply / import are never run. Only
-    resource ids, addresses and types are kept. See <a href="{{ url_for('terraform_page') }}">Terraform</a>
-    for sync status and drift.</p>
+    resource ids, addresses and types are kept. See <a href="{{ url_for('ownership_page') }}#terraform">Ownership</a>
+    for sync status and drift. Terraform is an optional ownership source: enable the Terraform enrichment
+    under <a href="#ownership">Ownership</a> to use it (and to re-sync mapped repos with every Refresh).</p>
   <table class="tf-repos">
     <thead><tr><th>Repository</th><th>Roots</th><th>Root × env</th><th>Synced pairs</th><th>Scanned</th><th></th></tr></thead>
     <tbody>
@@ -185,7 +220,9 @@
   <span class="mono">elasticloadbalancing:DescribeTargetGroups, elasticloadbalancing:DescribeTargetHealth,
   ec2:DescribeSecurityGroups</span> (connections and security group names on the Visual page);
   <span class="mono">elasticloadbalancing:DescribeTags, lambda:ListTags</span> (load balancer and
-  Lambda tags). The Extended view's Kafka nodes need <span class="mono">kafka:ListClustersV2</span>
+  Lambda tags); <span class="mono">tag:GetResources, cloudformation:ListStacks,
+  cloudformation:ListStackResources</span> (ownership) and, when enabled,
+  <span class="mono">cloudtrail:LookupEvents</span> (creator of unowned resources). The Extended view's Kafka nodes need <span class="mono">kafka:ListClustersV2</span>
   (Amazon MSK clusters) and <span class="mono">lambda:ListEventSourceMappings</span>; without them the
   source is skipped with a warning.
 </div>

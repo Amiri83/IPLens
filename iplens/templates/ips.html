@@ -53,6 +53,11 @@
       {% for e in environments if not e.value %}<option value="{{ env_not_set }}" {{ 'selected' if f.env == env_not_set }}>{{ e.label }} ({{ e.count }})</option>{% endfor %}
       {% if f.env and f.env != env_not_set and f.env not in environments | map(attribute='value') %}<option value="{{ f.env }}" selected>{{ f.env }}</option>{% endif %}
     </select></div>
+  <div><label for="own">Owner</label>
+    <select id="own" name="own">
+      <option value="">all</option>
+      {% for value, label in own_filters.items() %}<option value="{{ value }}" {{ 'selected' if value == f.own }}>{{ label }}</option>{% endfor %}
+    </select></div>
   <div><label for="q">Search</label>
     <input id="q" name="q" value="{{ f.q }}" placeholder="IP, name, ENI, subnet, VPC, description…" size="36"></div>
   <div class="row" style="gap: .5rem">
@@ -63,7 +68,7 @@
 </form>
 <p class="muted">{{ rows | length }} IP(s) · snapshot #{{ snap.id }} · sorted by address</p>
 <table class="ip-list">
-  <thead><tr><th>IP</th><th>Subnet</th><th>VPC</th><th>Resource type</th><th>Resource name / ref</th><th>ENI</th><th>Status</th><th>Environment</th><th>Tags</th><th>Terraform</th></tr></thead>
+  <thead><tr><th>IP</th><th>Subnet</th><th>VPC</th><th>Resource type</th><th>Resource name / ref</th><th>ENI</th><th>Status</th><th>Owner</th><th>Environment</th><th>Tags</th><th>Terraform</th></tr></thead>
   <tbody>
   {% for r in rows %}
     <tr>
@@ -78,13 +83,15 @@
         {% elif r.owner_ref and r.owner_ref != r.resource_name %}<div class="muted mono">{{ r.owner_ref }}</div>{% endif %}</td>
       <td class="mono"><a href="{{ url_for('eni', eni_id=r.eni_id) }}">{{ r.eni_id }}</a></td>
       <td><span class="badge {{ 'warn' if r.status == 'available' else '' }}">{{ r.status }}</span></td>
+      <td class="owner-cell">{% if r.owner.source %}{{ r.owner.value }}<div class="muted">{{ r.owner.label }}{% if r.owner.detail %} · <span class="mono">{{ r.owner.detail }}</span>{% endif %}</div>
+        {% else %}<span class="muted">unmanaged</span>{% endif %}</td>
       <td class="env-cell">{% if r.environment %}{{ r.environment }}<div class="muted">{{ env_sources.get(r.env_source, r.env_source) }}</div>{% else %}<span class="muted">–</span>{% endif %}</td>
       <td class="tags">{% for k, v in r.tags.items() %}<span class="tag mono small">{{ k }}={{ v }}</span> {% endfor %}</td>
       <td class="small">{% for m in r.tf %}<div>managed by <b>{{ m.root }}</b>: <span class="mono">{{ m.address }}</span></div>
         {% else %}{% if tf_roots %}<span class="muted">unmanaged</span>{% endif %}{% endfor %}</td>
     </tr>
   {% else %}
-    <tr><td colspan="10" class="muted">No matches</td></tr>
+    <tr><td colspan="11" class="muted">No matches</td></tr>
   {% endfor %}
   </tbody>
 </table>

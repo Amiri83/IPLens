@@ -349,6 +349,15 @@
       const env = raw.environment || "";
       return [{ key: "env:" + env, label: "environment: " + (env || NOT_SET), unmanaged: !env }];
     }
+    if (mode === "owner") {  // ownership source + value (iplens.ownership)
+      const o = raw.owner || {};
+      if (!o.source) return [{ key: "own:", label: "owner: unmanaged", unmanaged: true }];
+      return [{ key: `own:${o.source}:${o.value}`, label: `${o.label}: ${o.value}` }];
+    }
+    if (mode === "team") {
+      const team = raw.team || "";
+      return [{ key: "team:" + team, label: "team: " + (team || NOT_SET), unmanaged: !team }];
+    }
     return [];
   }
 
@@ -569,9 +578,10 @@
   const expandedGroups = new Set(JSON.parse(document.getElementById("visual-expanded").textContent || "[]"));
   let focusId = null;  // node whose neighbourhood is shown (focus mode), else null
 
-  // Swimlanes replace the "Group by" boxes for tags, Terraform roots and environments.
+  // Swimlanes replace the "Group by" boxes for tags, Terraform roots, environments, owners
+  // and teams.
   function laneMode() {
-    return extended && Boolean(groupBySelect) && ["tag", "tf", "env"].includes(groupBySelect.value);
+    return extended && Boolean(groupBySelect) && ["tag", "tf", "env", "owner", "team"].includes(groupBySelect.value);
   }
 
   // Extended view: crawled nodes not linked to this VPC that are drawn on request

@@ -221,3 +221,6 @@ pre.job-log { background: var(--bg); color: var(--fg); border: 1px solid var(--l
 .unlinked-panel li button:hover { text-decoration: underline; }
 .unlinked-panel li.shown button { font-weight: 700; }
 .env-cell .muted { font-size: 11.5px; }
+.owner-cell .muted { font-size: 11.5px; }
+label.check { display: flex; align-items: center; gap: .4rem; font-weight: normal; }
+details#terraform > summary { cursor: pointer; }
