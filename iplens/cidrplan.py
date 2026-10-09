@@ -495,8 +495,9 @@ def _tf_name(text: str) -> str:
     return re.sub(r"[^a-z0-9_]", "_", text.lower()).strip("_") or "planned"
 
 
-def tf_secondary(vpc_id: str, cidr: str) -> str:
-    name = _tf_name(f"secondary_{cidr}")
+def tf_secondary(vpc_id: str, cidr: str, name: str = "") -> str:
+    """``name`` overrides the resource label (default: derived from ``cidr``)."""
+    name = _tf_name(name or f"secondary_{cidr}")
     return (
         f'resource "aws_vpc_ipv4_cidr_block_association" "{name}" {{\n'
         f'  vpc_id     = "{vpc_id}"\n'

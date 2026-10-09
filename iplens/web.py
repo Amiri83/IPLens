@@ -44,6 +44,7 @@ from . import (
     viewstate,
 )
 from . import diff as diff_mod
+from . import report as report_mod
 from . import retention as retention_mod
 from . import rules as rules_mod
 from . import scope as scope_mod
@@ -469,10 +470,17 @@ def _register(app: Flask) -> None:
     @app.get("/")
     def overview():
         snap = _snapshot_or_none()
-        tree, owners = [], {}
+        tree, owners, envs = [], {}, []
         if snap:
             tree = queries.vpc_tree(_db(), snap["id"], _scope())
             owners = queries.owner_breakdown(_db(), snap["id"], _scope())
+            # Environment choices of the Report button.
+            envs = environment.summary(
+                r["environment"]
+                for r in queries.ip_list(
+                    _db(), snap["id"], scope=_scope(), env_keys=_env_keys(), own=_own()
+                )
+            )
         ref = _active_ref()
         history = queries.recent_snapshots(_db(), HISTORY_ROWS, ref) if ref is not None else []
         # Subnets forecast to fill up within trends.SOON_DAYS (default Trends window).
@@ -482,6 +490,8 @@ def _register(app: Flask) -> None:
             snap=snap,
             tree=tree,
             owners=owners,
+            envs=envs,
+            env_not_set=environment.FILTER_NOT_SET,
             soon=soon,
             soon_days=trends.SOON_DAYS,
             history=history,
@@ -792,6 +802,59 @@ def _register(app: Flask) -> None:
             fit_rows=max(len(requests) + 1, 3),
             tf_secondary=cidrplan.tf_secondary,
         )
+
+    # -- report (one self-contained HTML document) ----------------------------------------
+
+    @app.get("/report")
+    def report_page():
+        snap = _snapshot_or_none()
+        ref = _active_ref()
+        if not snap or ref is None:
+            abort(404, "No snapshot yet: refresh the account first.")
+        env = request.args.get("env", "").strip()[:128]
+        window = request.args.get("window", trends.DEFAULT_WINDOW, type=int)
+        if window not in trends.WINDOWS:
+            window = trends.DEFAULT_WINDOW
+        redactor = (
+            report_mod.Redactor(report_mod.redaction_key(current_app.secret_key))
+            if request.args.get("redact") == "1"
+            else None
+        )
+        model = report_mod.build(
+            _db(),
+            snap,
+            ref,
+            account=snapshot_label(snap),
+            scope=_scope(),
+            env=env,
+            env_keys=_env_keys(),
+            own=_own(),
+            rules=rules_mod.applicable(rules_mod.list_rules(_db()), ref),
+            window=window,
+            redactor=redactor,
+        )
+        html = render_template(
+            "report.html",
+            r=model,
+            chart=trends.svg_chart,
+            bar=report_mod.svg_bar,
+            soon_days=trends.SOON_DAYS,
+            at_risk_pct=report_mod.AT_RISK_FREE_PCT,
+            low_pct=report_mod.LOW_HEADROOM_PCT,
+            max_unmanaged=report_mod.MAX_UNMANAGED_LISTED,
+        )
+        if redactor is not None:
+            # Pattern pass over the whole document: summary, charts, tables, suggestions.
+            html = redactor.redact(html)
+        resp = Response(html, mimetype="text/html")
+        # Self-contained by construction; the policy makes any external load fail loudly.
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'none'; style-src 'unsafe-inline'; img-src data:"
+        )
+        if request.args.get("download") == "1":
+            name = f"iplens-report-{datetime.now(UTC):%Y%m%d}{'-redacted' if redactor else ''}"
+            resp.headers["Content-Disposition"] = f'attachment; filename="{name}.html"'
+        return resp
 
     # -- subnet grid / ENI / IP table ----------------------------------------
 

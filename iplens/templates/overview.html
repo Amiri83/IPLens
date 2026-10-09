@@ -32,6 +32,18 @@
         {% endfor %}
       </div>
     {% endif %}
+    <form method="get" action="{{ url_for('report_page') }}" target="_blank" class="row report-form" style="margin-top: .5rem">
+      <label for="report-env">Environment</label>
+      <select id="report-env" name="env">
+        <option value="">all</option>
+        {% for e in envs %}
+          <option value="{{ e.value or env_not_set }}">{{ e.label }}</option>
+        {% endfor %}
+      </select>
+      <label><input type="checkbox" name="redact" value="1"> redact identifiers</label>
+      <label><input type="checkbox" name="download" value="1"> download</label>
+      <button type="submit" class="secondary" title="One self-contained HTML document: print it to PDF from the browser">Report</button>
+    </form>
   </div>
 
   {{ legend() }}
