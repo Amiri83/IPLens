@@ -50,6 +50,19 @@ variable "db_password" { sensitive = true }
     "network/backend/dev.tfbackend": 'key = "network/dev.tfstate"\n',
     "network/.terraform.lock.hcl": "# lock file\n",
     "network/subnets.tf": 'resource "aws_subnet" "app" { cidr_block = "10.0.1.0/24" }\n',
+    # A non-S3 backend (runs terraform): tfvars environments, workspace-per-env, and a
+    # -backend-config file for dev
+    "services/main.tf": """
+terraform {
+  backend "http" {}
+}
+provider "aws" { region = var.region }
+locals { env = terraform.workspace }
+variable "region" {}
+""",
+    "services/envs/dev.tfvars": f'region = "us-east-1"\naccount_id = "{ACCOUNT}"\n',
+    "services/envs/prod.tfvars": f'region = "eu-west-1"\naccount_id = "{OTHER_ACCOUNT}"\n',
+    "services/backend/dev.tfbackend": 'address = "https://state.example.com/services-dev"\n',
     # Terraform Cloud with tags: one workspace per tfvars environment
     "platform/main.tf": """
 terraform {
@@ -147,7 +160,14 @@ def _env(root, name):
 
 def test_discovery_finds_roots_and_skips_modules_and_hidden_dirs(repo):
     roots = _by_rel(tfrepo.discover(repo))
-    assert set(roots) == {"network", "platform", "apps/envs/dev", "apps/envs/staging", "legacy"}
+    assert set(roots) == {
+        "network",
+        "services",
+        "platform",
+        "apps/envs/dev",
+        "apps/envs/staging",
+        "legacy",
+    }
 
 
 def test_discovery_reads_backend_and_tfvars_envs(repo):
@@ -394,9 +414,32 @@ def test_terraform_env_passes_only_the_mapped_credentials(tmp_path):
 # -- storage, mapping, sync ------------------------------------------------------------------
 
 
+class FakeGateway:
+    """Pre-flight stand-in: the credentials resolve to ``account`` without any AWS call
+    (or ``caller_identity`` raises ``error``)."""
+
+    def __init__(self, account=ACCOUNT, error=None):
+        self.account, self.error = account, error
+
+    def caller_identity(self, config=None):
+        if self.error is not None:
+            raise self.error
+        return {"account": self.account, "arn": ""}
+
+
+def fake_gateway(_account):
+    return FakeGateway()
+
+
 @pytest.fixture
 def app(home):
-    return create_app(home, testing=True, terraform_bin=TF, terraform_runner=FakeRunner())
+    return create_app(
+        home,
+        testing=True,
+        terraform_bin=TF,
+        terraform_runner=FakeRunner(),
+        gateway_factory=fake_gateway,
+    )
 
 
 @pytest.fixture
@@ -449,7 +492,7 @@ def test_mapping_is_saved_and_reloaded(app, repo):
     acct = _keys_account(app)
     repo_id = _discovered(app, repo)
     envs = _envs(app, repo_id)
-    assert len(envs) == 8
+    assert len(envs) == 10
     dev = envs[("network", "dev")]
     # suggested from the guessed AWS account id, not yet confirmed
     assert (dev["account_ref"], dev["confirmed"]) == (acct, 0)
@@ -494,14 +537,14 @@ def _sync(app, runner, **kw):
         cache_dir=paths.tf_cache_dir,
         terraform_bin=TF,
         runner=runner,
-        **kw,
+        **{"gateway_factory": fake_gateway, **kw},
     )
 
 
 def test_sync_runs_only_allowlisted_commands_and_ingests_ids(app, repo):
     acct = _keys_account(app)
     repo_id = _discovered(app, repo)
-    _confirm(app, repo_id, ("network", "dev"), acct)
+    _confirm(app, repo_id, ("services", "dev"), acct)
     before = _tree(repo)
     runner = FakeRunner(show=_state(_subnet("app", "subnet-0000000a")))
     (result,) = _sync(app, runner)
@@ -514,7 +557,7 @@ def test_sync_runs_only_allowlisted_commands_and_ingests_ids(app, repo):
     cache = app.extensions["iplens"]["paths"].tf_cache_dir.resolve()
     for _argv, kw in runner.calls:
         assert kw["shell"] is False and kw["timeout"] > 0
-        assert kw["cwd"] == str((repo / "network").resolve())
+        assert kw["cwd"] == str((repo / "services").resolve())
         assert Path(kw["env"]["TF_DATA_DIR"]).parent == cache
         assert kw["env"]["AWS_ACCESS_KEY_ID"] == FAKE_KEY_ID
     assert _tree(repo) == before  # the repository is untouched
@@ -525,13 +568,13 @@ def test_sync_runs_only_allowlisted_commands_and_ingests_ids(app, repo):
     assert root["resources"] == 1
     assert index[("subnet", "subnet-0000000a")][0]["address"] == "aws_subnet.app"
     assert FAKE_SECRET not in dump and "10.0.1.0/24" not in dump
-    assert _envs(app, repo_id)[("network", "dev")]["status"] == tfrepo.OK
+    assert _envs(app, repo_id)[("services", "dev")]["status"] == tfrepo.OK
 
 
 def test_sync_status_init_failed_without_leaking_credentials(app, repo, caplog):
     acct = _keys_account(app)
     repo_id = _discovered(app, repo)
-    _confirm(app, repo_id, ("network", "dev"), acct)
+    _confirm(app, repo_id, ("services", "dev"), acct)
     runner = FakeRunner(fail="init", stderr=f"Error: bad key {FAKE_KEY_ID} {FAKE_SECRET}".encode())
     with caplog.at_level(logging.INFO, logger="iplens"):
         (result,) = _sync(app, runner)
@@ -566,7 +609,7 @@ def test_sync_local_backend_reads_the_state_file_without_terraform(app, repo):
 def test_sync_refuses_a_cache_inside_the_repo(app, repo):
     acct = _keys_account(app)
     repo_id = _discovered(app, repo)
-    row = _confirm(app, repo_id, ("network", "dev"), acct)
+    row = _confirm(app, repo_id, ("services", "dev"), acct)
     runner = FakeRunner()
     with closing(_db(app)) as conn:
         result = tfrepo.sync_env(
@@ -599,9 +642,9 @@ def test_web_add_confirm_sync_and_drift(app, client, repo, snapshot_builder):
     assert FAKE_SECRET not in page and "example-tfstate-bucket" not in page
     repo_id = int(resp.location.rstrip("/").rsplit("/", 1)[1])
     envs = _envs(app, repo_id)
-    dev = envs[("network", "dev")]
+    dev = envs[("services", "dev")]
     _post(client, f"/settings/tfrepos/{repo_id}", {f"account_{dev['id']}": str(acct)})
-    assert _envs(app, repo_id)[("network", "dev")]["confirmed"] == 1
+    assert _envs(app, repo_id)[("services", "dev")]["confirmed"] == 1
     assert "selected" in client.get(f"/settings/tfrepos/{repo_id}").data.decode()
 
     app.extensions["iplens"]["tf_runner"] = FakeRunner(
@@ -629,7 +672,7 @@ def test_web_add_confirm_sync_and_drift(app, client, repo, snapshot_builder):
 def test_web_drift_lists(app, repo, snapshot_builder):
     acct = _keys_account(app)
     repo_id = _discovered(app, repo)
-    _confirm(app, repo_id, ("network", "dev"), acct)
+    _confirm(app, repo_id, ("services", "dev"), acct)
     _sync(app, FakeRunner(show=_state(_subnet("app", "subnet-0000000a"))))
     snap = snapshot_builder(_db(app), account_ref=acct)
     snap.vpc("vpc-0example0000001", "10.0.0.0/16").subnet(

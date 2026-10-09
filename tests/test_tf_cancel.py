@@ -19,15 +19,30 @@ from iplens import tfrepo
 from iplens.jobs import JobManager
 from iplens.web import create_app
 from tests import test_tfrepo
-from tests.test_tfrepo import TF, FakeRunner, _confirm, _db, _discovered, _envs, _keys_account
+from tests.test_tfrepo import (
+    TF,
+    FakeRunner,
+    _confirm,
+    _db,
+    _discovered,
+    _envs,
+    _keys_account,
+    fake_gateway,
+)
 
 repo = test_tfrepo.repo  # the synthetic repository fixture
-KEY = ("network", "dev")  # an S3-backend root: runs terraform init / workspace / show
+KEY = ("services", "dev")  # an HTTP-backend root: runs terraform init / workspace / show
 
 
 @pytest.fixture
 def app(home):
-    return create_app(home, testing=True, terraform_bin=TF, terraform_runner=FakeRunner())
+    return create_app(
+        home,
+        testing=True,
+        terraform_bin=TF,
+        terraform_runner=FakeRunner(),
+        gateway_factory=fake_gateway,
+    )
 
 
 class FakePopen:
@@ -98,6 +113,7 @@ def _sync(app, runner, terraform_bin=TF, **kw):
         cache_dir=paths.tf_cache_dir,
         terraform_bin=terraform_bin,
         runner=runner,
+        gateway_factory=fake_gateway,
         **kw,
     )
 

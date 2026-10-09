@@ -44,7 +44,7 @@ REGIONS = (
 
 MAX_DISPLAY_NAME = 64
 # Terraform repo sync: seconds each allowlisted terraform command may run.
-DEFAULT_TF_TIMEOUT = 300
+DEFAULT_TF_TIMEOUT = 120
 MIN_TF_TIMEOUT, MAX_TF_TIMEOUT = 10, 3600
 
 

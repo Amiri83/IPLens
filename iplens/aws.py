@@ -4,7 +4,8 @@ Every client created through :class:`AwsGateway` has a botocore ``before-call``
 hook that rejects any API operation whose name does not start with
 ``Describe``, ``List`` or ``Get``, except for the explicit read-only
 :data:`READ_ONLY_ALLOWLIST` (CloudWatch Logs queries used by the opt-in flow log
-analysis). IPLens never mutates AWS.
+analysis, and ``sts:AssumeRole`` for the role an S3 Terraform backend names: its
+session is only used to read the state object). IPLens never mutates AWS.
 """
 
 from __future__ import annotations
@@ -31,6 +32,9 @@ READ_ONLY_ALLOWLIST = frozenset(
         ("logs", "StartQuery"),
         ("logs", "GetQueryResults"),
         ("logs", "StopQuery"),
+        # Terraform S3 backends with a role_arn: the temporary session only reads the
+        # state object (s3:ListObjectsV2 / s3:GetObject) and is never stored.
+        ("sts", "AssumeRole"),
     }
 )
 
@@ -40,6 +44,12 @@ EXPIRED_CREDENTIAL_CODES = frozenset(
 )
 
 _BOTO_CONFIG = Config(retries={"max_attempts": 5, "mode": "adaptive"}, user_agent_extra="iplens")
+# Pre-flight checks and Terraform state reads: fail within ~10 seconds instead of hanging.
+FAST_CONFIG = Config(
+    connect_timeout=5, read_timeout=10, retries={"max_attempts": 2, "mode": "standard"}
+)
+# Seconds an assumed backend role session lasts (the minimum STS allows).
+ASSUMED_ROLE_SECONDS = 900
 
 
 class ReadOnlyViolation(RuntimeError):
@@ -123,15 +133,35 @@ class AwsGateway:
     def region(self) -> str | None:
         return self.session.region_name
 
-    def client(self, service: str) -> Any:
-        client = self.session.client(service, config=_BOTO_CONFIG)
+    def client(
+        self, service: str, *, region: str | None = None, config: Config | None = None
+    ) -> Any:
+        merged = _BOTO_CONFIG.merge(config) if config is not None else _BOTO_CONFIG
+        client = self.session.client(service, region_name=region or None, config=merged)
         # "before-call" is hierarchical: it fires for every operation of this client.
         client.meta.events.register("before-call", _guard_read_only)
         return client
 
-    def caller_identity(self) -> dict[str, str]:
-        ident = self.client("sts").get_caller_identity()
+    def caller_identity(self, config: Config | None = None) -> dict[str, str]:
+        sts = self.client("sts") if config is None else self.client("sts", config=config)
+        ident = sts.get_caller_identity()
         return {"account": ident.get("Account", ""), "arn": ident.get("Arn", "")}
+
+    def assume_role(
+        self, role_arn: str, session_name: str = "iplens-state-read", config: Config | None = None
+    ) -> AwsGateway:
+        """A gateway on temporary credentials of ``role_arn`` (kept in memory only)."""
+        creds = self.client("sts", config=config).assume_role(
+            RoleArn=role_arn, RoleSessionName=session_name, DurationSeconds=ASSUMED_ROLE_SECONDS
+        )["Credentials"]
+        return AwsGateway(
+            boto3.session.Session(
+                aws_access_key_id=creds["AccessKeyId"],
+                aws_secret_access_key=creds["SecretAccessKey"],
+                aws_session_token=creds["SessionToken"],
+                region_name=self.region,
+            )
+        )
 
     def account_aliases(self) -> list[str]:
         """IAM account alias (at most one per account). Needs iam:ListAccountAliases."""
