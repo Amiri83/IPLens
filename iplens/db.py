@@ -254,6 +254,10 @@ CREATE TABLE IF NOT EXISTS tf_repo_envs (
     status_detail  TEXT NOT NULL DEFAULT '',
     synced_at      TEXT,
     state_account  TEXT NOT NULL DEFAULT '',  -- AWS account id found in the state's ARNs
+    -- s3 backends: "extra backend-config" key=value lines (values CI passes), Fernet-
+    -- encrypted; only the key names are kept in clear.
+    backend_extra_enc  TEXT NOT NULL DEFAULT '',
+    backend_extra_keys TEXT NOT NULL DEFAULT '',
     UNIQUE (repo_id, root_rel, env)
 );
 
@@ -446,6 +450,8 @@ _ADDED_COLUMNS = (
     ("visual_prefs", "show_legend", "INTEGER NOT NULL DEFAULT 1"),
     ("tf_roots", "origin", "TEXT NOT NULL DEFAULT ''"),
     ("tf_repo_envs", "state_account", "TEXT NOT NULL DEFAULT ''"),
+    ("tf_repo_envs", "backend_extra_enc", "TEXT NOT NULL DEFAULT ''"),
+    ("tf_repo_envs", "backend_extra_keys", "TEXT NOT NULL DEFAULT ''"),
 )
 
 # Single-account settings rows from before multi-account support.

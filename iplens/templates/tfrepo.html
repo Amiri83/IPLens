@@ -29,7 +29,18 @@
           {% if e.workspace %}<div class="muted small">workspace <span class="mono">{{ e.workspace }}</span></div>{% endif %}
           {% if e.var_file %}<div class="muted small mono">{{ e.var_file }}</div>{% endif %}</td>
         <td class="small">{{ e.kinds | replace(',', ', ') }}</td>
-        <td class="mono small">{{ e.backend }}{% if e.backend_config %}<div class="muted">{{ e.backend_config }}</div>{% endif %}</td>
+        <td class="mono small">{{ e.backend }}{% if e.backend_config %}<div class="muted">{{ e.backend_config }}</div>{% endif %}
+          {% if e.backend == 's3' %}
+          <details class="small">
+            <summary>extra backend-config{% if e.backend_extra_keys %} <span class="badge ok">set: {{ e.backend_extra_keys | replace(',', ', ') }}</span>{% endif %}</summary>
+            <label for="extra-{{ e.id }}" class="muted">key=value lines CI passes with <span class="mono">-backend-config</span>
+              (bucket, key, region, workspace_key_prefix, role_arn, profile). Stored encrypted; values are never shown —
+              leave empty to keep the current ones.</label>
+            <textarea id="extra-{{ e.id }}" name="extra_{{ e.id }}" rows="3" cols="36" class="mono" spellcheck="false"
+              placeholder="bucket=state-bucket-a&#10;key=network/terraform.tfstate&#10;region=us-east-1"></textarea>
+            {% if e.backend_extra_keys %}<label><input type="checkbox" name="extra_clear_{{ e.id }}" value="1"> clear</label>{% endif %}
+          </details>
+          {% endif %}</td>
         <td class="mono small">{{ e.guess_account or '—' }} · {{ e.guess_region or '—' }}</td>
         <td>
           <label for="acct-{{ e.id }}" class="sr-only">IPLens account for {{ e.root_label }} {{ e.env }}</label>
@@ -67,7 +78,8 @@
   <input type="hidden" name="repo_id" value="{{ repo.id }}">
   <input type="hidden" name="next" value="{{ url_for('settings_tfrepo', repo_id=repo.id) }}">
   <button type="submit" class="secondary">Sync confirmed pairs now</button>
-  <span class="muted small">Runs only terraform init (read-only lock file), workspace select and show -json.</span>
+  <span class="muted small">S3 backends: the state object is read directly (s3:ListObjectsV2 / s3:GetObject, read-only).
+    Other backends: only terraform init (read-only lock file), workspace select and show -json.</span>
 </form>
 {% endif %}
 {% endblock %}

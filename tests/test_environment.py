@@ -160,4 +160,4 @@ def test_settings_store_environment_keys_and_terraform_timeout(client, snapshot_
     # Fields left out keep their value; the defaults apply to a fresh database.
     _post(client, "/settings", {"log_dir": ""})
     assert SettingsStore(db).load().env_tag_keys == ("tier",)
-    assert DEFAULT_TF_TIMEOUT == 300
+    assert DEFAULT_TF_TIMEOUT == 120

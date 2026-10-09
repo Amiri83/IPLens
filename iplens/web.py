@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import secrets
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -200,6 +201,8 @@ def create_app(
         "port": port,
         "terraform_bin": terraform_bin,
         "tf_runner": terraform_runner or tfrepo.run_process,
+        # Encrypts the "extra backend-config" values of s3-backend roots at rest.
+        "box": box,
         # Background jobs (Refresh, service crawl, Terraform sync): one per account.
         "jobs": JobManager(paths.db_path),
     }
@@ -249,13 +252,14 @@ def _credential_message(ctx: Progress, prefix: str, exc: BaseException, edit_url
     ctx.message("error", f"{prefix}: {msg} —", edit_url, "edit account")
 
 
-def sync_messages(ctx: Progress, results: list[tfrepo.SyncResult]) -> None:
+def sync_messages(ctx: Progress, results: list[tfrepo.SyncResult], seconds: float = 0.0) -> None:
     """Result lines of a Terraform sync."""
     if not results:
         ctx.message("warn", "Terraform sync: no confirmed root × environment pairs.")
         return
     ok = all(r.status == tfrepo.OK for r in results)
-    ctx.message("ok" if ok else "warn", f"Terraform sync: {tfrepo.summarise(results)}")
+    took = f" in {seconds:.1f}s" if seconds else ""
+    ctx.message("ok" if ok else "warn", f"Terraform sync: {tfrepo.summarise(results)}{took}")
     wrong = [r for r in results if r.status == tfrepo.WRONG_ACCOUNT]
     for r in wrong:
         ctx.message("warn", f"{r.label}: {r.detail}; it is left out of drift.")
@@ -549,9 +553,15 @@ def _register(app: Flask) -> None:
             # Terraform repos mapped to this account are re-synced with every refresh.
             if tf_sync is not None:
                 try:
-                    sync_messages(ctx, tf_sync(account_ref=account.id, progress=ctx))
+                    t0 = time.monotonic()
+                    results = tf_sync(account_ref=account.id, progress=ctx)
+                    sync_messages(ctx, results, time.monotonic() - t0)
                 except JobCancelled:
                     raise
+                except tfrepo.SyncAborted as exc:
+                    ctx.message(
+                        "warn", f"Terraform sync aborted: {exc} —", edit_url, "edit account"
+                    )
                 except Exception:
                     log.exception("terraform sync after refresh failed (account=%s)", account.id)
                     ctx.message("warn", "Terraform sync failed. See the log for details.")
@@ -1391,12 +1401,30 @@ def _register(app: Flask) -> None:
     def tfrepo_save_mapping(repo_id: int):
         _repo_or_404(repo_id)
         mapping: dict[int, int | None] = {}
+        extras: dict[int, str] = {}  # env row id -> extra backend-config ("" clears)
         for key, value in request.form.items():
             env_id = key.removeprefix("account_")
             if key.startswith("account_") and env_id.isdigit():
                 mapping[int(env_id)] = int(value) if value.isdigit() else None
+            env_id = key.removeprefix("extra_")
+            if key.startswith("extra_") and env_id.isdigit() and value.strip():
+                extras[int(env_id)] = value
+            env_id = key.removeprefix("extra_clear_")
+            if key.startswith("extra_clear_") and env_id.isdigit():
+                extras[int(env_id)] = ""
+        encrypt = _ext()["box"].encrypt
         with closing(_paths().db_path) as conn:
             synced = tfrepo.save_mapping(conn, repo_id, mapping)
+            for env_id, text in sorted(extras.items()):
+                try:
+                    keys = tfrepo.save_backend_extra(conn, repo_id, env_id, text, encrypt)
+                except ValueError as exc:  # names the line / key, never a value
+                    flash(f"Extra backend-config not saved: {exc}", "error")
+                    continue
+                # Key names only: the values are never logged or shown.
+                log.info(
+                    "extra backend-config of env row %s: %s", env_id, ",".join(keys) or "cleared"
+                )
         log.info("terraform repo %s mapping saved: %d pair(s) to sync", repo_id, synced)
         flash(f"Mapping saved: {synced} root × environment pair(s) will be synced.", "ok")
         return redirect(url_for("settings_tfrepo", repo_id=repo_id))
@@ -1424,6 +1452,7 @@ def _register(app: Flask) -> None:
         db_path, cache_dir, runner = _paths().db_path, _paths().tf_cache_dir, ext["tf_runner"]
         accounts = _accounts()
         timeout = float(_store().load().tf_timeout)
+        factory, decrypt = ext["gateway_factory"], ext["box"].decrypt
 
         def run(
             *,
@@ -1441,6 +1470,8 @@ def _register(app: Flask) -> None:
                 runner=runner,
                 timeout=timeout,
                 progress=progress,
+                gateway_factory=factory,
+                decrypt=decrypt,
             )
 
         return run
@@ -1450,10 +1481,21 @@ def _register(app: Flask) -> None:
         raw = request.form.get("repo_id", "")
         repo_id = int(raw) if raw.isdigit() else None
         sync = _tf_syncer()
+        # Resolved here: the worker has no request context for url_for.
+        edit_urls = {a.id: url_for("account_edit", account_id=a.id) for a in _accounts().list()}
 
         def work(ctx: JobContext) -> None:
-            results = sync(repo_id=repo_id, progress=ctx)
-            sync_messages(ctx, results)
+            t0 = time.monotonic()
+            try:
+                results = sync(repo_id=repo_id, progress=ctx)
+            except tfrepo.SyncAborted as exc:
+                edit = edit_urls.get(exc.account_ref)
+                if edit:
+                    ctx.message("error", f"Terraform sync aborted: {exc} —", edit, "edit account")
+                else:
+                    ctx.message("error", f"Terraform sync aborted: {exc}")
+                raise JobFailed("Terraform sync aborted") from None
+            sync_messages(ctx, results, time.monotonic() - t0)
             ctx.check()
             ctx.step("finished")
 

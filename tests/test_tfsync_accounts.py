@@ -28,6 +28,7 @@ from tests.test_tfrepo import (
     _state,
     _subnet,
     _sync,
+    fake_gateway,
 )
 
 repo = test_tfrepo.repo  # the synthetic repository fixture
@@ -43,7 +44,13 @@ def _arn_subnet(name: str, sid: str, account: str) -> dict:
 
 @pytest.fixture
 def app(home):
-    return create_app(home, testing=True, terraform_bin=TF, terraform_runner=FakeRunner())
+    return create_app(
+        home,
+        testing=True,
+        terraform_bin=TF,
+        terraform_runner=FakeRunner(),
+        gateway_factory=fake_gateway,
+    )
 
 
 @pytest.fixture
@@ -104,14 +111,14 @@ def test_wrong_account_is_flagged_suggested_and_left_out_of_drift(
     acct = _keys_account(app)  # credentials resolve to ACCOUNT
     other = _keys_account(app, name="env-prod", aws_id=OTHER)
     repo_id = _discovered(app, repo)
-    _confirm(app, repo_id, ("network", "dev"), acct)
+    _confirm(app, repo_id, ("services", "dev"), acct)
     show = _state(
         _arn_subnet("app", "subnet-0000000a", OTHER), _arn_subnet("gone", "subnet-0000000f", OTHER)
     )
     (result,) = _sync(app, FakeRunner(show=show))
     assert result.status == tfrepo.WRONG_ACCOUNT
     assert result.detail == f"the state's resources are in AWS account {OTHER}, not {ACCOUNT}"
-    env = _envs(app, repo_id)[("network", "dev")]
+    env = _envs(app, repo_id)[("services", "dev")]
     assert (env["status"], env["state_account"]) == (tfrepo.WRONG_ACCOUNT, OTHER)
     store = app.extensions["iplens"]["accounts"]
     assert tfrepo.suggest_for_state(OTHER, store.list()).id == other
@@ -135,7 +142,7 @@ def test_wrong_account_is_flagged_suggested_and_left_out_of_drift(
     ok = _state(_arn_subnet("app", "subnet-0000000a", ACCOUNT), _subnet("b", "subnet-0000000b"))
     (result,) = _sync(app, FakeRunner(show=ok))
     assert result.status == tfrepo.OK
-    assert _envs(app, repo_id)[("network", "dev")]["state_account"] == ACCOUNT
+    assert _envs(app, repo_id)[("services", "dev")]["state_account"] == ACCOUNT
     assert _drift(app, acct, snap.id).wrong_account == []
 
 
@@ -153,7 +160,7 @@ def test_local_backend_state_is_checked_too(app, repo):
 def test_managed_elsewhere_markers_are_excluded_from_drift(app, client, repo, snapshot_builder):
     acct = _keys_account(app)
     repo_id = _discovered(app, repo)
-    _confirm(app, repo_id, ("network", "dev"), acct)
+    _confirm(app, repo_id, ("services", "dev"), acct)
     _sync(
         app,
         FakeRunner(
@@ -243,7 +250,7 @@ class _SlowRunner(FakeRunner):
 def test_sync_runs_two_roots_at_a_time_with_a_shared_plugin_cache(app, repo):
     acct = _keys_account(app)
     repo_id = _discovered(app, repo)
-    for key in (("network", "dev"), ("network", "prod"), ("platform", "dev")):
+    for key in (("services", "dev"), ("services", "prod"), ("platform", "dev")):
         _confirm(app, repo_id, key, acct)
     runner = _SlowRunner(show=_state(_subnet("app", "subnet-0000000a")))
     results = _sync(app, runner, timeout=42)
@@ -267,7 +274,7 @@ def test_sync_progress_and_cancel_between_roots(app, repo):
 
     acct = _keys_account(app)
     repo_id = _discovered(app, repo)
-    for key in (("network", "dev"), ("network", "prod"), ("platform", "dev")):
+    for key in (("services", "dev"), ("services", "prod"), ("platform", "dev")):
         _confirm(app, repo_id, key, acct)
     manager = JobManager(_db(app))
     seen: list[list] = []

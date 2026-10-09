@@ -66,7 +66,11 @@
   <label for="tf_timeout">Timeout per terraform command (seconds)</label>
   <input id="tf_timeout" name="tf_timeout" value="{{ s.tf_timeout }}" size="6" inputmode="numeric" pattern="[0-9]+">
   <p class="muted small">Applies to <span class="mono">terraform init</span> and <span class="mono">terraform show -json</span>
-    (default 300). Two root × environment pairs are synced at a time; providers are cached once in the IPLens data directory.</p>
+    (default 120) of roots whose backend is not S3. Roots on an <span class="mono">s3</span> backend never run terraform:
+    their state object is read directly (read-only) with the mapped account's credentials, eight at a time; set
+    values CI passes with <span class="mono">-backend-config</span> per root on the Terraform repo page. Two terraform
+    root × environment pairs run at a time; providers are cached once in the IPLens data directory, and git module
+    fetches fail instead of prompting for credentials.</p>
   <p><button type="submit">Save</button></p>
 </form>
 

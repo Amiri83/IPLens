@@ -8,24 +8,32 @@ workspaces) and guesses each environment's AWS account id and region. Only paths
 names, the backend *type* and those two guesses are kept; variable, provider and
 backend values are never stored, logged or displayed.
 
-The sync (:func:`sync_env`) runs nothing but the invocations in
-:data:`ALLOWED_INVOCATIONS`, checked by :func:`check_allowlisted` right before
-``subprocess`` is called with an explicit argv (no shell), ``cwd`` at the root
-directory, ``TF_DATA_DIR`` in the app's cache directory (repo-scoped; the repo stays
-untouched), ``TF_PLUGIN_CACHE_DIR`` shared in that cache, the mapped IPLens account's
-credentials and a configurable timeout; a cancelled job or a timeout terminates the
-running command (killed after :data:`KILL_GRACE` seconds). ``plan``, ``apply``,
-``import``, ``destroy``, ``state`` and every other command or flag are refused. Roots
-on the local backend are read straight from their ``.tfstate`` file instead. Up to
-:data:`PARALLEL_ROOTS` pairs are synced at once. The AWS account ids in the state's
-ARNs are checked against the mapped account (a mismatch is ``wrong account`` and left
-out of drift); nothing else from the state is kept.
+The sync (:func:`sync`) first checks every mapped account's credentials
+(``sts:GetCallerIdentity``, ~10 s timeout; invalid or expired credentials abort the whole
+sync with :class:`SyncAborted`). Roots on the ``s3`` backend never run terraform: their
+state object is listed and read with boto3 (:mod:`iplens.s3state`, read-only, the mapped
+account's credentials or the backend's ``role_arn``), :data:`S3_PARALLEL` at a time.
+Roots on the local backend are read straight from their ``.tfstate`` file.
+
+Every other backend runs nothing but the invocations in :data:`ALLOWED_INVOCATIONS`,
+checked by :func:`check_allowlisted` right before ``subprocess`` is called with an
+explicit argv (no shell), ``cwd`` at the root directory, ``TF_DATA_DIR`` in the app's
+cache directory (repo-scoped; the repo stays untouched), ``TF_PLUGIN_CACHE_DIR`` shared
+in that cache, the mapped IPLens account's credentials, git set up to fail instead of
+prompting (``GIT_TERMINAL_PROMPT=0``, no ``GIT_ASKPASS``) and a configurable timeout; a
+cancelled job or a timeout terminates the running command (killed after
+:data:`KILL_GRACE` seconds). ``plan``, ``apply``, ``import``, ``destroy``, ``state`` and
+every other command or flag are refused. Up to :data:`PARALLEL_ROOTS` of those pairs run
+at once. The AWS account ids in the state's ARNs are checked against the mapped account
+(a mismatch is ``wrong account`` and left out of drift); nothing else from the state is
+kept. Each pair's time is logged.
 """
 
 from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -41,8 +49,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from . import terraform
-from .accounts import Account
+import botocore.exceptions
+from botocore.exceptions import BotoCoreError, ClientError
+
+from . import s3state, terraform
+from .accounts import EXPIRED_MESSAGE, Account, CredentialError
+from .aws import FAST_CONFIG, AwsGateway, is_credential_failure
 from .db import closing
 from .jobs import JobCancelled, NullProgress, Progress
 
@@ -429,6 +441,19 @@ def _analyse_root(repo: Path, d: Path, text: str) -> RootInfo:
     )
 
 
+def _root_text(d: Path, filenames: Iterable[str] | None = None) -> str:
+    """The ``.tf`` files of directory ``d``, comments stripped (size-capped)."""
+    names = filenames if filenames is not None else (p.name for p in d.glob("*.tf"))
+    parts, size = [], 0
+    for f in sorted(n for n in names if n.endswith(".tf")):
+        t = _read_text(d / f)
+        size += len(t)
+        if size > MAX_ROOT_TEXT:
+            break
+        parts.append(_strip_comments(t))
+    return "\n".join(parts)
+
+
 def discover(repo_path: str | os.PathLike[str]) -> list[RootInfo]:
     """Roots and environments of the repository at ``repo_path`` (files are only read)."""
     repo = Path(repo_path).expanduser().resolve()
@@ -448,17 +473,9 @@ def discover(repo_path: str | os.PathLike[str]) -> list[RootInfo]:
         if seen > MAX_DIRS or len(roots) >= MAX_ROOTS:
             log.warning("terraform discovery stopped early (repository too large)")
             break
-        tf_files = sorted(f for f in filenames if f.endswith(".tf"))
-        if not tf_files:
+        if not any(f.endswith(".tf") for f in filenames):
             continue
-        parts, size = [], 0
-        for f in tf_files:
-            t = _read_text(d / f)
-            size += len(t)
-            if size > MAX_ROOT_TEXT:
-                break
-            parts.append(_strip_comments(t))
-        text = "\n".join(parts)
+        text = _root_text(d, filenames)
         rel = "." if d == repo else _rel(d, repo)
         if _is_root(text, rel):
             roots.append(_analyse_root(repo, d, text))
@@ -621,6 +638,61 @@ def save_mapping(conn: sqlite3.Connection, repo_id: int, mapping: dict[int, int 
         "SELECT COUNT(*) FROM tf_repo_envs WHERE repo_id=? AND confirmed=1 AND present=1",
         (repo_id,),
     ).fetchone()[0]
+
+
+def save_backend_extra(
+    conn: sqlite3.Connection,
+    repo_id: int,
+    env_id: int,
+    text: str,
+    encrypt: Callable[[str], str],
+) -> list[str]:
+    """Store an environment's "extra backend-config" ``key=value`` lines (s3 backends).
+
+    The values are what CI passes with ``-backend-config``; they are needed for every
+    state read, so they are kept Fernet-encrypted (``encrypt``) and only their key
+    names in clear. Empty ``text`` clears them. Returns the key names; ValueError (no
+    values in its message) for invalid lines.
+    """
+    values = s3state.parse_extra(text)
+    keys = sorted(values)
+    conn.execute(
+        "UPDATE tf_repo_envs SET backend_extra_enc=?, backend_extra_keys=? "
+        "WHERE id=? AND repo_id=?",
+        (encrypt(json.dumps(values)) if values else "", ",".join(keys), env_id, repo_id),
+    )
+    return keys
+
+
+def backend_extra(row: dict[str, Any], decrypt: Callable[[str], str] | None) -> dict[str, str]:
+    """The decrypted extra backend-config of an env row ({} if none / undecryptable)."""
+    enc = row.get("backend_extra_enc") or ""
+    if not enc or decrypt is None:
+        return {}
+    try:
+        values = json.loads(decrypt(enc))
+    except ValueError:
+        log.warning("extra backend-config of env row %s cannot be decrypted", row.get("id"))
+        return {}
+    return {k: v for k, v in values.items() if k in s3state.BACKEND_KEYS and isinstance(v, str)}
+
+
+def s3_backend(
+    root: Path, row: dict[str, Any], extra: dict[str, str], default_region: str = ""
+) -> s3state.S3Backend:
+    """The s3 backend settings of a root x environment: its ``backend "s3"`` block, its
+    ``-backend-config`` file, then ``extra`` (partial configurations are fine)."""
+    block: dict[str, str] = {}
+    for _, tbody in _blocks(_root_text(root), "terraform"):
+        for labels, body in _blocks(tbody, "backend"):
+            if labels and labels[0] == "s3":
+                block = s3state.parse_hcl(body)
+    from_file: dict[str, str] = {}
+    if row.get("backend_config"):
+        bfile = (root / row["backend_config"]).resolve()
+        if bfile.is_file() and _inside(bfile, root):
+            from_file = s3state.parse_hcl(_strip_comments(_read_text(bfile)))
+    return s3state.resolve(block, from_file, extra, default_region=default_region)
 
 
 # -- the command allowlist ---------------------------------------------------------------
@@ -826,10 +898,12 @@ OK, INIT_FAILED, NO_STATE, SHOW_FAILED, ERROR, WRONG_ACCOUNT, CANCELLED = (
     "cancelled",
 )
 # Seconds each terraform command may run (Settings: "Terraform timeout").
-DEFAULT_TIMEOUT = 300.0
+DEFAULT_TIMEOUT = 120.0
 WORKSPACE_TIMEOUT = 60.0
-# Root x environment pairs synced at the same time (a small bounded thread pool).
+# Root x environment pairs running terraform at the same time (a small bounded pool).
 PARALLEL_ROOTS = 2
+# S3-backend pairs read at the same time (a few API calls each, no subprocess).
+S3_PARALLEL = 8
 # Under the cache directory: provider plugins shared by every sync (TF_PLUGIN_CACHE_DIR).
 PLUGIN_CACHE = "plugin-cache"
 # Inherited by terraform; AWS credentials come from the mapped account (below).
@@ -858,8 +932,17 @@ _PASSTHROUGH_ENV = frozenset(
         "AWS_CONFIG_FILE",
         "AWS_SHARED_CREDENTIALS_FILE",
         "AWS_CA_BUNDLE",
+        # git module sources over SSH: the agent and the user's ssh command (see below).
+        "SSH_AUTH_SOCK",
+        "GIT_SSH_COMMAND",
     }
 )
+# git must fail at once instead of waiting for a password nobody will type: no terminal
+# prompt, no askpass helper (GIT_ASKPASS / SSH_ASKPASS are never passed through), and
+# ssh in batch mode unless the user configured their own GIT_SSH_COMMAND.
+_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+_GIT_SSH_DEFAULT = "ssh -o BatchMode=yes -o ConnectTimeout=10"
+_NEVER_PASSED = ("GIT_ASKPASS", "SSH_ASKPASS")
 _PASSTHROUGH_PREFIXES = ("TF_TOKEN_",)  # Terraform Cloud / registry API tokens
 _KEY_ID_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 
@@ -901,7 +984,11 @@ def terraform_env(
         TF_IN_AUTOMATION="1",
         TF_INPUT="0",
         CHECKPOINT_DISABLE="1",
+        **_GIT_ENV,
     )
+    env.setdefault("GIT_SSH_COMMAND", _GIT_SSH_DEFAULT)
+    for k in _NEVER_PASSED:
+        env.pop(k, None)
     if plugin_cache is not None:
         env["TF_PLUGIN_CACHE_DIR"] = str(plugin_cache)
     return env
@@ -926,6 +1013,16 @@ class SyncResult:
     status: str
     detail: str = ""
     resources: int = 0
+    seconds: float = 0.0  # wall time of this pair
+
+
+class SyncAborted(RuntimeError):
+    """A mapped account's credentials are invalid or expired: nothing was synced.
+    The message is safe to show (account name and reason, no credential values)."""
+
+    def __init__(self, message: str, account_ref: int | None = None):
+        super().__init__(message)
+        self.account_ref = account_ref
 
 
 def root_name_for(repo_path: str, root_rel: str, env: str) -> str:
@@ -963,10 +1060,11 @@ def _record(conn: sqlite3.Connection, row: dict[str, Any], result: SyncResult) -
         (result.status, result.detail[:300], _now(), row["id"]),
     )
     log.info(
-        "terraform sync %s: %s%s",
+        "terraform sync %s: %s%s in %.1fs",
         result.label,
         result.status,
         f" ({result.detail})" if result.detail else "",
+        result.seconds,
     )
     return result
 
@@ -1005,23 +1103,31 @@ def sync_env(
     runner: Runner = run_process,
     timeout: float = DEFAULT_TIMEOUT,
     progress: Progress | None = None,
+    s3_clients: s3state.Clients | None = None,
+    extra: dict[str, str] | None = None,
+    identity: str = "",
 ) -> SyncResult:
     """Sync one confirmed root x environment (``row`` from :func:`list_envs`).
 
-    After ``show -json`` the AWS account ids in the state's ARNs are compared with the
-    mapped account: a state whose resources live in another account is ``wrong
-    account`` (its root is left out of drift). ``progress`` reports the current command
-    and is checked for cancellation before each one and while it runs: a cancelled or
-    timed-out command is terminated (killed after :data:`KILL_GRACE` seconds) and the
-    pair's partial ``TF_DATA_DIR`` removed, so the next run starts clean.
+    An ``s3`` backend's state object is read directly (``s3_clients``; ``extra`` holds
+    the decrypted extra backend-config), a local one from its file; any other backend
+    runs the allowlisted terraform commands. The AWS account ids in the state's ARNs
+    are compared with the mapped account (or ``identity``, the account its credentials
+    resolved to in the pre-flight): a state whose resources live in another account is
+    ``wrong account`` (its root is left out of drift). ``progress`` reports the current
+    step and is checked for cancellation before each one and while a command runs: a
+    cancelled or timed-out command is terminated (killed after :data:`KILL_GRACE`
+    seconds) and the pair's partial ``TF_DATA_DIR`` removed, so the next run starts clean.
     """
     label = f"{row['root_label']} [{row['env']}]"
     where = f"root {row['root_label']} env {row['env']}"
     progress = progress or NullProgress()
-    expected = expected_account_id(account)
+    expected = expected_account_id(account) or identity
+    started = time.monotonic()
 
     def done(status: str, detail: str = "", count: int = 0) -> SyncResult:
-        return _record(conn, row, SyncResult(row["id"], label, status, detail, count))
+        seconds = time.monotonic() - started
+        return _record(conn, row, SyncResult(row["id"], label, status, detail, count, seconds))
 
     def ingest(doc: Any, ok_detail: str) -> SyncResult:
         if not terraform.has_state(doc):
@@ -1062,6 +1168,40 @@ def sync_env(
         except (ValueError, OSError) as exc:
             return done(SHOW_FAILED, str(exc) if isinstance(exc, ValueError) else "unreadable")
         return ingest(doc, "local state file")
+
+    if row["backend"] == "s3":
+        try:
+            progress.check()
+        except JobCancelled:
+            return done(CANCELLED, "cancelled before the state was read")
+        progress.step(f"{where} · reading the state from S3")
+        cfg = s3_backend(root, row, extra or {}, account.region or row["guess_region"])
+        missing = cfg.missing()
+        if missing:
+            return done(
+                ERROR,
+                f"s3 backend config incomplete: no {' / '.join(missing)} "
+                "(add it under extra backend-config)",
+            )
+        if cfg.profile:
+            log.info("%s: the backend's profile is ignored; the mapped account is used", where)
+        try:
+            client = (s3_clients or s3state.Clients()).s3(account, cfg)
+            data = s3state.read_state(client, cfg, row["workspace"])
+        except s3state.StateMissing:
+            return done(NO_STATE, "no state object in the bucket (workspace not created yet?)")
+        except s3state.StateUnavailable as exc:
+            return done(ERROR, str(exc))
+        except (CredentialError, BotoCoreError, ClientError) as exc:
+            if is_credential_failure(exc):
+                return done(ERROR, f"account credentials: {EXPIRED_MESSAGE}")
+            return done(ERROR, f"S3 state read failed ({type(exc).__name__})")
+        try:
+            doc = terraform.load_document(data)
+        except ValueError as exc:
+            return done(SHOW_FAILED, str(exc))
+        del data  # nothing but the extracted ids outlives parsing
+        return ingest(doc, "s3 state")
 
     if not terraform_bin:
         return done(ERROR, "terraform binary not found (PATH or IPLENS_TERRAFORM_BIN)")
@@ -1154,6 +1294,103 @@ def sync_env(
     return ingest(doc, "")
 
 
+# Raised while resolving credentials: the user fixes these by changing the account.
+_CREDENTIAL_EXCEPTIONS = (
+    CredentialError,
+    *(
+        getattr(botocore.exceptions, n)
+        for n in (
+            "NoCredentialsError",
+            "PartialCredentialsError",
+            "ProfileNotFound",
+            "CredentialRetrievalError",
+            "TokenRetrievalError",
+            "SSOTokenLoadError",
+            "UnauthorizedSSOTokenError",
+        )
+        if hasattr(botocore.exceptions, n)
+    ),
+)
+# AWS error codes of credentials that are not (or no longer) valid.
+_INVALID_CREDENTIAL_CODES = frozenset(
+    {"InvalidClientTokenId", "SignatureDoesNotMatch", "UnrecognizedClientException"}
+)
+
+
+@dataclass
+class Preflight:
+    identities: dict[int, str] = field(default_factory=dict)  # account ref -> AWS account
+    problems: dict[int, str] = field(default_factory=dict)  # account ref -> why skipped
+
+
+def _credential_reason(exc: BaseException) -> str:
+    """Why credentials are unusable ('' if ``exc`` is not a credential failure)."""
+    if isinstance(exc, CredentialError):
+        return str(exc)
+    if isinstance(exc, _CREDENTIAL_EXCEPTIONS):
+        return f"credentials could not be loaded ({type(exc).__name__})"
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if is_credential_failure(exc) and code not in _INVALID_CREDENTIAL_CODES:
+            return EXPIRED_MESSAGE
+        if code in _INVALID_CREDENTIAL_CODES:
+            return f"credentials are invalid ({code})"
+    return ""
+
+
+def preflight(accounts: Sequence[Account], clients: s3state.Clients) -> Preflight:
+    """``sts:GetCallerIdentity`` for each account (~10 s timeout, in parallel).
+
+    Raises :class:`SyncAborted` when any account's credentials are invalid or expired;
+    an account AWS could not be reached for is listed in ``problems`` (its pairs are
+    skipped, the others synced)."""
+    out = Preflight()
+
+    def check(account: Account) -> tuple[Account, str, str]:
+        problem = account.credential_problem()
+        if problem:
+            return account, "credentials", problem
+        try:
+            ident = clients.gateway(account).caller_identity(config=FAST_CONFIG)
+        except Exception as exc:  # noqa: BLE001 - classified below, details only logged
+            reason = _credential_reason(exc)
+            if reason:
+                return account, "credentials", reason
+            log.warning("pre-flight of account=%s failed: %s", account.id, type(exc).__name__)
+            if isinstance(exc, ClientError):
+                code = exc.response.get("Error", {}).get("Code", "") or "error"
+                return account, "failed", f"sts:GetCallerIdentity failed ({code})"
+            return account, "failed", f"AWS not reachable ({type(exc).__name__})"
+        return account, "ok", str(ident.get("account", ""))
+
+    started = time.monotonic()
+    if len(accounts) <= 1:
+        checks = [check(a) for a in accounts]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=min(S3_PARALLEL, len(accounts)), thread_name_prefix="iplens-pre"
+        ) as pool:
+            checks = list(pool.map(check, accounts))
+    log.info(
+        "terraform sync pre-flight: %d account(s) in %.1fs",
+        len(accounts),
+        time.monotonic() - started,
+    )
+    for account, kind, value in checks:
+        if kind == "credentials":
+            raise SyncAborted(
+                f"the credentials of account {account.display_name or account.id} are invalid "
+                f"or expired: {value}",
+                account.id,
+            )
+        ref = account.id if account.id is not None else -1
+        if kind == "ok":
+            out.identities[ref] = value
+        else:
+            out.problems[ref] = value
+    return out
+
+
 def sync(
     db_path: Path,
     get_account: Callable[[int], Account | None],
@@ -1166,12 +1403,21 @@ def sync(
     timeout: float = DEFAULT_TIMEOUT,
     progress: Progress | None = None,
     parallel: int = PARALLEL_ROOTS,
+    gateway_factory: Callable[[Account], AwsGateway] = AwsGateway.from_account,
+    decrypt: Callable[[str], str] | None = None,
 ) -> list[SyncResult]:
     """Sync every confirmed, present root x environment (optionally of one account /
-    repository), ``parallel`` at a time. ``get_account`` returns the account *with* its
-    secrets. Each pair runs in its own thread with its own database connection; once
+    repository). ``get_account`` returns the account *with* its secrets; ``decrypt``
+    opens the stored extra backend-config.
+
+    First the pre-flight (:func:`preflight`) checks every account a non-local pair
+    needs: invalid or expired credentials raise :class:`SyncAborted` before anything is
+    synced (every pair is marked ``error``). Then s3-backend pairs are read
+    :data:`S3_PARALLEL` at a time while the terraform pairs run ``parallel`` at a time.
+    Each pair runs in its own thread with its own database connection; once
     ``progress`` is cancelled no further pair is started."""
     progress = progress or NullProgress()
+    started = time.monotonic()
     with closing(db_path) as conn:
         rows = [
             r
@@ -1190,33 +1436,84 @@ def sync(
         f"terraform sync: {len(work)} root × environment pair(s)", done=0, total=len(work)
     )
 
+    def label(row: dict[str, Any]) -> str:
+        return f"{row['root_label']} [{row['env']}]"
+
+    clients = s3state.Clients(gateway_factory)
+    needs_aws = {a.id: a for r, a in work if r["backend"] != "local"}
+    if needs_aws:
+        progress.step(f"terraform sync: checking {len(needs_aws)} account(s)")
+        try:
+            pre = preflight(list(needs_aws.values()), clients)
+        except SyncAborted as exc:
+            log.warning("terraform sync aborted: %s", exc)
+            with closing(db_path) as conn:
+                for row, _a in work:
+                    _record(conn, row, SyncResult(row["id"], label(row), ERROR, f"aborted: {exc}"))
+            raise
+    else:
+        pre = Preflight()
+
     def one(item: tuple[dict[str, Any], Account]) -> SyncResult:
         row, account = item
         with progress.bind():
             if progress.cancelled:
-                return SyncResult(
-                    row["id"], f"{row['root_label']} [{row['env']}]", CANCELLED, "not started"
-                )
+                return SyncResult(row["id"], label(row), CANCELLED, "not started")
             with closing(db_path) as conn:
-                result = sync_env(
-                    conn,
-                    row,
-                    account,
-                    cache_dir=cache_dir,
-                    terraform_bin=terraform_bin,
-                    runner=runner,
-                    timeout=timeout,
-                    progress=progress,
-                )
+                problem = pre.problems.get(account.id or -1) if row["backend"] != "local" else None
+                if problem:
+                    result = _record(
+                        conn,
+                        row,
+                        SyncResult(row["id"], label(row), ERROR, f"pre-flight: {problem}"),
+                    )
+                else:
+                    result = sync_env(
+                        conn,
+                        row,
+                        account,
+                        cache_dir=cache_dir,
+                        terraform_bin=terraform_bin,
+                        runner=runner,
+                        timeout=timeout,
+                        progress=progress,
+                        s3_clients=clients,
+                        extra=backend_extra(row, decrypt) if row["backend"] == "s3" else None,
+                        identity=pre.identities.get(account.id or -1, ""),
+                    )
             progress.advance()
             return result
 
-    if parallel <= 1 or len(work) <= 1:
-        return [one(w) for w in work]
-    with ThreadPoolExecutor(
-        max_workers=min(parallel, len(work)), thread_name_prefix="iplens-tf"
-    ) as pool:
-        return list(pool.map(one, work))
+    def run_all(items: list[tuple[int, Any]], width: int, pool_name: str) -> list[tuple[int, Any]]:
+        if width <= 1 or len(items) <= 1:
+            return [(i, one(w)) for i, w in items]
+        with ThreadPoolExecutor(
+            max_workers=min(width, len(items)), thread_name_prefix=pool_name
+        ) as p:
+            return list(zip((i for i, _ in items), p.map(one, (w for _, w in items)), strict=True))
+
+    indexed = list(enumerate(work))
+    fast = [(i, w) for i, w in indexed if w[0]["backend"] in ("s3", "local")]
+    slow = [(i, w) for i, w in indexed if w[0]["backend"] not in ("s3", "local")]
+    if fast and slow and parallel > 1:
+        # The S3 reads finish while terraform still runs; neither waits for the other.
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="iplens-sync") as both:
+            f_fast = both.submit(run_all, fast, S3_PARALLEL, "iplens-s3")
+            f_slow = both.submit(run_all, slow, parallel, "iplens-tf")
+            done_items = f_fast.result() + f_slow.result()
+    else:
+        done_items = run_all(fast, S3_PARALLEL if parallel > 1 else 1, "iplens-s3") + run_all(
+            slow, parallel, "iplens-tf"
+        )
+    results = [r for _, r in sorted(done_items, key=lambda x: x[0])]
+    log.info(
+        "terraform sync finished: %d pair(s) (%d s3, %d terraform) in %.1fs",
+        len(results),
+        sum(1 for r, _a in work if r["backend"] == "s3"),
+        len(slow),
+        time.monotonic() - started,
+    )
+    return results
 
 
 def summarise(results: Sequence[SyncResult]) -> str:
