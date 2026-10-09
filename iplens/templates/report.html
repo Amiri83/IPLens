@@ -1,0 +1,264 @@
+<!doctype html>
+{#- Self-contained report (report.py): inline CSS and SVG only. No scripts, links or
+    external assets, so the file can be saved, shared and printed to PDF as is. -#}
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IPLens report · {{ r.account }}{{ ' · ' ~ r.env_label if r.env }}</title>
+<style>
+:root {
+  --bg: #fff; --fg: #1f2933; --muted: #535e6b; --line: #dde2e8; --card: #f6f7f9;
+  --used: #3b6fd8; --idle: #e8a33a; --reserved: #8a94a3; --free: #e3e8ee; --err: #c0392b;
+  --badge-bg: #e8edf3; --badge-fg: #364250;
+  --ok-bg: #e1f3e6; --ok-fg: #1c6634; --warn-bg: #fdf0d9; --warn-fg: #7a4800;
+  --err-bg: #fbe4e1; --err-fg: #a3261a; --blocked-bg: #eef0f3; --blocked-fg: #545e69;
+}
+* { box-sizing: border-box; }
+html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+body { margin: 0 auto; max-width: 980px; padding: 1.5rem; background: var(--bg); color: var(--fg);
+       font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+h1 { font-size: 22px; margin: 0 0 .25rem; }
+h2 { font-size: 16px; margin: 1.6rem 0 .5rem; padding-bottom: .25rem; border-bottom: 2px solid var(--line); }
+h3 { font-size: 13px; margin: .9rem 0 .35rem; }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.meta { color: var(--muted); margin-bottom: .6rem; }
+.note { background: var(--card); border: 1px solid var(--line); border-radius: 5px; padding: .4rem .6rem; margin: .3rem 0; }
+table { width: 100%; border-collapse: collapse; margin: .2rem 0 .6rem; }
+th, td { text-align: left; padding: .3rem .45rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; font-size: 11px; text-transform: uppercase; color: var(--muted); }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr { break-inside: avoid; }
+tr.blocked td { color: var(--blocked-fg); background: var(--blocked-bg); }
+.badge { display: inline-block; padding: 0 .4rem; border-radius: 3px; font-size: 11px;
+         background: var(--badge-bg); color: var(--badge-fg); white-space: nowrap; }
+.badge.ok { background: var(--ok-bg); color: var(--ok-fg); }
+.badge.warn { background: var(--warn-bg); color: var(--warn-fg); }
+.badge.err { background: var(--err-bg); color: var(--err-fg); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: .5rem; margin: .4rem 0 .8rem; }
+.tile { border: 1px solid var(--line); border-radius: 6px; padding: .45rem .6rem; background: var(--card); }
+.tile .v { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tile .k { color: var(--muted); font-size: 11px; text-transform: uppercase; }
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+.pbar .pbar-bg { fill: var(--free); }
+.pbar .pbar-fg { fill: var(--used); }
+.pbar.err .pbar-fg { fill: var(--err); }
+.pbar { vertical-align: middle; }
+pre { background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: .4rem .6rem;
+      margin: .3rem 0; white-space: pre-wrap; font-size: 11.5px; }
+ul.reasons { margin: .2rem 0; padding-left: 1.1rem; }
+/* Trends charts (trends.svg_chart): same classes and tokens as the app's stylesheet. */
+.trend-chart { display: block; max-width: 100%; height: auto; }
+.trend-chart .trend-line { fill: none; stroke: var(--used); stroke-width: 2; stroke-linejoin: round; }
+.trend-chart .trend-dot { fill: var(--used); stroke: var(--bg); stroke-width: 2; }
+.trend-chart .trend-hit { fill: transparent; stroke: none; }
+.trend-chart .trend-cap { stroke: var(--err); stroke-width: 1.5; stroke-dasharray: 6 4; }
+.trend-chart .trend-fit { stroke: var(--reserved); stroke-width: 1.5; stroke-dasharray: 3 3; }
+.trend-chart .trend-grid { stroke: var(--line); stroke-width: 1; }
+.trend-chart .trend-axis, .trend-chart .trend-empty { fill: var(--muted); font-size: 11px; }
+.trend-chart .trend-label { fill: var(--fg); font-size: 11.5px; }
+footer { margin-top: 2rem; color: var(--muted); font-size: 11px; border-top: 1px solid var(--line); padding-top: .4rem; }
+@page { size: A4; margin: 14mm; }
+@media print {
+  body { padding: 0; max-width: none; font-size: 11.5px; }
+  h2 { break-after: avoid; }
+  section.keep { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>IP address report</h1>
+  <div class="meta">
+    <b>{{ r.account }}</b> · region <span class="mono">{{ r.region }}</span> ·
+    snapshot taken {{ r.taken_at }} · generated {{ r.generated_at }}
+    {% if r.env %} · environment <span class="badge">{{ r.env_label }}</span>{% endif %}
+    {% if r.redacted %} · <span class="badge warn">identifiers redacted</span>{% endif %}
+  </div>
+  {% for n in r.notes %}<div class="note">{{ n }}</div>{% endfor %}
+</header>
+
+<section id="summary" class="keep">
+  <h2>Summary</h2>
+  {% set s = r.summary %}
+  <div class="tiles">
+    <div class="tile"><div class="k">VPCs</div><div class="v">{{ s.vpcs }}</div></div>
+    <div class="tile"><div class="k">Subnets</div><div class="v">{{ s.subnets }}</div></div>
+    <div class="tile"><div class="k">Usable IPs</div><div class="v">{{ s.usable }}</div></div>
+    <div class="tile"><div class="k">Used (incl. idle)</div><div class="v">{{ s.used_pct | pct }}</div>
+      <div class="muted">{{ s.consumed }} IPs · {{ s.idle }} idle</div></div>
+    <div class="tile"><div class="k">Free</div><div class="v">{{ s.free_pct | pct }}</div>
+      <div class="muted">{{ s.free }} IPs</div></div>
+    <div class="tile"><div class="k">At-risk subnets</div><div class="v">{{ r.at_risk | length }}</div></div>
+  </div>
+  <h3>At-risk subnets</h3>
+  <p class="muted">Forecast full within {{ soon_days }} days (Trends, {{ r.trend_window }}-day window) or less than {{ at_risk_pct | int }}% free.</p>
+  <table>
+    <thead><tr><th>Subnet</th><th>Name</th><th>CIDR</th><th>AZ</th><th class="num">Used</th>
+      <th class="num">Free</th><th>Free %</th><th>Forecast</th></tr></thead>
+    <tbody>
+    {% for a in r.at_risk %}
+      <tr>
+        <td class="mono">{{ a.subnet.subnet_id }}</td>
+        <td>{{ a.subnet.name }}</td>
+        <td class="mono">{{ a.subnet.cidr }}</td>
+        <td>{{ a.subnet.az }}</td>
+        <td class="num">{{ a.subnet.consumed }}</td>
+        <td class="num">{{ a.subnet.free }}</td>
+        <td>{{ bar(100 - a.subnet.free_pct, width=80, cls='err') }} {{ a.subnet.free_pct | pct }}</td>
+        <td>{% if a.forecast %}{{ a.forecast.text }}{% if a.forecast.confidence_note %}<div class="muted">{{ a.forecast.confidence_note }}</div>{% endif %}{% else %}<span class="muted">no history</span>{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="muted">No subnet is at risk.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section id="consumers">
+  <h2>Top IP consumers</h2>
+  <div class="cols">
+  {% for title, rows in (("By owner", r.by_owner), ("By environment", r.by_env), ("By resource type", r.by_type)) %}
+    <div>
+      <h3>{{ title }}</h3>
+      <table>
+        <thead><tr><th>{{ title[3:] | capitalize }}</th><th class="num">IPs</th><th>Share</th></tr></thead>
+        <tbody>
+        {% for c in rows %}
+          <tr><td>{{ c.label }}</td><td class="num">{{ c.ips }}</td><td>{{ bar(c.pct, width=90) }} {{ c.pct | pct }}</td></tr>
+        {% else %}
+          <tr><td colspan="3" class="muted">No IPs.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endfor %}
+  </div>
+</section>
+
+<section id="trend" class="keep">
+  <h2>Used-IP trend</h2>
+  <p class="muted">{{ r.trend_snapshots }} snapshot(s) in the last {{ r.trend_window }} days ·
+    {% set fc = r.trend_total.forecast %}forecast: {{ fc.text if fc else 'not enough data' }}
+    {% if fc and fc.confidence_note %} · {{ fc.confidence_note }}{% endif %}</p>
+  {{ chart(r.trend_total, width=900, height=240) }}
+  {% if r.trend_vpcs | length > 1 %}
+    <table>
+      <thead><tr><th>VPC</th><th>Name</th><th class="num">Used</th><th class="num">Limit</th><th>Trend</th><th>Forecast</th></tr></thead>
+      <tbody>
+      {% for v in r.trend_vpcs %}
+        <tr><td class="mono">{{ v.key }}</td><td>{{ v.name }}</td><td class="num">{{ v.latest }}</td>
+          <td class="num">{{ v.capacity }}</td><td>{{ chart(v, width=160, height=36, compact=True) }}</td>
+          <td>{{ v.forecast.text if v.forecast else '' }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+
+<section id="suggestions">
+  <h2>Suggestions</h2>
+  <div class="tiles">
+    <div class="tile"><div class="k">Allowed: IPs to free</div><div class="v">{{ r.totals.allowed }}</div>
+      <div class="muted">{{ r.allowed | length }} suggestion(s)</div></div>
+    <div class="tile"><div class="k">Blocked by rules</div><div class="v">{{ r.totals.blocked }}</div>
+      <div class="muted">{{ r.blocked | length }} suggestion(s)</div></div>
+  </div>
+  <p class="muted">Estimates; alternative suggestions for the same resources can overlap. IPLens never changes AWS.</p>
+  {% for title, items, blocked in (("Allowed", r.allowed, False), ("Blocked by rule", r.blocked, True)) %}
+    <h3 id="suggestions-{{ 'blocked' if blocked else 'allowed' }}">{{ title }}</h3>
+    <table>
+      <thead><tr><th>Type</th><th>Suggestion</th><th class="num">IPs saved</th>{% if blocked %}<th>Blocked by</th>{% endif %}</tr></thead>
+      <tbody>
+      {% for s in items %}
+        <tr class="{{ 'blocked' if blocked }}">
+          <td><span class="badge">{{ s.kind_label }}</span></td>
+          <td><b>{{ s.title }}</b><div class="muted">{{ s.detail }}</div></td>
+          <td class="num">{% if s.ips_saved %}<b>{{ s.ips_saved }}</b>{% else %}<span class="muted">{{ s.impact or '–' }}</span>{% endif %}</td>
+          {% if blocked %}<td><ul class="reasons">{% for name, reason in s.blocked_by %}<li><b>{{ name }}</b>: {{ reason }}</li>{% endfor %}</ul></td>{% endif %}
+        </tr>
+      {% else %}
+        <tr><td colspan="{{ 4 if blocked else 3 }}" class="muted">None.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endfor %}
+</section>
+
+<section id="headroom">
+  <h2>CIDR headroom</h2>
+  <p class="muted">Free space of each VPC CIDR (every subnet counts). Less than {{ low_pct | int }}% free is flagged.
+    The recommendation is the first /{{ r.secondary_prefix }} secondary CIDR that passes the AWS
+    association restrictions and does not overlap any network IPLens knows (all accounts' VPCs,
+    Transit Gateway and peering routes). Read-only: nothing is created in AWS.</p>
+  {% for h in r.headroom %}
+    <section class="keep">
+    <h3><span class="mono">{{ h.vpc.vpc_id }}</span> {{ h.vpc.name }}
+      · {{ h.free_pct | pct }} free
+      {% if h.low %}<span class="badge err">low headroom</span>{% else %}<span class="badge ok">ok</span>{% endif %}</h3>
+    <table>
+      <thead><tr><th>CIDR</th><th class="num">Addresses</th><th class="num">In subnets</th><th class="num">Free</th>
+        <th>Largest free</th><th class="num">Free /24s</th><th>Fragmentation</th></tr></thead>
+      <tbody>
+      {% for m in h.maps %}
+        <tr><td class="mono">{{ m.cidr }}{% if m.primary %} <span class="badge">primary</span>{% endif %}</td>
+          <td class="num">{{ m.size }}</td><td class="num">{{ m.allocated }}</td><td class="num">{{ m.free_total }}</td>
+          <td class="mono">{{ m.largest_free or '–' }}</td><td class="num">{{ m.per_size[24][0] }}</td>
+          <td>{{ bar(m.fragmentation * 100, width=70) }} {{ '%.2f' | format(m.fragmentation) }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% if h.recommendation %}
+      <div>Secondary CIDR recommendation: <b class="mono">{{ h.recommendation.cidr }}</b>
+        <span class="muted">(pool {{ h.recommendation.pool }})</span>
+        <span class="badge {{ 'warn' if h.recommendation.warnings else 'ok' }}">{{ h.recommendation.status }}</span></div>
+      {% if h.recommendation.warnings %}<ul class="reasons muted">{% for w in h.recommendation.warnings %}<li>{{ w }}</li>{% endfor %}</ul>{% endif %}
+      <pre class="mono">{{ h.terraform }}</pre>
+    {% else %}
+      <div class="muted">No secondary /{{ r.secondary_prefix }} candidate passes the checks.</div>
+    {% endif %}
+    </section>
+  {% else %}
+    <div class="muted">No VPCs.</div>
+  {% endfor %}
+</section>
+
+<section id="ownership" class="keep">
+  <h2>Ownership coverage</h2>
+  {% set o = r.ownership %}
+  {% if o %}
+    <div class="tiles">
+      <div class="tile"><div class="k">Resources</div><div class="v">{{ o.total }}</div></div>
+      <div class="tile"><div class="k">Managed</div><div class="v">{{ r.managed }}</div><div class="muted">{{ r.managed_pct | pct }}</div></div>
+      <div class="tile"><div class="k">Unmanaged</div><div class="v">{{ o.unmanaged | length }}</div></div>
+    </div>
+    <table>
+      <thead><tr><th>Source</th><th class="num">Resources</th><th>Share</th></tr></thead>
+      <tbody>
+      {% for c in o.counts %}
+        <tr><td>{{ c.label }}</td><td class="num">{{ c.count }}</td>
+          <td>{% set p = 100.0 * c.count / o.total if o.total else 0 %}{{ bar(p, width=90, cls='err' if not c.source else '') }} {{ p | pct }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% if o.unmanaged %}
+      <h3>Unmanaged resources{% if o.unmanaged | length > max_unmanaged %} (first {{ max_unmanaged }} of {{ o.unmanaged | length }}){% endif %}</h3>
+      <table>
+        <thead><tr><th>Type</th><th>Resource</th></tr></thead>
+        <tbody>
+        {% for u in o.unmanaged[:max_unmanaged] %}<tr><td>{{ u.label }}</td><td class="mono">{{ u.resource_id }}</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  {% else %}
+    <div class="muted">No ownership data.</div>
+  {% endif %}
+</section>
+
+<footer>
+  Generated by IPLens (read-only). {% if r.redacted %}Account ids, ARNs, IP addresses / CIDRs, AWS resource ids and
+  account names are replaced by keyed-hash placeholders: the same value always gives the same placeholder.{% endif %}
+</footer>
+</body>
+</html>
