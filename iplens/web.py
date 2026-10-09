@@ -30,6 +30,7 @@ from flask import (
 from markupsafe import Markup
 
 from . import (
+    cidrplan,
     diagram,
     environment,
     extgraph,
@@ -743,6 +744,53 @@ def _register(app: Flask) -> None:
             result=result,
             error=error,
             not_set=environment.NOT_SET_LABEL,
+        )
+
+    # -- CIDR planner (read-only proposals) ----------------------------------------------
+
+    @app.get("/cidr-planner")
+    def cidr_planner():
+        snap = _snapshot_or_none()
+        if not snap:
+            return render_template("cidrplan.html", snap=None)
+        # Every subnet counts toward free space; the scope only limits the VPC choice.
+        vpcs = [
+            v
+            for v in queries.vpc_tree(_db(), snap["id"], scope_mod.UNSCOPED)
+            if _scope().vpc_ok(v.vpc_id)
+        ]
+        vpc_id = request.args.get("vpc", "")
+        vpc = next((v for v in vpcs if v.vpc_id == vpc_id), vpcs[0] if vpcs else None)
+        prefix = request.args.get("prefix", cidrplan.DEFAULT_SECONDARY_PREFIX, type=int)
+        if not cidrplan.VPC_MIN_PREFIX <= prefix <= cidrplan.VPC_MAX_PREFIX:
+            prefix = cidrplan.DEFAULT_SECONDARY_PREFIX
+        requests = []
+        for size, az in zip(request.args.getlist("size"), request.args.getlist("az"), strict=False):
+            if size.isdigit() and int(size) in cidrplan.FIT_SIZES:
+                requests.append(cidrplan.FitRequest(int(size), az.strip()[:32]))
+        custom = request.args.get("check", "").strip()[:43]
+        plan, error = None, ""
+        if vpc is not None:
+            try:
+                plan = cidrplan.plan(vpc, cidrplan.known_networks(_db()), requests, prefix, custom)
+            except ValueError:
+                error = f"Not an IPv4 network: {custom}"
+                plan = cidrplan.plan(vpc, cidrplan.known_networks(_db()), requests, prefix)
+        return render_template(
+            "cidrplan.html",
+            snap=snap,
+            vpcs=vpcs,
+            vpc=vpc,
+            plan=plan,
+            prefix=prefix,
+            requests=requests,
+            custom=custom,
+            error=error,
+            sizes=cidrplan.SIZES,
+            fit_sizes=cidrplan.FIT_SIZES,
+            vpc_prefixes=range(cidrplan.VPC_MIN_PREFIX, cidrplan.VPC_MAX_PREFIX + 1),
+            fit_rows=max(len(requests) + 1, 3),
+            tf_secondary=cidrplan.tf_secondary,
         )
 
     # -- subnet grid / ENI / IP table ----------------------------------------
