@@ -74,7 +74,7 @@
     {% for r in tf_roots %}
       <tr>
         <td><b>{{ r.name }}</b></td>
-        <td class="mono small">{{ r.source }}{% if not r.source_path %} <span class="badge">upload</span>{% endif %}</td>
+        <td class="mono small">{{ r.source }}{% if r.origin == 'repo' %} <span class="badge">repo sync</span>{% elif not r.source_path %} <span class="badge">upload</span>{% endif %}</td>
         <td>{{ r.resources }}</td>
         <td>{{ r.loaded_at | localtime }}</td>
         <td style="white-space: nowrap">
@@ -108,6 +108,58 @@
     </div>
     <p><button type="submit">Load</button>
       <span class="muted small">Loading a root name again replaces it.</span></p>
+  </form>
+</section>
+
+<section class="card" id="tfrepos">
+  <h2 style="margin-top: 0">Terraform repos</h2>
+  <p class="muted">Add a local Terraform repository. IPLens scans its <span class="mono">.tf</span> /
+    <span class="mono">.tfvars</span> files (without running terraform) for roots, environments
+    (env folders, <span class="mono">*.tfvars</span>, workspaces) and backends, and guesses each
+    environment's AWS account. After you confirm the mapping, <b>Sync</b> (and every Refresh of a mapped
+    account) runs only <span class="mono">terraform init -input=false -lockfile=readonly</span>,
+    <span class="mono">terraform workspace select</span> and <span class="mono">terraform show -json</span>
+    with the mapped account's credentials and <span class="mono">TF_DATA_DIR</span> in the IPLens data
+    directory: the repository is never modified, and plan / apply / import are never run. Only
+    resource ids, addresses and types are kept. See <a href="{{ url_for('terraform_page') }}">Terraform</a>
+    for sync status and drift.</p>
+  <table class="tf-repos">
+    <thead><tr><th>Repository</th><th>Roots</th><th>Root × env</th><th>Synced pairs</th><th>Scanned</th><th></th></tr></thead>
+    <tbody>
+    {% for p in tf_repos %}
+      <tr>
+        <td class="mono small">{{ p.path }}</td>
+        <td>{{ p.roots }}</td>
+        <td>{{ p.envs }}</td>
+        <td>{{ p.confirmed }}</td>
+        <td>{{ p.discovered_at | localtime }}</td>
+        <td style="white-space: nowrap">
+          <a class="btn secondary" href="{{ url_for('settings_tfrepo', repo_id=p.id) }}">Review mapping</a>
+          <form class="inline" method="post" action="{{ url_for('terraform_sync') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="repo_id" value="{{ p.id }}">
+            <input type="hidden" name="next" value="{{ url_for('settings_page') }}#tfrepos">
+            <button type="submit" class="secondary"{% if not p.confirmed %} disabled title="Confirm the mapping first"{% endif %}>Sync</button>
+          </form>
+          <form class="inline" method="post" action="{{ url_for('tfrepo_delete', repo_id=p.id) }}"
+                onsubmit="return confirm('Remove this repository and the roots its syncs loaded? The repository itself is not touched.')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="danger" type="submit">Remove</button>
+          </form>
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">No Terraform repos added.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <form method="post" action="{{ url_for('tfrepo_add') }}" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div><label for="tfrepo-path">Local repository path</label>
+        <input id="tfrepo-path" name="path" size="50" class="mono" placeholder="/path/to/infra-repo"></div>
+    </div>
+    <p><button type="submit">Add and scan</button></p>
   </form>
 </section>
 

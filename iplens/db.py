@@ -217,7 +217,43 @@ CREATE TABLE IF NOT EXISTS tf_roots (
     name        TEXT NOT NULL UNIQUE,
     source      TEXT NOT NULL DEFAULT '',   -- uploaded file name or local path
     source_path TEXT NOT NULL DEFAULT '',   -- local path for "Reload" ('' for uploads)
-    loaded_at   TEXT NOT NULL
+    loaded_at   TEXT NOT NULL,
+    origin      TEXT NOT NULL DEFAULT ''    -- '' state file / upload | 'repo' repo sync
+);
+
+-- Local Terraform repositories (tfrepo.py). Discovery parses .tf / .tfvars files only;
+-- only paths, names, the backend *type* and the guessed AWS account id / region are kept,
+-- never variable, backend or provider values.
+CREATE TABLE IF NOT EXISTS tf_repos (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    path          TEXT NOT NULL UNIQUE,
+    added_at      TEXT NOT NULL,
+    discovered_at TEXT
+);
+
+-- One row per discovered root x environment. account_ref is the confirmed IPLens account;
+-- only confirmed rows are synced.
+CREATE TABLE IF NOT EXISTS tf_repo_envs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id        INTEGER NOT NULL REFERENCES tf_repos(id) ON DELETE CASCADE,
+    root_rel       TEXT NOT NULL,             -- root directory relative to the repo ('.' = top)
+    root_label     TEXT NOT NULL DEFAULT '',  -- root shown (env folders under their parent)
+    env            TEXT NOT NULL,
+    kinds          TEXT NOT NULL DEFAULT '',  -- how the env was found: dir,tfvars,workspace
+    var_file       TEXT NOT NULL DEFAULT '',  -- relative to the root
+    backend_config TEXT NOT NULL DEFAULT '',  -- relative to the root (-backend-config file)
+    workspace      TEXT NOT NULL DEFAULT '',
+    backend        TEXT NOT NULL DEFAULT '',  -- backend type: s3 | remote | cloud | local | ...
+    guess_account  TEXT NOT NULL DEFAULT '',
+    guess_region   TEXT NOT NULL DEFAULT '',
+    account_ref    INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+    confirmed      INTEGER NOT NULL DEFAULT 0,
+    present        INTEGER NOT NULL DEFAULT 1, -- 0: no longer found by the latest discovery
+    root_name      TEXT NOT NULL DEFAULT '',  -- tf_roots.name the sync writes to
+    status         TEXT NOT NULL DEFAULT '',  -- '' | ok | init failed | no state | ...
+    status_detail  TEXT NOT NULL DEFAULT '',
+    synced_at      TEXT,
+    UNIQUE (repo_id, root_rel, env)
 );
 
 CREATE TABLE IF NOT EXISTS tf_resources (
@@ -369,6 +405,7 @@ _ADDED_COLUMNS = (
     ("visual_prefs", "shorten_names", "INTEGER NOT NULL DEFAULT 0"),
     ("visual_prefs", "evidence", "TEXT"),
     ("visual_prefs", "show_legend", "INTEGER NOT NULL DEFAULT 1"),
+    ("tf_roots", "origin", "TEXT NOT NULL DEFAULT ''"),
 )
 
 # Single-account settings rows from before multi-account support.
