@@ -13,12 +13,13 @@ The sync (:func:`sync_env`) runs nothing but the invocations in
 ``subprocess`` is called with an explicit argv (no shell), ``cwd`` at the root
 directory, ``TF_DATA_DIR`` in the app's cache directory (repo-scoped; the repo stays
 untouched), ``TF_PLUGIN_CACHE_DIR`` shared in that cache, the mapped IPLens account's
-credentials and a configurable timeout. ``plan``, ``apply``, ``import``, ``destroy``,
-``state`` and every other command or flag are refused. Roots on the local backend are
-read straight from their ``.tfstate`` file instead. Up to :data:`PARALLEL_ROOTS` pairs
-are synced at once. The AWS account ids in the state's ARNs are checked against the
-mapped account (a mismatch is ``wrong account`` and left out of drift); nothing else
-from the state is kept.
+credentials and a configurable timeout; a cancelled job or a timeout terminates the
+running command (killed after :data:`KILL_GRACE` seconds). ``plan``, ``apply``,
+``import``, ``destroy``, ``state`` and every other command or flag are refused. Roots
+on the local backend are read straight from their ``.tfstate`` file instead. Up to
+:data:`PARALLEL_ROOTS` pairs are synced at once. The AWS account ids in the state's
+ARNs are checked against the mapped account (a mismatch is ``wrong account`` and left
+out of drift); nothing else from the state is kept.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import time
@@ -684,6 +686,89 @@ def check_allowlisted(argv: Sequence[str], terraform_bin: str) -> list[str]:
 
 
 Runner = Callable[..., subprocess.CompletedProcess]
+Popen = Callable[..., subprocess.Popen]
+
+# Seconds a terraform process gets to exit after terminate() before it is kill()ed.
+KILL_GRACE = 5.0
+# How often a running command checks for a cancel request.
+POLL_INTERVAL = 0.1
+
+
+class CommandCancelled(JobCancelled):
+    """The job was cancelled while a terraform command ran; the process was stopped."""
+
+
+def _signal_group(proc: subprocess.Popen, kill: bool) -> None:
+    """Signal the process group of ``proc`` (provider plugins terraform started)."""
+    if os.name != "posix" or not isinstance(proc, subprocess.Popen):
+        return
+    with contextlib.suppress(OSError):
+        os.killpg(proc.pid, signal.SIGKILL if kill else signal.SIGTERM)
+
+
+def stop_process(proc: subprocess.Popen, grace: float = KILL_GRACE) -> None:
+    """``terminate()`` ``proc``, ``kill()`` it if it has not exited within ``grace``
+    seconds, then reap it and close its pipes. Its process group goes with it."""
+    if proc.poll() is None:
+        proc.terminate()
+        _signal_group(proc, kill=False)
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _signal_group(proc, kill=True)
+            proc.wait()
+    _signal_group(proc, kill=True)  # helpers that ignored SIGTERM or outlived terraform
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError, ValueError):
+        proc.communicate(timeout=grace)
+
+
+def run_process(
+    args: Sequence[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    timeout: float,
+    cancelled: Callable[[], bool] = lambda: False,
+    popen: Popen = subprocess.Popen,
+    grace: float = KILL_GRACE,
+    poll: float = POLL_INTERVAL,
+    **_ignored: Any,
+) -> subprocess.CompletedProcess:
+    """A cancellable ``subprocess.run(args, capture_output=True, timeout=timeout)``.
+
+    The process is spawned with an explicit argv and no shell, in its own session (so
+    its plugins can be stopped with it). Every ``poll`` seconds ``cancelled()`` is
+    checked: on a cancel request (:class:`CommandCancelled`) or once ``timeout`` has
+    passed (``subprocess.TimeoutExpired``) the process is stopped by
+    :func:`stop_process` before the exception is raised.
+    """
+    deadline = time.monotonic() + timeout
+    proc = popen(
+        list(args),
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        while True:
+            try:
+                out, err = proc.communicate(timeout=poll)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                return subprocess.CompletedProcess(list(args), proc.returncode, out, err)
+            if cancelled():
+                raise CommandCancelled()
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(list(args), timeout)
+    except BaseException:
+        stop_process(proc, grace)  # cancel, timeout or anything else: never leave it running
+        raise
 
 
 def run_terraform(
@@ -693,7 +778,8 @@ def run_terraform(
     cwd: Path,
     env: dict[str, str],
     timeout: float,
-    runner: Runner = subprocess.run,
+    runner: Runner = run_process,
+    cancelled: Callable[[], bool] = lambda: False,
 ) -> subprocess.CompletedProcess:
     """Run one allowlisted invocation: explicit argv, no shell, ``TF_DATA_DIR`` set."""
     args = check_allowlisted(argv, terraform_bin)
@@ -710,6 +796,7 @@ def run_terraform(
         timeout=timeout,
         shell=False,
         check=False,
+        cancelled=cancelled,
     )
     log.info(
         "terraform %s exited %s after %.1fs", args[1], proc.returncode, time.monotonic() - started
@@ -915,7 +1002,7 @@ def sync_env(
     *,
     cache_dir: Path,
     terraform_bin: str,
-    runner: Runner = subprocess.run,
+    runner: Runner = run_process,
     timeout: float = DEFAULT_TIMEOUT,
     progress: Progress | None = None,
 ) -> SyncResult:
@@ -924,7 +1011,9 @@ def sync_env(
     After ``show -json`` the AWS account ids in the state's ARNs are compared with the
     mapped account: a state whose resources live in another account is ``wrong
     account`` (its root is left out of drift). ``progress`` reports the current command
-    and is checked for cancellation before each one (a running command finishes first).
+    and is checked for cancellation before each one and while it runs: a cancelled or
+    timed-out command is terminated (killed after :data:`KILL_GRACE` seconds) and the
+    pair's partial ``TF_DATA_DIR`` removed, so the next run starts clean.
     """
     label = f"{row['root_label']} [{row['env']}]"
     where = f"root {row['root_label']} env {row['env']}"
@@ -994,6 +1083,11 @@ def sync_env(
     env = terraform_env(account, data_dir, plugin_cache=plugins)
     secrets = (account.secret_access_key, account.session_token)
 
+    def discard_data_dir() -> None:
+        """Drop the pair's working cache a stopped command may have left half-written."""
+        shutil.rmtree(data_dir, ignore_errors=True)
+        log.info("removed the partial terraform working directory of %s", where)
+
     def run(argv: list[str], limit: float) -> subprocess.CompletedProcess | None:
         progress.check()
         progress.step(f"{where} · terraform {' '.join(argv[1:3])}")
@@ -1005,9 +1099,15 @@ def sync_env(
                 env=env,
                 timeout=limit,
                 runner=runner,
+                cancelled=lambda: progress.cancelled,
             )
+        except CommandCancelled:
+            log.warning("terraform %s stopped: the job was cancelled", argv[1])
+            discard_data_dir()
+            raise
         except subprocess.TimeoutExpired:
-            log.warning("terraform %s timed out after %ss", argv[1], int(limit))
+            log.warning("terraform %s timed out after %ss and was stopped", argv[1], int(limit))
+            discard_data_dir()
             return None
 
     init = [terraform_bin, "init", "-input=false", "-lockfile=readonly"]
@@ -1033,6 +1133,8 @@ def sync_env(
                     _log_failure("workspace select", proc, secrets)
                 return done(INIT_FAILED, "workspace select failed; see the log")
         proc = run([terraform_bin, "show", "-json"], timeout)
+    except CommandCancelled:
+        return done(CANCELLED, "cancelled: the running terraform command was stopped")
     except JobCancelled:
         return done(CANCELLED, "cancelled before the next terraform command")
     except CommandNotAllowed as exc:
@@ -1060,7 +1162,7 @@ def sync(
     terraform_bin: str,
     account_ref: int | None = None,
     repo_id: int | None = None,
-    runner: Runner = subprocess.run,
+    runner: Runner = run_process,
     timeout: float = DEFAULT_TIMEOUT,
     progress: Progress | None = None,
     parallel: int = PARALLEL_ROOTS,
