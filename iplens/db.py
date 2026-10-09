@@ -446,6 +446,14 @@ CREATE TABLE IF NOT EXISTS jobs (
     log         TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS ix_jobs_account ON jobs(account_ref, started_at);
+
+-- Scheduled Refresh (scheduler.py): interval_hours 0 = off. last_run_at is when the
+-- scheduler last started (or tried to start) the account's Refresh.
+CREATE TABLE IF NOT EXISTS refresh_schedules (
+    account_ref    INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+    interval_hours INTEGER NOT NULL DEFAULT 0,
+    last_run_at    TEXT NOT NULL DEFAULT ''
+);
 """
 
 # Seconds a connection waits for another thread's write lock before failing.

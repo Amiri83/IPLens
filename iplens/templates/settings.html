@@ -11,7 +11,7 @@
 <p class="muted">Snapshots, the IP list, the Visual page and suggestions always show the
   <b>active</b> account (selector in the top bar). Rules are shared and can be limited to one account.</p>
 <table class="accounts">
-  <thead><tr><th>Account</th><th>Region</th><th>Auth</th><th>Credentials</th><th></th></tr></thead>
+  <thead><tr><th>Account</th><th>Region</th><th>Auth</th><th>Credentials</th><th>Scheduled refresh</th><th></th></tr></thead>
   <tbody>
   {% for c in accounts %}
     {% set a = c.account %}
@@ -32,6 +32,18 @@
           {% elif a.auth_mode == 'temporary' %}<span class="badge warn">{{ a.status }}</span>{% endif %}
         {% endif %}
       </td>
+      <td>
+        <form class="inline" method="post" action="{{ url_for('account_schedule', account_id=a.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <label for="interval-{{ a.id }}" class="sr-only">Scheduled refresh interval</label>
+          <select id="interval-{{ a.id }}" name="interval" onchange="this.form.submit()">
+            {% for hours, label in intervals.items() %}
+              <option value="{{ hours }}" {{ 'selected' if schedules.get(a.id, 0) == hours }}>{{ label }}</option>
+            {% endfor %}
+          </select>
+          <noscript><button type="submit" class="secondary">Set</button></noscript>
+        </form>
+      </td>
       <td style="white-space: nowrap">
         <a class="btn secondary" href="{{ url_for('account_edit', account_id=a.id) }}">Edit</a>
         <form class="inline" method="post" action="{{ url_for('account_test', account_id=a.id) }}">
@@ -46,17 +58,31 @@
       </td>
     </tr>
   {% else %}
-    <tr><td colspan="5" class="muted">No accounts yet — <a href="{{ url_for('account_new') }}">add one</a>.</td></tr>
+    <tr><td colspan="6" class="muted">No accounts yet — <a href="{{ url_for('account_new') }}">add one</a>.</td></tr>
   {% endfor %}
   </tbody>
 </table>
-<p class="muted small">Test calls sts:GetCallerIdentity and ec2:DescribeVpcs with the account's saved credentials.</p>
+<p class="muted small">Test calls sts:GetCallerIdentity and ec2:DescribeVpcs with the account's saved credentials.
+  A scheduled refresh runs while IPLens is running, as a background job like the Refresh button (skipped while
+  the account already has a job running).</p>
 
 <form class="card" method="post" action="{{ url_for('settings_save') }}" autocomplete="off">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <h2 style="margin-top: 0">Logging</h2>
   <label for="log_dir">Log directory</label>
   <input id="log_dir" name="log_dir" value="{{ s.log_dir }}" size="60" class="mono" placeholder="{{ default_log_dir }}">
+  <h2 id="retention">Snapshot retention</h2>
+  <div class="row">
+    <div><label for="retention_days">Keep snapshots for (days)</label>
+      <input id="retention_days" name="retention_days" type="number" value="{{ s.retention_days }}"
+             min="{{ retention_limits.keep[0] }}" max="{{ retention_limits.keep[1] }}" size="6"></div>
+    <div><label for="downsample_days">One per day after (days)</label>
+      <input id="downsample_days" name="downsample_days" type="number" value="{{ s.downsample_days }}"
+             min="{{ retention_limits.thin[0] }}" max="{{ retention_limits.thin[1] }}" size="6"></div>
+  </div>
+  <p class="muted small">Applied after every Refresh: snapshots older than the window are deleted, and older than
+    the downsample threshold only the newest successful snapshot of each day is kept (Trends stay bounded).
+    The latest successful snapshot of each account is always kept.</p>
   <h2>Environments</h2>
   <label for="env_tag_keys">Environment tag keys</label>
   <input id="env_tag_keys" name="env_tag_keys" value="{{ s.env_tag_keys_text }}" size="40" class="mono" placeholder="Environment, env, stage">

@@ -62,6 +62,9 @@ TEXT_PAIRS = [
     ("fg", "ok-bg"),
     ("fg", "warn-bg"),
     ("fg", "err-bg"),
+    # Diff page deltas, Trends chart labels
+    ("ok-fg", "card"),
+    ("err-fg", "card"),
     # rows greyed out by a rule
     ("blocked-fg", "blocked-bg"),
     ("blocked-link", "blocked-bg"),

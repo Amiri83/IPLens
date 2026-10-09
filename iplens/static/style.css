@@ -24,7 +24,7 @@ header { background: var(--nav-bg); color: var(--nav-fg-active); padding: 0 1.25
          display: flex; align-items: stretch; gap: 1.5rem; height: 48px; }
 header .brand { font-weight: 700; letter-spacing: .02em; align-self: center; }
 header nav { display: flex; align-self: stretch; }
-header nav a { display: flex; align-items: center; padding: 0 .9rem; color: var(--nav-fg);
+header nav a { display: flex; align-items: center; padding: 0 .9rem; color: var(--nav-fg); white-space: nowrap;
                text-decoration: none; font-weight: 500;
                border-top: 3px solid transparent; border-bottom: 3px solid transparent; }
 header nav a:hover { color: var(--nav-fg-active); background: var(--nav-bg-hover);
@@ -224,3 +224,25 @@ pre.job-log { background: var(--bg); color: var(--fg); border: 1px solid var(--l
 .owner-cell .muted { font-size: 11.5px; }
 label.check { display: flex; align-items: center; gap: .4rem; font-weight: normal; }
 details#terraform > summary { cursor: pointer; }
+
+/* Trends: hand-drawn SVG charts (trends.svg_chart). Text uses text tokens, never a series colour. */
+.trend-head { align-items: flex-start; gap: 1.2rem; }
+.trend-chart { display: block; max-width: 100%; height: auto; }
+.trend-chart .trend-line { fill: none; stroke: var(--used); stroke-width: 2;
+                           stroke-linejoin: round; stroke-linecap: round; }
+.trend-chart .trend-dot { fill: var(--used); stroke: var(--card); stroke-width: 2; }
+.trend-chart .trend-hit { fill: transparent; stroke: none; }
+.trend-chart .trend-hit:hover { fill: var(--used); stroke: var(--card); stroke-width: 2; }
+.trend-chart .trend-cap { stroke: var(--err); stroke-width: 1.5; stroke-dasharray: 6 4; }
+.trend-chart .trend-fit { stroke: var(--reserved); stroke-width: 1.5; stroke-dasharray: 3 3; }
+.trend-chart .trend-grid { stroke: var(--line); stroke-width: 1; }
+.trend-chart .trend-axis, .trend-chart .trend-empty { fill: var(--muted); font-size: 11px; }
+.trend-chart .trend-label { fill: var(--fg); font-size: 11.5px; }
+.trend-table tr:target { background: var(--warn-bg); }
+.confidence-note { margin-top: .2rem; }
+.forecast-badge { margin-left: .3rem; font-family: system-ui, sans-serif; }
+/* Diff: signed deltas */
+.delta-up { color: var(--err-fg); font-weight: 600; }
+.delta-down { color: var(--ok-fg); font-weight: 600; }
+.diff-side { gap: 1rem; }
+.diff-group > summary { cursor: pointer; }
