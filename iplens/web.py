@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import secrets
-import subprocess
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -175,7 +174,8 @@ def create_app(
     """Build the app. ``port`` is the port the server listens on; when given,
     the Host header must be ``127.0.0.1:<port>`` or ``localhost:<port>``.
     ``terraform_bin`` (default: found on PATH at sync time) and ``terraform_runner``
-    (default: ``subprocess.run``) are for tests; the command allowlist applies to both."""
+    (default: the cancellable :func:`tfrepo.run_process`) are for tests; the command
+    allowlist applies to both."""
     paths = default_paths(home).ensure()
     init_db(paths.db_path)
     box = SecretBox.from_path(paths.key_path)
@@ -199,7 +199,7 @@ def create_app(
         "gateway_factory": gateway_factory or AwsGateway.from_account,
         "port": port,
         "terraform_bin": terraform_bin,
-        "tf_runner": terraform_runner or subprocess.run,
+        "tf_runner": terraform_runner or tfrepo.run_process,
         # Background jobs (Refresh, service crawl, Terraform sync): one per account.
         "jobs": JobManager(paths.db_path),
     }

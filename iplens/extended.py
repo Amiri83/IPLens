@@ -88,6 +88,8 @@ EXTERNAL_SERVICES = frozenset({"tgw", "tgw-attachment", "pcx", "internet"})
 MAX_PER_SOURCE = 300
 MAX_CONFIG_ITEMS = 100
 MAX_REX_RESOURCES = 2000
+# Ends every snapshot-level "a source hit its cap" warning (see ExtendedCrawler._cap).
+CAPPED_SUFFIX = " of more"
 # A pattern matching more resources than this counts as broad access, like "*".
 MAX_PATTERN_MATCHES = 25
 # Names shorter than this are never matched as references (too many false hits).
@@ -390,6 +392,16 @@ class ExtendedCrawler:
         log.warning("extended crawl: %s", msg)
         self.result.warnings.append(msg)
 
+    def _cap(self, what: str, items: list[Any], limit: int) -> list[Any]:
+        """The first ``limit`` items, with a warning if ``items`` holds more than that.
+
+        Callers fetch ``limit + 1`` items where they can, so "more" is known, not guessed.
+        """
+        if len(items) <= limit:
+            return items
+        self._warn(f"{what}: showing first {limit}{CAPPED_SUFFIX}")
+        return items[:limit]
+
     def _client(self, service: str) -> Any:
         return self.gw.client(service)
 
@@ -539,7 +551,11 @@ class ExtendedCrawler:
 
     def _sqs(self) -> int:
         sqs = self._client("sqs")
-        urls = _pages(sqs, "list_queues", "QueueUrls", MAX_PER_SOURCE)
+        urls = self._cap(
+            "SQS queues",
+            _pages(sqs, "list_queues", "QueueUrls", MAX_PER_SOURCE + 1),
+            MAX_PER_SOURCE,
+        )
         attrs: dict[str, dict[str, str]] = {}
         for url in urls:
             try:
@@ -567,7 +583,11 @@ class ExtendedCrawler:
 
     def _dynamodb(self) -> int:
         ddb = self._client("dynamodb")
-        names = _pages(ddb, "list_tables", "TableNames", MAX_PER_SOURCE)
+        names = self._cap(
+            "DynamoDB tables",
+            _pages(ddb, "list_tables", "TableNames", MAX_PER_SOURCE + 1),
+            MAX_PER_SOURCE,
+        )
         for name in names:
             arn, stream = "", ""
             try:
@@ -611,7 +631,12 @@ class ExtendedCrawler:
             ]
         count = 0
         for bus in buses:
-            for rule in events.list_rules(EventBusName=bus).get("Rules", [])[:MAX_PER_SOURCE]:
+            rules = self._cap(
+                f"EventBridge rules ({bus} bus)",
+                events.list_rules(EventBusName=bus).get("Rules", []),
+                MAX_PER_SOURCE,
+            )
+            for rule in rules:
                 name = rule["Name"] if bus == "default" else f"{bus}/{rule['Name']}"
                 nid = self.graph.node("events", name, rule.get("Arn", ""))
                 count += 1
@@ -633,7 +658,11 @@ class ExtendedCrawler:
 
     def _apigw_rest(self) -> int:
         apigw = self._client("apigateway")
-        apis = _pages(apigw, "get_rest_apis", "items", MAX_PER_SOURCE)
+        apis = self._cap(
+            "API Gateway REST APIs",
+            _pages(apigw, "get_rest_apis", "items", MAX_PER_SOURCE + 1),
+            MAX_PER_SOURCE,
+        )
         for api in apis:
             nid = self.graph.node("apigateway", api.get("name") or api["id"])
             for res in _pages(
@@ -646,7 +675,9 @@ class ExtendedCrawler:
 
     def _apigw_http(self) -> int:
         apigw = self._client("apigatewayv2")
-        apis = apigw.get_apis().get("Items", [])[:MAX_PER_SOURCE]
+        apis = self._cap(
+            "API Gateway HTTP/WebSocket APIs", apigw.get_apis().get("Items", []), MAX_PER_SOURCE
+        )
         for api in apis:
             nid = self.graph.node("apigateway", api.get("Name") or api["ApiId"])
             for integ in apigw.get_integrations(ApiId=api["ApiId"]).get("Items", []):
@@ -697,7 +728,12 @@ class ExtendedCrawler:
                 return 0
             raise
         count = 0
-        for r in _pages(rex, "list_resources", "Resources", MAX_REX_RESOURCES):
+        resources = self._cap(
+            "Resource Explorer resources",
+            _pages(rex, "list_resources", "Resources", MAX_REX_RESOURCES + 1),
+            MAX_REX_RESOURCES,
+        )
+        for r in resources:
             arn = r.get("Arn", "")
             parsed = node_for_arn(arn)
             service, res = arn_parts(arn)
@@ -742,8 +778,11 @@ class ExtendedCrawler:
         ``kafka:ListClustersV2`` permission. Broker, authentication and configuration
         details are not read.
         """
-        clusters = _pages(
-            self._client("kafka"), "list_clusters_v2", "ClusterInfoList", MAX_PER_SOURCE
+        kafka = self._client("kafka")
+        clusters = self._cap(
+            "MSK (Kafka) clusters",
+            _pages(kafka, "list_clusters_v2", "ClusterInfoList", MAX_PER_SOURCE + 1),
+            MAX_PER_SOURCE,
         )
         for c in clusters:
             arn = c.get("ClusterArn", "")
@@ -814,7 +853,11 @@ class ExtendedCrawler:
 
     def _s3_notifications(self) -> int:
         s3 = self._client("s3")
-        buckets = [n for n in self.graph.nodes.values() if n.service == "s3"][:MAX_PER_SOURCE]
+        buckets = self._cap(
+            "S3 bucket notifications",
+            [n for n in self.graph.nodes.values() if n.service == "s3"],
+            MAX_PER_SOURCE,
+        )
         unreadable = 0
         for b in buckets:
             # One bucket in another region or behind a bucket policy must not end the source.
@@ -845,8 +888,12 @@ class ExtendedCrawler:
 
     def _state_machines(self) -> int:
         sfn = self._client("stepfunctions")
-        machines = [n for n in self.graph.nodes.values() if n.service == "states" and n.arn]
-        for m in machines[:MAX_PER_SOURCE]:
+        machines = self._cap(
+            "Step Functions state machine definitions",
+            [n for n in self.graph.nodes.values() if n.service == "states" and n.arn],
+            MAX_PER_SOURCE,
+        )
+        for m in machines:
             desc = sfn.describe_state_machine(stateMachineArn=m.arn)
             if desc.get("roleArn"):
                 self._role_holders.setdefault(desc["roleArn"], set()).add(m.node_id)
@@ -1089,11 +1136,15 @@ class ExtendedCrawler:
 
     def _route53(self) -> int:
         r53 = self._client("route53")
-        zones = [
-            z
-            for z in _pages(r53, "list_hosted_zones", "HostedZones")
-            if (z.get("Config") or {}).get("PrivateZone")
-        ][:MAX_PER_SOURCE]
+        zones = self._cap(
+            "Route 53 private hosted zones",
+            [
+                z
+                for z in _pages(r53, "list_hosted_zones", "HostedZones")
+                if (z.get("Config") or {}).get("PrivateZone")
+            ],
+            MAX_PER_SOURCE,
+        )
         for z in zones:
             vpcs = r53.get_hosted_zone(Id=z["Id"]).get("VPCs", [])
             for v in vpcs:
@@ -1150,9 +1201,13 @@ class ExtendedCrawler:
         if not any(s.get("recording") for s in status):
             self._warn("AWS Config: no configuration recorder is recording; skipped")
             return 0
-        items = [n for n in self.graph.nodes.values() if n.service in self._CONFIG_TYPES]
+        items = self._cap(
+            "AWS Config resource histories",
+            [n for n in self.graph.nodes.values() if n.service in self._CONFIG_TYPES],
+            MAX_CONFIG_ITEMS,
+        )
         count = 0
-        for n in items[:MAX_CONFIG_ITEMS]:
+        for n in items:
             rtype = self._CONFIG_TYPES[n.service]
             rid = n.arn if n.service == "sns" else n.name
             try:
@@ -1234,8 +1289,10 @@ def latest_crawl(conn: sqlite3.Connection, snapshot_id: int) -> dict[str, Any] |
     ).fetchone()
     if row is None:
         return None
+    warnings = json.loads(row["warnings"] or "[]")
     return {
         "crawled_at": row["crawled_at"],
-        "warnings": json.loads(row["warnings"] or "[]"),
+        "warnings": warnings,
+        "capped": [w for w in warnings if str(w).endswith(CAPPED_SUFFIX)],
         "sources": json.loads(row["sources"] or "{}"),
     }

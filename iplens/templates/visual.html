@@ -37,13 +37,15 @@
     <span class="muted">
       {% if crawl %}Services crawled {{ crawl.crawled_at | localtime }} for snapshot #{{ snap.id }}
         · {{ crawl.sources | length }} source(s) read · {{ crawl.warnings | length }} warning(s).
+        {% if crawl.capped %}<span class="badge warn" id="crawl-capped"
+          title="{{ crawl.capped | length }} source(s) hit their per-source limit: only the first items were read (see the crawl warnings)">⚠ {{ crawl.capped | length }} capped</span>{% endif %}
       {% else %}Not crawled for snapshot #{{ snap.id }} yet: read-only, each source is optional
         (a missing permission or disabled feature is a warning).{% endif %}
     </span>
   </div>
   {% if crawl and crawl.warnings %}
-  <details class="crawl-warnings">
-    <summary>{{ crawl.warnings | length }} crawl warning(s)</summary>
+  <details class="crawl-warnings"{{ ' open' if crawl.capped }}>
+    <summary>{{ crawl.warnings | length }} crawl warning(s){% if crawl.capped %} · {{ crawl.capped | length }} source(s) capped{% endif %}</summary>
     <ul>{% for w in crawl.warnings %}<li>{{ w }}</li>{% endfor %}</ul>
   </details>
   {% endif %}

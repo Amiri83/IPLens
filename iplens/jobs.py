@@ -3,7 +3,8 @@
 At most **one job per account** runs at a time. A job is a plain function run in a
 worker thread with a :class:`JobContext`; it reports its current step, done / total
 counts and log lines, and checks for cancellation between steps (cooperative: a running
-AWS call or ``terraform`` command finishes first). The Flask layer only starts jobs,
+AWS call finishes first; a running ``terraform`` command is terminated, see
+:func:`iplens.tfrepo.run_process`). The Flask layer only starts jobs,
 polls their state (:meth:`JobManager.status`) and asks them to stop; the work itself
 never touches Flask's request state, and every database access in a worker opens its
 own SQLite connection (:func:`iplens.db.closing`).
