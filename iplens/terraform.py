@@ -224,13 +224,90 @@ def parse_document(doc: Any) -> list[TfResource]:
 
 def read_state_file(path: str) -> tuple[str, list[TfResource]]:
     """Parse a local state file (opened read-only); returns (resolved path, resources)."""
+    resolved, doc = read_state_document(path)
+    return resolved, parse_document(doc)
+
+
+def read_state_document(path: str) -> tuple[str, Any]:
+    """Decode a local state file (opened read-only); returns (resolved path, document)."""
     p = Path(path).expanduser()
     if not p.is_file():
         raise ValueError("no such file")
     if p.stat().st_size > MAX_STATE_BYTES:
         raise ValueError("state file is too large")
     with p.open("rb") as fh:
-        return str(p.resolve()), parse_state(fh.read())
+        return str(p.resolve()), load_document(fh.read())
+
+
+# -- AWS account ids in a state ------------------------------------------------------
+
+# Only the 12-digit account id is taken from an ARN; the ARN itself is never kept.
+_ARN_ACCOUNT_RE = re.compile(r"^arn:aws[\w-]*:[\w-]+:[\w-]*:(\d{12}):")
+MAX_ARN_SCAN = 20000  # strings inspected by the fallback scan
+
+
+def _instances(doc: dict[str, Any]) -> Iterator[tuple[Any, Any]]:
+    """``(values, sensitive)`` of every managed resource instance (both formats)."""
+    if "values" in doc or "format_version" in doc:
+        stack = [((doc.get("values") or {}).get("root_module"), 0)]
+        while stack:
+            module, depth = stack.pop()
+            if not isinstance(module, dict) or depth > 50:
+                continue
+            for res in module.get("resources") or []:
+                if isinstance(res, dict) and res.get("mode") == "managed":
+                    yield res.get("values"), res.get("sensitive_values")
+            stack.extend((c, depth + 1) for c in module.get("child_modules") or [])
+    else:
+        for res in doc.get("resources") or []:
+            if isinstance(res, dict) and res.get("mode") == "managed":
+                for inst in res.get("instances") or []:
+                    if isinstance(inst, dict):
+                        yield inst.get("attributes"), inst.get("sensitive_attributes")
+
+
+def _strings(value: Any, budget: list[int]) -> Iterator[str]:
+    stack = [value]
+    while stack and budget[0] > 0:
+        v = stack.pop()
+        if isinstance(v, str):
+            budget[0] -= 1
+            yield v
+        elif isinstance(v, dict):
+            stack.extend(v.values())
+        elif isinstance(v, list):
+            stack.extend(v)
+
+
+def state_account_ids(doc: Any) -> dict[str, int]:
+    """AWS account id -> number of managed resources whose own ``arn`` names it.
+
+    The resources' own ARNs say where they live. A state without any ``arn`` attribute
+    falls back to every ARN found in the resources' values (which may also name other
+    accounts, e.g. a peer VPC owner). Values are inspected in memory only; nothing but
+    the account ids is returned.
+    """
+    if not isinstance(doc, dict):
+        return {}
+    own: dict[str, int] = {}
+    any_arn: dict[str, int] = {}
+    budget = [MAX_ARN_SCAN]
+    for values, sensitive in _instances(doc):
+        if not isinstance(values, dict):
+            continue
+        arn = values.get("arn")
+        hidden = isinstance(sensitive, dict) and sensitive.get("arn") is True
+        m = _ARN_ACCOUNT_RE.match(arn) if isinstance(arn, str) and not hidden else None
+        if m:
+            own[m.group(1)] = own.get(m.group(1), 0) + 1
+            continue
+        if own or budget[0] <= 0:
+            continue
+        for s in _strings(values, budget):
+            m = _ARN_ACCOUNT_RE.match(s)
+            if m:
+                any_arn[m.group(1)] = any_arn.get(m.group(1), 0) + 1
+    return own or any_arn
 
 
 def validate_root_name(name: str) -> str:

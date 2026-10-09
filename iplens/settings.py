@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .db import ACTIVE_ACCOUNT_KEY, closing
+from .environment import DEFAULT_TAG_KEYS, parse_tag_keys
 
 # A practical list; the GUI also accepts any free-text region code.
 REGIONS = (
@@ -42,11 +43,32 @@ REGIONS = (
 )
 
 MAX_DISPLAY_NAME = 64
+# Terraform repo sync: seconds each allowlisted terraform command may run.
+DEFAULT_TF_TIMEOUT = 300
+MIN_TF_TIMEOUT, MAX_TF_TIMEOUT = 10, 3600
 
 
 @dataclass
 class Settings:
     log_dir: str = ""
+    tf_timeout: int = DEFAULT_TF_TIMEOUT
+    # Tag keys an environment is read from, in order (see iplens.environment).
+    env_tag_keys: tuple[str, ...] = DEFAULT_TAG_KEYS
+
+    @property
+    def env_tag_keys_text(self) -> str:
+        return ", ".join(self.env_tag_keys)
+
+
+def parse_tf_timeout(value: str | int | None) -> int:
+    """A timeout in seconds within [MIN_TF_TIMEOUT, MAX_TF_TIMEOUT]; ValueError otherwise."""
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError("the Terraform timeout must be a whole number of seconds") from None
+    if not MIN_TF_TIMEOUT <= seconds <= MAX_TF_TIMEOUT:
+        raise ValueError(f"the Terraform timeout must be {MIN_TF_TIMEOUT}-{MAX_TF_TIMEOUT} seconds")
+    return seconds
 
 
 def mask_key_id(key_id: str) -> str:
@@ -75,10 +97,31 @@ class SettingsStore:
             )
 
     def load(self) -> Settings:
-        return Settings(log_dir=self._get("log_dir"))
+        try:
+            timeout = parse_tf_timeout(self._get("tf_timeout") or DEFAULT_TF_TIMEOUT)
+        except ValueError:
+            timeout = DEFAULT_TF_TIMEOUT
+        raw_keys = self._get("env_tag_keys")
+        return Settings(
+            log_dir=self._get("log_dir"),
+            tf_timeout=timeout,
+            env_tag_keys=parse_tag_keys(raw_keys) if raw_keys else DEFAULT_TAG_KEYS,
+        )
 
-    def save(self, *, log_dir: str = "") -> None:
+    def save(
+        self,
+        *,
+        log_dir: str = "",
+        tf_timeout: int | None = None,
+        env_tag_keys: str | None = None,
+    ) -> None:
+        """Store the settings; ``None`` keeps a value unchanged."""
         self._set("log_dir", log_dir.strip())
+        if tf_timeout is not None:
+            self._set("tf_timeout", str(parse_tf_timeout(tf_timeout)))
+        if env_tag_keys is not None:
+            keys = parse_tag_keys(env_tag_keys)
+            self._set("env_tag_keys", ",".join(keys or DEFAULT_TAG_KEYS))
 
     def active_account_id(self) -> int | None:
         value = self._get(ACTIVE_ACCOUNT_KEY)

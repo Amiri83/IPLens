@@ -16,8 +16,12 @@ from botocore.exceptions import BotoCoreError, ClientError
 from .attribution import Attribution, attribute_eni, lambda_eni_index, lambda_owners
 from .aws import AwsGateway
 from .db import closing
+from .jobs import JobCancelled, NullProgress, Progress
 
 log = logging.getLogger(__name__)
+
+# Progress steps of one collection (see Collector._step).
+COLLECT_STEPS = 11
 
 
 @dataclass
@@ -212,12 +216,21 @@ class Collector:
         db_path: Path,
         account_ref: int | None = None,
         account_name: str = "",
+        progress: Progress | None = None,
     ):
         self.gw = gateway
         self.db_path = db_path
         self.account_ref = account_ref  # IPLens account record the snapshot belongs to
         # The record's display name, frozen on the snapshot (later renames do not apply).
         self.account_name = account_name
+        # Background job reporting; cancellation is checked between API calls.
+        self.progress: Progress = progress or NullProgress()
+        self._done = 0
+
+    def _step(self, text: str) -> None:
+        self.progress.check()
+        self.progress.step(f"collect · {text}", done=self._done, total=COLLECT_STEPS)
+        self._done += 1
 
     def run(self) -> CollectResult:
         region = self.gw.region or ""
@@ -235,11 +248,15 @@ class Collector:
         try:
             result = self._collect(snap_id)
         except Exception as exc:
-            log.exception("collection failed snapshot=%s", snap_id)
+            if isinstance(exc, JobCancelled):
+                log.info("collection cancelled snapshot=%s", snap_id)
+                error = "cancelled"
+            else:
+                log.exception("collection failed snapshot=%s", snap_id)
+                error = f"{type(exc).__name__}: {exc}"
             with closing(self.db_path) as conn:
                 conn.execute(
-                    "UPDATE snapshots SET status='failed', error=? WHERE id=?",
-                    (f"{type(exc).__name__}: {exc}", snap_id),
+                    "UPDATE snapshots SET status='failed', error=? WHERE id=?", (error, snap_id)
                 )
             raise
         log.info(
@@ -258,6 +275,7 @@ class Collector:
         result = CollectResult(snapshot_id=snap_id)
 
         account_id = ""
+        self._step("sts:GetCallerIdentity")
         try:
             account_id = self.gw.caller_identity()["account"]
         except (BotoCoreError, ClientError) as exc:
@@ -266,37 +284,52 @@ class Collector:
         aliases = self._optional(result, "iam:ListAccountAliases", self.gw.account_aliases)
         account_alias = aliases[0] if aliases else ""
 
+        self._step("ec2:DescribeVpcs")
         vpcs = _paginate(ec2, "describe_vpcs", "Vpcs")
+        self._step("ec2:DescribeSubnets")
         subnets = _paginate(ec2, "describe_subnets", "Subnets")
+        self._step("ec2:DescribeNetworkInterfaces")
         enis = _paginate(ec2, "describe_network_interfaces", "NetworkInterfaces")
+        self._step("ec2:DescribeVpcEndpoints")
         endpoints = self._optional(
             result,
             "ec2:DescribeVpcEndpoints",
             lambda: _paginate(ec2, "describe_vpc_endpoints", "VpcEndpoints"),
         )
+        self._step("lambda:ListFunctions")
         lambdas = self._optional(
             result,
             "lambda:ListFunctions",
             lambda: _paginate(self.gw.client("lambda"), "list_functions", "Functions"),
         )
+        self._step("elasticloadbalancing:DescribeLoadBalancers")
         lbs = self._optional(
             result,
             "elasticloadbalancing:DescribeLoadBalancers",
             lambda: _paginate(self.gw.client("elbv2"), "describe_load_balancers", "LoadBalancers"),
         )
         lb_targets = self._collect_lb_targets(result, lbs)
+        self._step("ec2:DescribeSecurityGroups")
         security_groups = self._optional(
             result,
             "ec2:DescribeSecurityGroups",
             lambda: _paginate(ec2, "describe_security_groups", "SecurityGroups"),
         )
+        self._step("ECS services and tasks")
         ecs = self._collect_ecs(result)
+        self._step("tags")
         lb_tags = self._collect_lb_tags(result, lbs)
         lambda_tags = self._collect_lambda_tags(result, lambdas)
+        self._step("writing the snapshot")
 
         lambda_index = lambda_eni_index(lambdas)
-        # (resource_type, resource_id, key, value) for every tagged ENI-owning resource.
+        # (resource_type, resource_id, key, value) for every tagged ENI-owning resource,
+        # plus VPC and subnet tags (environment fallback, "managed elsewhere" tag markers).
         tag_rows: list[tuple[str, str, str, str]] = []
+        for v in vpcs:
+            tag_rows += [("vpc", v["VpcId"], *kv) for kv in tag_pairs(v.get("Tags"))]
+        for s in subnets:
+            tag_rows += [("subnet", s["SubnetId"], *kv) for kv in tag_pairs(s.get("Tags"))]
         for e in enis:
             tag_rows += [("eni", e["NetworkInterfaceId"], *kv) for kv in tag_pairs(e.get("TagSet"))]
         for ep in endpoints:

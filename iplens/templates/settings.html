@@ -57,6 +57,16 @@
   <h2 style="margin-top: 0">Logging</h2>
   <label for="log_dir">Log directory</label>
   <input id="log_dir" name="log_dir" value="{{ s.log_dir }}" size="60" class="mono" placeholder="{{ default_log_dir }}">
+  <h2>Environments</h2>
+  <label for="env_tag_keys">Environment tag keys</label>
+  <input id="env_tag_keys" name="env_tag_keys" value="{{ s.env_tag_keys_text }}" size="40" class="mono" placeholder="Environment, env, stage">
+  <p class="muted small">A resource's environment comes from the Terraform repo root × environment that manages it;
+    otherwise from the first of these tag keys found on the resource, its subnet or its VPC (case-insensitive).</p>
+  <h2>Terraform sync</h2>
+  <label for="tf_timeout">Timeout per terraform command (seconds)</label>
+  <input id="tf_timeout" name="tf_timeout" value="{{ s.tf_timeout }}" size="6" inputmode="numeric" pattern="[0-9]+">
+  <p class="muted small">Applies to <span class="mono">terraform init</span> and <span class="mono">terraform show -json</span>
+    (default 300). Two root × environment pairs are synced at a time; providers are cached once in the IPLens data directory.</p>
   <p><button type="submit">Save</button></p>
 </form>
 
@@ -135,7 +145,7 @@
         <td>{{ p.discovered_at | localtime }}</td>
         <td style="white-space: nowrap">
           <a class="btn secondary" href="{{ url_for('settings_tfrepo', repo_id=p.id) }}">Review mapping</a>
-          <form class="inline" method="post" action="{{ url_for('terraform_sync') }}">
+          <form class="inline" method="post" action="{{ url_for('terraform_sync') }}" data-job="tfsync">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="repo_id" value="{{ p.id }}">
             <input type="hidden" name="next" value="{{ url_for('settings_page') }}#tfrepos">
@@ -171,6 +181,8 @@
   <span class="mono">elasticloadbalancing:DescribeTargetGroups, elasticloadbalancing:DescribeTargetHealth,
   ec2:DescribeSecurityGroups</span> (connections and security group names on the Visual page);
   <span class="mono">elasticloadbalancing:DescribeTags, lambda:ListTags</span> (load balancer and
-  Lambda tags).
+  Lambda tags). The Extended view's Kafka nodes need <span class="mono">kafka:ListClustersV2</span>
+  (Amazon MSK clusters) and <span class="mono">lambda:ListEventSourceMappings</span>; without them the
+  source is skipped with a warning.
 </div>
 {% endblock %}

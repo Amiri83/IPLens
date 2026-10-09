@@ -191,3 +191,33 @@ ul.owner-list { margin: .3rem 0 0; padding-left: 1.2rem; }
 .rule-summary { color: var(--fg); }
 details.advanced > summary { cursor: pointer; font-weight: 600; margin: 1rem 0 .5rem; }
 .rule-form select[multiple] { min-width: 420px; max-width: 100%; }
+
+/* Background job modal (jobs.js): --fg on --card, the log --fg on --bg. */
+.job-modal { position: fixed; inset: 0; background: rgba(31, 41, 51, .45); z-index: 50;
+             display: flex; align-items: flex-start; justify-content: center; padding-top: 8vh; }
+.job-modal[hidden] { display: none; }
+.job-box { width: min(760px, 94vw); max-height: 84vh; overflow: auto; }
+.job-box h2 { margin-top: 0; }
+.job-step { font-weight: 600; margin: .3rem 0 .5rem; word-break: break-word; }
+.job-box progress { width: 100%; height: 12px; }
+ul.job-messages { list-style: none; padding: 0; margin: .5rem 0; }
+pre.job-log { background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+              border-radius: 5px; padding: .5rem; margin: .3rem 0 .6rem; max-height: 280px;
+              overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+.job-actions { gap: .5rem; justify-content: flex-end; }
+.job-badge { position: fixed; right: 1rem; bottom: 1rem; z-index: 40; max-width: 60vw;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-badge[hidden] { display: none; }
+
+/* Visual: environment filter and the "not linked" side panel of the Extended view. */
+.env-filters label { white-space: nowrap; }
+.visual-main { display: flex; gap: .8rem; align-items: flex-start; }
+.visual-main .cy-wrap { flex: 1 1 auto; min-width: 0; }
+.unlinked-panel { flex: 0 0 260px; max-height: 720px; overflow: auto; font-size: 12.5px; }
+.unlinked-panel h2 { font-size: 14px; margin: 0 0 .3rem; }
+.unlinked-panel ul { list-style: none; padding: 0; margin: .4rem 0 0; }
+.unlinked-panel li button { background: none; border: 0; padding: .15rem 0; color: var(--link);
+                            cursor: pointer; text-align: left; font: inherit; }
+.unlinked-panel li button:hover { text-decoration: underline; }
+.unlinked-panel li.shown button { font-weight: 700; }
+.env-cell .muted { font-size: 11.5px; }

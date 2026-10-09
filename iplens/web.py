@@ -7,6 +7,7 @@ import os
 import secrets
 import subprocess
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,7 +28,7 @@ from flask import (
 )
 from markupsafe import Markup
 
-from . import diagram, extgraph, flowlogs, queries, terraform, tfrepo, viewstate
+from . import diagram, environment, extgraph, flowlogs, queries, terraform, tfrepo, viewstate
 from . import rules as rules_mod
 from . import scope as scope_mod
 from . import suggestions as sugg_mod
@@ -50,9 +51,11 @@ from .db import closing, connect, init_db
 from .declutter import DEFAULT_EVIDENCE, FOCUS_HOPS, parse_evidence
 from .export import XLSX_MIMETYPE, ips_to_xlsx
 from .extended import EVIDENCE_HELP, EVIDENCE_LABELS, EVIDENCE_LEVELS, ExtendedCrawler, latest_crawl
+from .jobs import KINDS as JOB_KINDS
+from .jobs import JobBusy, JobCancelled, JobContext, JobFailed, JobManager, Progress
 from .logging_setup import LEVELS, configure_logging, read_log
 from .queries import LB_ICONS, TYPE_ICONS
-from .settings import MAX_DISPLAY_NAME, REGIONS, Settings, SettingsStore
+from .settings import MAX_DISPLAY_NAME, REGIONS, Settings, SettingsStore, parse_tf_timeout
 from .visual import (
     DEFAULT_EDGE_TYPES,
     EDGE_TYPE_LABELS,
@@ -72,7 +75,13 @@ OUT_OF_SCOPE = "This resource is outside the active scope."
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 # Visual page "Group by" choices (kept in the URL like the edge filter).
-GROUP_BY = {"": "nothing", "sg": "security group", "tag": "tag", "tf": "Terraform root"}
+GROUP_BY = {
+    "": "nothing",
+    "sg": "security group",
+    "tag": "tag",
+    "tf": "Terraform root",
+    "env": "environment",
+}
 # Visual page modes: the IP view is the default; "extended" adds regional services.
 VIEW_MODES = {"ip": "IP view", "extended": "Extended view"}  # keys: viewstate.VIEWS
 MAX_CRAWL_WARNINGS_FLASHED = 8
@@ -191,6 +200,8 @@ def create_app(
         "port": port,
         "terraform_bin": terraform_bin,
         "tf_runner": terraform_runner or subprocess.run,
+        # Background jobs (Refresh, service crawl, Terraform sync): one per account.
+        "jobs": JobManager(paths.db_path),
     }
     apply_log_dir(app, store.load())
     log.info("IPLens started (data dir %s)", paths.home)
@@ -213,6 +224,41 @@ def _store() -> SettingsStore:
 
 def _accounts() -> AccountStore:
     return _ext()["accounts"]
+
+
+def _jobs() -> JobManager:
+    return _ext()["jobs"]
+
+
+def flash_job_messages(job: dict[str, Any]) -> None:
+    """Flash a finished job's result lines (forms submitted without JavaScript)."""
+    for m in job.get("messages", []):
+        if m.get("link_url"):
+            flash(
+                Markup('{0} <a href="{1}">{2}</a>').format(
+                    m["text"], m["link_url"], m["link_text"]
+                ),
+                m["category"],
+            )
+        else:
+            flash(m["text"], m["category"])
+
+
+def _credential_message(ctx: Progress, prefix: str, exc: BaseException, edit_url: str) -> None:
+    msg = str(exc) if isinstance(exc, CredentialError) else EXPIRED_MESSAGE
+    ctx.message("error", f"{prefix}: {msg} —", edit_url, "edit account")
+
+
+def sync_messages(ctx: Progress, results: list[tfrepo.SyncResult]) -> None:
+    """Result lines of a Terraform sync."""
+    if not results:
+        ctx.message("warn", "Terraform sync: no confirmed root × environment pairs.")
+        return
+    ok = all(r.status == tfrepo.OK for r in results)
+    ctx.message("ok" if ok else "warn", f"Terraform sync: {tfrepo.summarise(results)}")
+    wrong = [r for r in results if r.status == tfrepo.WRONG_ACCOUNT]
+    for r in wrong:
+        ctx.message("warn", f"{r.label}: {r.detail}; it is left out of drift.")
 
 
 def log_dir_for(paths: AppPaths, settings: Settings) -> Path:
@@ -398,6 +444,51 @@ def _register(app: Flask) -> None:
             confirm_word=DELETE_CONFIRMATION,
         )
 
+    # -- background jobs -------------------------------------------------------------
+
+    def _wants_background() -> bool:
+        """Pages with JavaScript post ``background=1`` and follow the job in a modal;
+        plain form posts run the job to the end and flash its result lines."""
+        return request.form.get("background") == "1"
+
+    def _run_job(account_ref: int, kind: str, work: Callable[[JobContext], None], back: str):
+        background = _wants_background()
+        try:
+            job = _jobs().start(account_ref, kind, work, background=background)
+        except JobBusy as exc:
+            if background:
+                return jsonify({"ok": False, "error": str(exc), "job": exc.job}), 409
+            flash(str(exc), "error")
+            return redirect(back)
+        if background:
+            return jsonify(
+                {"ok": True, "job": job, "status_url": url_for("job_status", job_id=job["id"])}
+            )
+        flash_job_messages(job)
+        return redirect(back)
+
+    def _job_account() -> int:
+        """Jobs are keyed by the active account (0 when there is none)."""
+        return _active_ref() or 0
+
+    @app.get("/jobs/current")
+    def job_current():
+        """The active account's running job, else its last one (a reload re-attaches)."""
+        job = _jobs().current(_job_account())
+        return jsonify({"job": job, "kinds": JOB_KINDS})
+
+    @app.get("/jobs/<job_id>")
+    def job_status(job_id: str):
+        job = _jobs().status(job_id[:64], _job_account())
+        if job is None:
+            abort(404)
+        return jsonify({"job": job})
+
+    @app.post("/jobs/<job_id>/cancel")
+    def job_cancel(job_id: str):
+        ok = _jobs().cancel(job_id[:64], _job_account())
+        return jsonify({"ok": ok, "job": _jobs().status(job_id[:64], _job_account())})
+
     @app.post("/refresh")
     def refresh():
         raw = request.form.get("account_id", "")
@@ -410,44 +501,63 @@ def _register(app: Flask) -> None:
             g.pop("active_account", None)
         active = _active()
         if active is None:
+            if _wants_background():
+                return jsonify({"ok": False, "error": "Add an AWS account in Settings first."}), 400
             flash("Add an AWS account in Settings first.", "error")
             return redirect(url_for("settings_page"))
-        try:
-            account = _accounts().get(active.id, with_secret=True)
-            gw = _ext()["gateway_factory"](account)
-            result = Collector(gw, _paths().db_path, account.id, account.display_name).run()
-            with closing(_paths().db_path) as conn:
-                queries.prune_snapshots(conn)
-        except Exception as exc:
-            # Full details (type, message, traceback) go to the log file only;
-            # raw errors can carry ARNs, account ids or request ids.
-            log.exception("refresh failed (account=%s)", active.id)
-            if is_credential_failure(exc):
-                msg = str(exc) if isinstance(exc, CredentialError) else EXPIRED_MESSAGE
-                _credential_flash("Refresh failed", msg, active.id)
-            else:
-                flash("Refresh failed. See the log for details.", "error")
-            return redirect(url_for("overview"))
-        label = account_label(result.account_id, result.account_alias, account.display_name)
-        msg = (
-            f"Refreshed {label} · {gw.region}: {result.vpcs} VPCs, {result.subnets} subnets, "
-            f"{result.enis} ENIs, {result.ips} IPs"
-        )
-        flash(msg, "ok")
-        mismatch = _accounts().record_identity(account.id, result.account_id)
-        if mismatch:
-            log.warning("refresh of account=%s: %s", account.id, mismatch)
-            _identity_flash(mismatch, account.id)
-        for w in result.warnings:
-            flash(w, "warn")
-        # Terraform repos mapped to this account are re-synced with every refresh.
-        if tfrepo.list_envs(_db(), account_ref=account.id):
+        # Everything the job needs is resolved here: the worker never touches the request.
+        account = _accounts().get(active.id, with_secret=True)
+        factory = _ext()["gateway_factory"]
+        db_path = _paths().db_path
+        accounts = _accounts()
+        edit_url = url_for("account_edit", account_id=account.id)
+        tf_sync = _tf_syncer() if tfrepo.list_envs(_db(), account_ref=account.id) else None
+
+        def work(ctx: JobContext) -> None:
             try:
-                _flash_sync(_tf_sync(account_ref=account.id))
-            except Exception:
-                log.exception("terraform sync after refresh failed (account=%s)", account.id)
-                flash("Terraform sync failed. See the log for details.", "warn")
-        return redirect(url_for("overview"))
+                gw = factory(account)
+                result = Collector(
+                    gw, db_path, account.id, account.display_name, progress=ctx
+                ).run()
+                with closing(db_path) as conn:
+                    queries.prune_snapshots(conn)
+            except (JobCancelled, JobFailed):
+                raise
+            except Exception as exc:
+                # Full details (type, message, traceback) go to the log file only;
+                # raw errors can carry ARNs, account ids or request ids.
+                log.exception("refresh failed (account=%s)", account.id)
+                if is_credential_failure(exc):
+                    _credential_message(ctx, "Refresh failed", exc, edit_url)
+                else:
+                    ctx.message("error", "Refresh failed. See the log for details.")
+                raise JobFailed("Refresh failed") from None
+            label = account_label(result.account_id, result.account_alias, account.display_name)
+            ctx.message(
+                "ok",
+                f"Refreshed {label} · {gw.region}: {result.vpcs} VPCs, {result.subnets} "
+                f"subnets, {result.enis} ENIs, {result.ips} IPs",
+            )
+            mismatch = accounts.record_identity(account.id, result.account_id)
+            if mismatch:
+                log.warning("refresh of account=%s: %s", account.id, mismatch)
+                ctx.message(
+                    "warn", f"Warning: {mismatch} — check the", edit_url, "account settings"
+                )
+            for w in result.warnings:
+                ctx.message("warn", w)
+            # Terraform repos mapped to this account are re-synced with every refresh.
+            if tf_sync is not None:
+                try:
+                    sync_messages(ctx, tf_sync(account_ref=account.id, progress=ctx))
+                except JobCancelled:
+                    raise
+                except Exception:
+                    log.exception("terraform sync after refresh failed (account=%s)", account.id)
+                    ctx.message("warn", "Terraform sync failed. See the log for details.")
+            ctx.step("finished")
+
+        return _run_job(account.id, "refresh", work, url_for("overview"))
 
     # -- snapshot history ------------------------------------------------------------
 
@@ -530,15 +640,25 @@ def _register(app: Flask) -> None:
             tag_key=a.get("tag_key", "").strip()[:128],
             tag_value=a.get("tag_value", "").strip()[:256],
             tf=a.get("tf", "").strip()[: terraform.MAX_ROOT_NAME],
+            env=a.get("env", "").strip()[:128],
         )
+
+    def _env_keys() -> tuple[str, ...]:
+        """Tag keys environments are read from (Settings)."""
+        if "env_keys" not in g:
+            g.env_keys = _store().load().env_tag_keys
+        return g.env_keys
 
     @app.get("/ips")
     def ips():
         snap = _snapshot_or_none()
         flt = _ip_filter()
-        rows, tree, keys = [], [], []
+        rows, tree, keys, envs = [], [], [], []
         if snap:
-            rows = queries.ip_list(_db(), snap["id"], flt, _scope())
+            # Without the environment filter first: the dropdown lists every environment.
+            every = queries.ip_list(_db(), snap["id"], replace(flt, env=""), _scope(), _env_keys())
+            envs = environment.summary(r["environment"] for r in every)
+            rows = [r for r in every if environment.matches(r["environment"], flt.env)]
             tree = queries.vpc_tree(_db(), snap["id"], _scope())
             keys = queries.tag_keys(_db(), snap["id"])
         return render_template(
@@ -549,6 +669,9 @@ def _register(app: Flask) -> None:
             tree=tree,
             owner_types=OWNER_TYPES,
             tag_keys=keys,
+            environments=envs,
+            env_not_set=environment.FILTER_NOT_SET,
+            env_sources=environment.SOURCE_LABELS,
             tf_roots=[r["name"] for r in terraform.list_roots(_db())],
             tf_managed=queries.TF_MANAGED,
             tf_unmanaged=queries.TF_UNMANAGED,
@@ -559,7 +682,7 @@ def _register(app: Flask) -> None:
     def ips_export():
         snap = _snapshot_or_none()
         flt = _ip_filter()
-        rows = queries.ip_list(_db(), snap["id"], flt, _scope()) if snap else []
+        rows = queries.ip_list(_db(), snap["id"], flt, _scope(), _env_keys()) if snap else []
         body = ips_to_xlsx(rows, OWNER_LABELS)
         log.info("exported %d IP row(s) to xlsx", len(rows))
         name = f"iplens-ips-snapshot-{snap['id']}.xlsx" if snap else "iplens-ips.xlsx"
@@ -740,11 +863,12 @@ def _register(app: Flask) -> None:
             OWNER_LABELS,
             _edge_types(),
             _scope(),
+            _env_keys(),
         )
         if data is None:
             abort(404)
         if _view_mode() == "extended" and data.get("vpc"):
-            data["extended"] = extgraph.extended_data(_db(), snap["id"], data)
+            data["extended"] = extgraph.extended_data(_db(), snap["id"], data, _env_keys())
         return jsonify(data)
 
     # -- extended view: service crawl and flow logs -------------------------------
@@ -775,35 +899,50 @@ def _register(app: Flask) -> None:
         vpc = request.form.get("vpc", "")[:64]
         snap = _snapshot_or_none()
         if not snap:
-            flash(
-                "Refresh the account first: the service crawl extends its latest snapshot.", "error"
-            )
+            msg = "Refresh the account first: the service crawl extends its latest snapshot."
+            if _wants_background():
+                return jsonify({"ok": False, "error": msg}), 400
+            flash(msg, "error")
             return redirect(_extended_url(vpc))
         got = _gateway_or_flash("Service crawl failed")
         if got is None:
+            if _wants_background():
+                return jsonify(
+                    {
+                        "ok": False,
+                        "error": "Service crawl failed: no AWS session (reload for details).",
+                    }
+                ), 400
             return redirect(_extended_url(vpc))
         account, gw = got
-        try:
-            result = ExtendedCrawler(gw, _paths().db_path, snap["id"]).run()
-        except Exception as exc:
-            log.exception("service crawl failed (account=%s)", account.id)
-            if is_credential_failure(exc):
-                msg = str(exc) if isinstance(exc, CredentialError) else EXPIRED_MESSAGE
-                _credential_flash("Service crawl failed", msg, account.id)
-            else:
-                flash("Service crawl failed. See the log for details.", "error")
-            return redirect(_extended_url(vpc))
-        flash(
-            f"Crawled services for snapshot #{snap['id']}: {result.nodes} node(s), "
-            f"{result.edges} evidence line(s), {len(result.warnings)} warning(s).",
-            "ok",
-        )
-        for w in result.warnings[:MAX_CRAWL_WARNINGS_FLASHED]:
-            flash(w, "warn")
-        if len(result.warnings) > MAX_CRAWL_WARNINGS_FLASHED:
-            more = len(result.warnings) - MAX_CRAWL_WARNINGS_FLASHED
-            flash(f"… and {more} more warning(s), listed on the Extended view.", "warn")
-        return redirect(_extended_url(vpc))
+        db_path, snap_id = _paths().db_path, snap["id"]
+        edit_url = url_for("account_edit", account_id=account.id)
+
+        def work(ctx: JobContext) -> None:
+            try:
+                result = ExtendedCrawler(gw, db_path, snap_id, progress=ctx).run()
+            except (JobCancelled, JobFailed):
+                raise
+            except Exception as exc:
+                log.exception("service crawl failed (account=%s)", account.id)
+                if is_credential_failure(exc):
+                    _credential_message(ctx, "Service crawl failed", exc, edit_url)
+                else:
+                    ctx.message("error", "Service crawl failed. See the log for details.")
+                raise JobFailed("Service crawl failed") from None
+            ctx.message(
+                "ok",
+                f"Crawled services for snapshot #{snap_id}: {result.nodes} node(s), "
+                f"{result.edges} evidence line(s), {len(result.warnings)} warning(s).",
+            )
+            for w in result.warnings[:MAX_CRAWL_WARNINGS_FLASHED]:
+                ctx.message("warn", w)
+            if len(result.warnings) > MAX_CRAWL_WARNINGS_FLASHED:
+                more = len(result.warnings) - MAX_CRAWL_WARNINGS_FLASHED
+                ctx.message("warn", f"… and {more} more warning(s), listed on the Extended view.")
+            ctx.step("finished")
+
+        return _run_job(account.id, "crawl", work, _extended_url(vpc))
 
     def _flow_target() -> tuple[Any, str, list[str]]:
         """Latest snapshot, VPC id and its subnet ids for the flow log endpoints."""
@@ -1244,12 +1383,9 @@ def _register(app: Flask) -> None:
     @app.get("/settings/tfrepos/<int:repo_id>")
     def settings_tfrepo(repo_id: int):
         repo = _repo_or_404(repo_id)
-        return render_template(
-            "tfrepo.html",
-            repo=repo,
-            envs=tfrepo.list_envs(_db(), repo_id=repo_id),
-            accounts=_account_choices(),
-        )
+        envs = tfrepo.list_envs(_db(), repo_id=repo_id)
+        _wrong_account_rows(envs)
+        return render_template("tfrepo.html", repo=repo, envs=envs, accounts=_account_choices())
 
     @app.post("/settings/tfrepos/<int:repo_id>")
     def tfrepo_save_mapping(repo_id: int):
@@ -1280,50 +1416,132 @@ def _register(app: Flask) -> None:
         flash("Terraform repo removed from IPLens (the repository itself is never touched)", "ok")
         return redirect(url_for("settings_page") + "#tfrepos")
 
-    def _tf_sync(*, account_ref: int | None = None, repo_id: int | None = None):
+    def _tf_syncer() -> Callable[..., list[tfrepo.SyncResult]]:
+        """A Terraform sync bound to this app's settings, safe to call from a job thread
+        (it captures plain values, never the request or app context)."""
         ext = _ext()
         tf_bin = ext["terraform_bin"]
-        return tfrepo.sync(
-            _paths().db_path,
-            lambda ref: _accounts().get(ref, with_secret=True),
-            cache_dir=_paths().tf_cache_dir,
-            terraform_bin=tfrepo.find_terraform() if tf_bin is None else tf_bin,
-            account_ref=account_ref,
-            repo_id=repo_id,
-            runner=ext["tf_runner"],
-        )
+        db_path, cache_dir, runner = _paths().db_path, _paths().tf_cache_dir, ext["tf_runner"]
+        accounts = _accounts()
+        timeout = float(_store().load().tf_timeout)
 
-    def _flash_sync(results: list[tfrepo.SyncResult]) -> None:
-        if not results:
-            flash("Terraform sync: no confirmed root × environment pairs.", "warn")
-            return
-        ok = all(r.status == tfrepo.OK for r in results)
-        flash(f"Terraform sync: {tfrepo.summarise(results)}", "ok" if ok else "warn")
+        def run(
+            *,
+            account_ref: int | None = None,
+            repo_id: int | None = None,
+            progress: Progress | None = None,
+        ) -> list[tfrepo.SyncResult]:
+            return tfrepo.sync(
+                db_path,
+                lambda ref: accounts.get(ref, with_secret=True),
+                cache_dir=cache_dir,
+                terraform_bin=tfrepo.find_terraform() if tf_bin is None else tf_bin,
+                account_ref=account_ref,
+                repo_id=repo_id,
+                runner=runner,
+                timeout=timeout,
+                progress=progress,
+            )
+
+        return run
 
     @app.post("/terraform/sync")
     def terraform_sync():
         raw = request.form.get("repo_id", "")
-        _flash_sync(_tf_sync(repo_id=int(raw) if raw.isdigit() else None))
-        return redirect(_safe_next(request.form.get("next") or url_for("terraform_page")))
+        repo_id = int(raw) if raw.isdigit() else None
+        sync = _tf_syncer()
+
+        def work(ctx: JobContext) -> None:
+            results = sync(repo_id=repo_id, progress=ctx)
+            sync_messages(ctx, results)
+            ctx.check()
+            ctx.step("finished")
+
+        back = _safe_next(request.form.get("next") or url_for("terraform_page"))
+        return _run_job(_job_account(), "tfsync", work, back)
+
+    def _wrong_account_rows(envs: list[dict[str, Any]]) -> None:
+        """Add the suggested IPLens account to each "wrong account" root (in place)."""
+        accounts = _accounts().list()
+        labels = {c["id"]: c["label"] for c in _account_choices()}
+        for e in envs:
+            if e.get("status") == tfrepo.WRONG_ACCOUNT:
+                hit = tfrepo.suggest_for_state(e.get("state_account", ""), accounts)
+                e["suggest_ref"] = hit.id if hit else None
+                e["suggest_label"] = labels.get(hit.id, "") if hit else ""
 
     @app.get("/terraform")
     def terraform_page():
         ref = _active_ref()
         snap = _snapshot_or_none()
         envs = tfrepo.list_envs(_db(), account_ref=ref) if ref is not None else []
+        _wrong_account_rows(envs)
+        drift = tfrepo.drift(_db(), ref, snap) if snap is not None and ref is not None else None
+        if drift is not None:
+            _wrong_account_rows(drift.wrong_account)
         return render_template(
             "terraform.html",
             envs=envs,
             snap=snap,
-            drift=tfrepo.drift(_db(), ref, snap) if snap is not None and ref is not None else None,
+            drift=drift,
             any_roots=bool(terraform.list_roots(_db())),
+            markers=tfrepo.list_markers(_db(), ref) if ref is not None else [],
+            marker_kinds=tfrepo.MARKER_KINDS,
+            marker_types=[
+                (k, terraform.KIND_LABELS.get(k, k)) for k in (*tfrepo.DRIFT_KINDS, "eni")
+            ],
+            wrong_account=tfrepo.WRONG_ACCOUNT,
         )
+
+    @app.post("/terraform/markers")
+    def terraform_marker_add():
+        ref = _active_or_400()
+        f = request.form
+        kind = f.get("kind", "")
+        value = f.get(f"value_{kind}", "") or f.get("value", "")
+        scope_ref = None if f.get("scope") == "all" else ref
+        try:
+            with closing(_paths().db_path) as conn:
+                tfrepo.add_marker(conn, scope_ref, kind, value, f.get("note", ""))
+        except ValueError as exc:
+            flash(f"Marker not saved: {exc}", "error")
+            return redirect(url_for("terraform_page") + "#managed-elsewhere")
+        log.info("managed-elsewhere marker added (account=%s, kind=%s)", scope_ref, kind)
+        flash("Marked as managed elsewhere: left out of drift.", "ok")
+        return redirect(url_for("terraform_page") + "#managed-elsewhere")
+
+    @app.post("/terraform/markers/<int:marker_id>/delete")
+    def terraform_marker_delete(marker_id: int):
+        ref = _active_or_400()
+        if not any(m.id == marker_id for m in tfrepo.list_markers(_db(), ref)):
+            abort(404)
+        with closing(_paths().db_path) as conn:
+            tfrepo.delete_marker(conn, marker_id)
+        flash("Marker removed.", "ok")
+        return redirect(url_for("terraform_page") + "#managed-elsewhere")
 
     @app.post("/settings")
     def settings_save():
-        _store().save(log_dir=request.form.get("log_dir", ""))
-        new_dir = apply_log_dir(current_app, _store().load())
-        log.info("settings saved: log_dir=%s", new_dir)
+        f = request.form
+        # Fields missing from the form keep their value.
+        try:
+            timeout = parse_tf_timeout(f["tf_timeout"]) if "tf_timeout" in f else None
+        except ValueError as exc:
+            flash(f"Settings not saved: {exc}", "error")
+            return redirect(url_for("settings_page"))
+        _store().save(
+            log_dir=f.get("log_dir", ""),
+            tf_timeout=timeout,
+            env_tag_keys=f.get("env_tag_keys") if "env_tag_keys" in f else None,
+        )
+        saved = _store().load()
+        new_dir = apply_log_dir(current_app, saved)
+        log.info(
+            "settings saved: log_dir=%s tf_timeout=%ss env_tag_keys=%s",
+            new_dir,
+            saved.tf_timeout,
+            ",".join(saved.env_tag_keys),
+        )
         flash("Settings saved", "ok")
         return redirect(url_for("settings_page"))
 

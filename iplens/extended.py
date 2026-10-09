@@ -42,6 +42,7 @@ from botocore.exceptions import ClientError
 
 from .aws import AwsGateway, ReadOnlyViolation
 from .db import closing
+from .jobs import NullProgress, Progress
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ SERVICE_LABELS = {
     "states": "Step Functions",
     "secretsmanager": "Secret (name only)",
     "kinesis": "Kinesis stream",
+    "kafka": "Kafka (MSK / self-managed)",
     "tgw": "Transit Gateway",
     "tgw-attachment": "TGW attachment",
     "pcx": "VPC peering",
@@ -130,6 +132,8 @@ def node_for_arn(arn: str) -> tuple[str, str] | None:
         return "s3", res
     if service == "kinesis" and res.startswith("stream/"):
         return "kinesis", res.split("/", 2)[1]
+    if service == "kafka" and res.startswith("cluster/"):
+        return "kafka", res.split("/", 2)[1]  # cluster/<name>/<uuid>
     if service == "states" and res.startswith("stateMachine:"):
         return "states", res.split(":", 2)[1]
     if service == "secretsmanager" and res.startswith("secret:"):
@@ -139,6 +143,17 @@ def node_for_arn(arn: str) -> tuple[str, str] | None:
     if service == "ecs" and res.startswith("service/"):
         return "ecs", res[len("service/") :]
     return None
+
+
+def kafka_bootstrap_host(mapping: dict[str, Any]) -> str:
+    """First bootstrap host (port dropped) of a self-managed Kafka event source mapping."""
+    endpoints = (mapping.get("SelfManagedEventSource") or {}).get("Endpoints") or {}
+    for server in endpoints.get("KAFKA_BOOTSTRAP_SERVERS") or []:
+        host, sep, port = str(server).strip().rpartition(":")
+        host = host if sep and port.isdigit() else str(server).strip()
+        if host and len(host) <= 253:
+            return host
+    return ""
 
 
 @dataclass
@@ -332,10 +347,18 @@ def action_services(statement: dict[str, Any]) -> set[str]:
 class ExtendedCrawler:
     """Crawl regional services into the ``ext_*`` tables of snapshot ``snapshot_id``."""
 
-    def __init__(self, gateway: AwsGateway, db_path: Path, snapshot_id: int):
+    def __init__(
+        self,
+        gateway: AwsGateway,
+        db_path: Path,
+        snapshot_id: int,
+        progress: Progress | None = None,
+    ):
         self.gw = gateway
         self.db_path = db_path
         self.snapshot_id = snapshot_id
+        # Background job reporting; cancellation is checked between sources.
+        self.progress: Progress = progress or NullProgress()
         self.graph = ExtGraph()
         self.result = CrawlResult(snapshot_id)
         # In-memory only, dropped when the crawl ends (env values are never stored).
@@ -377,7 +400,7 @@ class ExtendedCrawler:
             self._load_snapshot(conn)
         log.info("extended crawl started snapshot=%s", self.snapshot_id)
         # Inventory first: later sources match references against the catalog.
-        for name, fn in (
+        sources = (
             ("lambda:ListFunctions", self._lambdas),
             ("sns:ListTopics", self._sns_topics),
             ("sqs:ListQueues", self._sqs),
@@ -389,6 +412,7 @@ class ExtendedCrawler:
             ("apigateway:GetRestApis", self._apigw_rest),
             ("apigatewayv2:GetApis", self._apigw_http),
             ("ecs:DescribeServices", self._ecs_services),
+            ("kafka:ListClustersV2", self._msk_clusters),
             ("resource-explorer-2:ListResources", self._resource_explorer),
             # Relationships.
             ("sns:ListSubscriptions", self._sns_subscriptions),
@@ -407,9 +431,14 @@ class ExtendedCrawler:
             ("route53resolver:ListResolverRules", self._resolver),
             ("config:GetResourceConfigHistory", self._config),
             ("xray:GetServiceGraph", self._xray),
-        ):
+        )
+        for i, (name, fn) in enumerate(sources):
+            self.progress.check()
+            self.progress.step(f"crawl · {name}", done=i, total=len(sources) + 1)
             self._source(name, fn)
         self._functions.clear()
+        self.progress.check()
+        self.progress.step("crawl · saving", done=len(sources), total=len(sources) + 1)
         self._save()
         log.info(
             "extended crawl finished snapshot=%s nodes=%d edges=%d warnings=%d",
@@ -705,12 +734,51 @@ class ExtendedCrawler:
                 count += 1
         return count
 
+    def _msk_clusters(self) -> int:
+        """Amazon MSK clusters (provisioned and serverless) by name and ARN.
+
+        ``ListClustersV2`` is the MSK list call that covers both cluster types (the old
+        ``ListClusters`` only returns provisioned ones); it needs the read-only
+        ``kafka:ListClustersV2`` permission. Broker, authentication and configuration
+        details are not read.
+        """
+        clusters = _pages(
+            self._client("kafka"), "list_clusters_v2", "ClusterInfoList", MAX_PER_SOURCE
+        )
+        for c in clusters:
+            arn = c.get("ClusterArn", "")
+            name = c.get("ClusterName") or (node_for_arn(arn) or ("", ""))[1]
+            if name:
+                self.graph.node("kafka", name, arn)
+        return len(clusters)
+
+    def _kafka_source(self, mapping: dict[str, Any]) -> str | None:
+        """Node of a mapping's MSK cluster (by ARN) or self-managed Kafka bootstrap host."""
+        arn = mapping.get("EventSourceArn", "")
+        if arn:
+            return self.graph.node_from_arn(arn)
+        host = kafka_bootstrap_host(mapping)
+        return self.graph.node("kafka", host, area="external") if host else None
+
     def _event_source_mappings(self) -> int:
         maps = _pages(self._client("lambda"), "list_event_source_mappings", "EventSourceMappings")
         for m in maps:
             fn = self.graph.node_from_arn(m.get("FunctionArn", ""))
-            src = self.graph.node_from_arn(m.get("EventSourceArn", ""))
-            if fn and src:
+            src = self._kafka_source(m)
+            if fn and src and src.startswith("kafka:"):
+                topics = [str(t)[:64] for t in (m.get("Topics") or [])[:3]]
+                kind = "MSK cluster" if m.get("EventSourceArn") else "self-managed Kafka"
+                self.graph.edge(
+                    src,
+                    fn,
+                    "configured",
+                    "event source",
+                    f"event source mapping ({m.get('State', 'unknown')}): {kind} "
+                    f"{self._label(src)}"
+                    + (f" topic(s) {', '.join(topics)}" if topics else "")
+                    + f" triggers {self._label(fn)}",
+                )
+            elif fn and src:
                 what = "DynamoDB stream" if ":table/" in m.get("EventSourceArn", "") else "source"
                 self.graph.edge(
                     src,
