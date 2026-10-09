@@ -18,6 +18,8 @@
     {{ nav_link('overview', 'Discovery', ep in ('overview', 'subnet', 'eni')) }}
     {{ nav_link('ips', 'IP List', ep.startswith('ips')) }}
     {{ nav_link('visual', 'Visual', ep.startswith('visual')) }}
+    {{ nav_link('trends_page', 'Trends', ep == 'trends_page') }}
+    {{ nav_link('diff_page', 'Diff', ep == 'diff_page') }}
     {{ nav_link('scope_page', 'Scope', ep.startswith('scope')) }}
     {{ nav_link('rules_list', 'Rules', ep.startswith('rule')) }}
     {{ nav_link('suggestions', 'Suggestions', ep == 'suggestions') }}

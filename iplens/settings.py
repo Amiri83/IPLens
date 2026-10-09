@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ownership
+from . import ownership, retention
 from .db import ACTIVE_ACCOUNT_KEY, closing
 from .environment import DEFAULT_TAG_KEYS, parse_tag_keys
 
@@ -71,6 +71,13 @@ class Settings:
     ci_patterns: tuple[str, ...] = ownership.DEFAULT_CI_PATTERNS
     tf_enrichment: bool = False  # Terraform state as an ownership source (off by default)
     cloudtrail_lookup: bool = False  # CloudTrail creator of still unowned resources
+    # Snapshot retention (see iplens.retention).
+    retention_days: int = retention.RETENTION_DAYS
+    downsample_days: int = retention.DOWNSAMPLE_AFTER_DAYS
+
+    @property
+    def retention_policy(self) -> retention.Policy:
+        return retention.Policy(self.retention_days, self.downsample_days)
 
     @property
     def env_tag_keys_text(self) -> str:
@@ -137,6 +144,12 @@ class SettingsStore:
             timeout = parse_tf_timeout(self._get("tf_timeout") or DEFAULT_TF_TIMEOUT)
         except ValueError:
             timeout = DEFAULT_TF_TIMEOUT
+        try:
+            keep = int(self._get("retention_days") or retention.RETENTION_DAYS)
+            thin = int(self._get("downsample_days") or retention.DOWNSAMPLE_AFTER_DAYS)
+            retention.validate(keep, thin)
+        except ValueError:
+            keep, thin = retention.RETENTION_DAYS, retention.DOWNSAMPLE_AFTER_DAYS
         raw_keys = self._get("env_tag_keys")
         patterns = self._get("ci_patterns")
         return Settings(
@@ -156,6 +169,8 @@ class SettingsStore:
             ),
             tf_enrichment=self._get("tf_enrichment") == "1",
             cloudtrail_lookup=self._get("cloudtrail_lookup") == "1",
+            retention_days=keep,
+            downsample_days=thin,
         )
 
     def _key_setting(self, name: str, default: str) -> str:
@@ -200,6 +215,24 @@ class SettingsStore:
             self._set("tf_enrichment", "1" if tf_enrichment else "0")
         if cloudtrail_lookup is not None:
             self._set("cloudtrail_lookup", "1" if cloudtrail_lookup else "0")
+
+    def save_retention(self, retention_days: str | int, downsample_days: str | int) -> None:
+        """Store the retention window and downsample threshold; ValueError if invalid."""
+        keep = retention.parse_days(
+            retention_days,
+            "retention window",
+            retention.MIN_RETENTION_DAYS,
+            retention.MAX_RETENTION_DAYS,
+        )
+        thin = retention.parse_days(
+            downsample_days,
+            "downsample threshold",
+            retention.MIN_DOWNSAMPLE_DAYS,
+            retention.MAX_DOWNSAMPLE_DAYS,
+        )
+        retention.validate(keep, thin)
+        self._set("retention_days", str(keep))
+        self._set("downsample_days", str(thin))
 
     def active_account_id(self) -> int | None:
         value = self._get(ACTIVE_ACCOUNT_KEY)

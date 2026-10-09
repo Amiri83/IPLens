@@ -36,10 +36,14 @@ from . import (
     flowlogs,
     ownership,
     queries,
+    scheduler,
     terraform,
     tfrepo,
+    trends,
     viewstate,
 )
+from . import diff as diff_mod
+from . import retention as retention_mod
 from . import rules as rules_mod
 from . import scope as scope_mod
 from . import suggestions as sugg_mod
@@ -81,6 +85,8 @@ GatewayFactory = Callable[[Account], AwsGateway]
 # Typed on the Discovery page to confirm deleting snapshots.
 DELETE_CONFIRMATION = "DELETE"
 HISTORY_ROWS = 50
+# Snapshots offered by the Diff page's pickers (newest first).
+DIFF_CHOICES = 500
 OUT_OF_SCOPE = "This resource is outside the active scope."
 # DNS-rebinding protection: only these Host header names are served.
 ALLOWED_HOSTS = ("127.0.0.1", "localhost")
@@ -191,12 +197,14 @@ def create_app(
     port: int | None = None,
     terraform_bin: str | None = None,
     terraform_runner: tfrepo.Runner | None = None,
+    scheduler_enabled: bool | None = None,
 ) -> Flask:
     """Build the app. ``port`` is the port the server listens on; when given,
     the Host header must be ``127.0.0.1:<port>`` or ``localhost:<port>``.
     ``terraform_bin`` (default: found on PATH at sync time) and ``terraform_runner``
     (default: the cancellable :func:`tfrepo.run_process`) are for tests; the command
-    allowlist applies to both."""
+    allowlist applies to both. ``scheduler_enabled`` (default: not ``testing``) starts the
+    scheduled-Refresh thread (:mod:`iplens.scheduler`)."""
     paths = default_paths(home).ensure()
     init_db(paths.db_path)
     box = SecretBox.from_path(paths.key_path)
@@ -230,6 +238,14 @@ def create_app(
     log.info("IPLens started (data dir %s)", paths.home)
 
     _register(app)
+    sched = scheduler.Scheduler(
+        paths.db_path,
+        app.extensions["iplens"]["jobs"],
+        app.extensions["iplens"]["start_scheduled_refresh"],
+    )
+    app.extensions["iplens"]["scheduler"] = sched
+    if scheduler_enabled if scheduler_enabled is not None else not testing:
+        sched.start()
     return app
 
 
@@ -458,11 +474,15 @@ def _register(app: Flask) -> None:
             owners = queries.owner_breakdown(_db(), snap["id"], _scope())
         ref = _active_ref()
         history = queries.recent_snapshots(_db(), HISTORY_ROWS, ref) if ref is not None else []
+        # Subnets forecast to fill up within trends.SOON_DAYS (default Trends window).
+        soon = trends.soon_full(_db(), ref, scope=_scope()) if snap and ref is not None else {}
         return render_template(
             "overview.html",
             snap=snap,
             tree=tree,
             owners=owners,
+            soon=soon,
+            soon_days=trends.SOON_DAYS,
             history=history,
             protected=queries.protected_snapshot_ids(_db()),
             confirm_word=DELETE_CONFIRMATION,
@@ -529,13 +549,21 @@ def _register(app: Flask) -> None:
                 return jsonify({"ok": False, "error": "Add an AWS account in Settings first."}), 400
             flash("Add an AWS account in Settings first.", "error")
             return redirect(url_for("settings_page"))
-        # Everything the job needs is resolved here: the worker never touches the request.
-        account = _accounts().get(active.id, with_secret=True)
+        return _run_job(active.id, "refresh", _refresh_work(active.id), url_for("overview"))
+
+    def _refresh_work(account_id: int) -> Callable[[JobContext], None]:
+        """The Refresh job of an account (a manual Refresh or a scheduled one). Needs a
+        request context; everything the job needs is resolved here, so the worker never
+        touches the request."""
+        account = _accounts().get(account_id, with_secret=True)
+        if account is None:
+            raise ValueError(f"unknown account {account_id}")
         factory = _ext()["gateway_factory"]
         db_path = _paths().db_path
         accounts = _accounts()
         edit_url = url_for("account_edit", account_id=account.id)
         own = _own()
+        policy = _store().load().retention_policy
         # Terraform is an optional ownership enrichment: mapped repos are only re-synced
         # with every refresh when it is enabled (the Sync buttons always work).
         tf_sync = (
@@ -556,7 +584,9 @@ def _register(app: Flask) -> None:
                     ownership_config=own,
                 ).run()
                 with closing(db_path) as conn:
-                    queries.prune_snapshots(conn)
+                    pruned = retention_mod.apply(conn, policy)
+                if pruned:
+                    log.info("retention: deleted %d snapshot(s)", pruned)
             except (JobCancelled, JobFailed):
                 raise
             except Exception as exc:
@@ -599,7 +629,17 @@ def _register(app: Flask) -> None:
                     ctx.message("warn", "Terraform sync failed. See the log for details.")
             ctx.step("finished")
 
-        return _run_job(account.id, "refresh", work, url_for("overview"))
+        return work
+
+    def _start_scheduled_refresh(account_ref: int) -> dict[str, Any]:
+        """Start an account's Refresh from the scheduler thread (no request of its own:
+        a throwaway request context resolves the same settings a manual Refresh uses).
+        Raises JobBusy while the account has a job running."""
+        with app.test_request_context("/"):
+            work = _refresh_work(account_ref)
+            return _jobs().start(account_ref, "refresh", work, label="Scheduled refresh")
+
+    app.extensions["iplens"]["start_scheduled_refresh"] = _start_scheduled_refresh
 
     # -- snapshot history ------------------------------------------------------------
 
@@ -641,6 +681,69 @@ def _register(app: Flask) -> None:
         )
         flash(f"Cleared history: deleted {deleted} snapshot(s), kept the latest per account.", "ok")
         return redirect(url_for("overview"))
+
+    # -- trends and diff (read from the snapshot history) -----------------------------
+
+    @app.get("/trends")
+    def trends_page():
+        snap = _snapshot_or_none()
+        window = request.args.get("window", trends.DEFAULT_WINDOW, type=int)
+        if window not in trends.WINDOWS:
+            window = trends.DEFAULT_WINDOW
+        ref = _active_ref()
+        data = trends.load(_db(), ref, window, _scope()) if snap and ref is not None else None
+        vpc = request.args.get("vpc", "")
+        if data and vpc not in {v.key for v in data.vpcs}:
+            vpc = ""
+        return render_template(
+            "trends.html",
+            snap=snap,
+            data=data,
+            vpc=vpc,
+            window=window,
+            windows=trends.WINDOWS,
+            chart=trends.svg_chart,
+            min_points=trends.MIN_CONFIDENT_POINTS,
+            soon_days=trends.SOON_DAYS,
+        )
+
+    @app.get("/diff")
+    def diff_page():
+        snap = _snapshot_or_none()
+        ref = _active_ref()
+        choices = (
+            [h for h in queries.recent_snapshots(_db(), DIFF_CHOICES, ref) if h["status"] == "ok"]
+            if ref is not None
+            else []
+        )
+        ok_ids = {h["id"] for h in choices}
+        prev_id, latest_id = diff_mod.default_pair(_db(), ref) if ref is not None else (None, None)
+        old_id = request.args.get("old", prev_id, type=int)
+        new_id = request.args.get("new", latest_id, type=int)
+        result, error = None, ""
+        if old_id is not None and new_id is not None:
+            if old_id not in ok_ids or new_id not in ok_ids:
+                abort(404)
+            if old_id == new_id:
+                error = "Pick two different snapshots."
+            else:
+                if old_id > new_id:  # always older -> newer
+                    old_id, new_id = new_id, old_id
+                result = diff_mod.diff_snapshots(
+                    _db(), old_id, new_id, OWNER_LABELS, _scope(), _env_keys(), _own()
+                )
+        taken = {h["id"]: h["taken_at"] for h in choices}
+        return render_template(
+            "diff.html",
+            snap=snap,
+            choices=choices,
+            old_id=old_id,
+            new_id=new_id,
+            taken=taken,
+            result=result,
+            error=error,
+            not_set=environment.NOT_SET_LABEL,
+        )
 
     # -- subnet grid / ENI / IP table ----------------------------------------
 
@@ -1335,6 +1438,12 @@ def _register(app: Flask) -> None:
             cloudtrail_days=ownership.CLOUDTRAIL_DAYS,
             cloudtrail_max=ownership.MAX_CLOUDTRAIL_LOOKUPS,
             accounts=_account_choices(),
+            schedules=scheduler.intervals(_db()),
+            intervals=scheduler.INTERVALS,
+            retention_limits={
+                "keep": (retention_mod.MIN_RETENTION_DAYS, retention_mod.MAX_RETENTION_DAYS),
+                "thin": (retention_mod.MIN_DOWNSAMPLE_DAYS, retention_mod.MAX_DOWNSAMPLE_DAYS),
+            },
             default_log_dir=_paths().default_log_dir,
             tf_roots=terraform.list_roots(_db()),
             tf_types=sorted(terraform.MANAGED_TYPES),
@@ -1664,6 +1773,8 @@ def _register(app: Flask) -> None:
         # Fields missing from the form keep their value.
         try:
             timeout = parse_tf_timeout(f["tf_timeout"]) if "tf_timeout" in f else None
+            if "retention_days" in f:
+                _store().save_retention(f["retention_days"], f.get("downsample_days", ""))
         except ValueError as exc:
             flash(f"Settings not saved: {exc}", "error")
             return redirect(url_for("settings_page"))
@@ -1683,7 +1794,7 @@ def _register(app: Flask) -> None:
         new_dir = apply_log_dir(current_app, saved)
         log.info(
             "settings saved: log_dir=%s tf_timeout=%ss env_tag_keys=%s ownership keys=%s "
-            "tf_enrichment=%s cloudtrail=%s",
+            "tf_enrichment=%s cloudtrail=%s retention=%sd downsample=%sd",
             new_dir,
             saved.tf_timeout,
             ",".join(saved.env_tag_keys),
@@ -1692,6 +1803,8 @@ def _register(app: Flask) -> None:
             ),
             saved.tf_enrichment,
             saved.cloudtrail_lookup,
+            saved.retention_days,
+            saved.downsample_days,
         )
         flash("Settings saved", "ok")
         return redirect(url_for("settings_page"))
@@ -1782,6 +1895,20 @@ def _register(app: Flask) -> None:
             _store().set_active_account_id(first.id if first else None)
         log.info("account deleted: id=%s", account_id)
         flash("Account deleted together with its snapshots", "ok")
+        return redirect(url_for("settings_page"))
+
+    @app.post("/accounts/<int:account_id>/schedule")
+    def account_schedule(account_id: int):
+        if _accounts().get(account_id) is None:
+            abort(404)
+        try:
+            hours = scheduler.parse_interval(request.form.get("interval", ""))
+        except ValueError as exc:
+            abort(400, str(exc))
+        with closing(_paths().db_path) as conn:
+            scheduler.set_interval(conn, account_id, hours)
+        log.info("scheduled refresh of account=%s: %s", account_id, scheduler.INTERVALS[hours])
+        flash(f"Scheduled refresh: {scheduler.INTERVALS[hours]}", "ok")
         return redirect(url_for("settings_page"))
 
     @app.post("/accounts/<int:account_id>/test")

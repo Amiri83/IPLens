@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 from . import __version__
 
@@ -22,7 +23,10 @@ def main(argv: list[str] | None = None) -> None:
 
     from .web import create_app
 
-    app = create_app(args.home, port=args.port)
+    # With --debug the reloader's watcher process builds the app too: only the serving
+    # child (WERKZEUG_RUN_MAIN) runs the scheduled-Refresh thread.
+    serving = not args.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    app = create_app(args.home, port=args.port, scheduler_enabled=serving)
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 

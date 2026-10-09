@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% from "_macros.html" import no_data with context %}
+{% block title %}Diff{% endblock %}
+{% macro delta(n) -%}
+  <span class="{{ 'delta-up' if n > 0 else 'delta-down' if n < 0 else 'muted' }}">{{ '%+d' % n }}</span>
+{%- endmacro %}
+{% block content %}
+<h1>Diff</h1>
+{% if not snap %}
+  {{ no_data() }}
+{% elif choices | length < 2 %}
+  <div class="card muted">The diff needs two successful snapshots of this account: Refresh again later, or set a
+    scheduled refresh in <a href="{{ url_for('settings_page') }}">Settings</a>.</div>
+{% else %}
+<form method="get" action="{{ url_for('diff_page') }}" class="card row">
+  {% for name, label, current in (('old', 'From (older)', old_id), ('new', 'To (newer)', new_id)) %}
+  <div><label for="snap-{{ name }}">{{ label }}</label>
+    <select id="snap-{{ name }}" name="{{ name }}">
+      {% for h in choices %}<option value="{{ h.id }}" {{ 'selected' if h.id == current }}>#{{ h.id }} · {{ h.taken_at[:16] | replace('T', ' ') }} UTC</option>{% endfor %}
+    </select></div>
+  {% endfor %}
+  <div><button type="submit">Compare</button></div>
+  <div class="muted small" style="flex: 1 1 100%">Default: the latest snapshot against the previous one.
+    ENIs are matched by id, IPs by address; the active scope applies.</div>
+</form>
+
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+{% if result %}
+  {% set t = result.totals %}
+  <div class="card">
+    Snapshot #{{ result.old_id }} ({{ taken[result.old_id] | localtime }}) → #{{ result.new_id }} ({{ taken[result.new_id] | localtime }}):
+    <b>ENIs</b> <span class="badge ok">+{{ t.enis_added }} added</span> <span class="badge err">−{{ t.enis_removed }} removed</span>
+    <span class="badge warn">{{ t.enis_changed }} changed</span> ·
+    <b>IPs</b> <span class="badge ok">+{{ t.ips_added }} added</span> <span class="badge err">−{{ t.ips_removed }} removed</span>
+    <span class="badge warn">{{ t.ips_changed }} changed</span> · net {{ delta(t.ip_delta) }} IPs
+  </div>
+
+  <div class="row diff-side" style="align-items: flex-start">
+    <section class="card" style="flex: 1 1 380px">
+      <h2 style="margin-top: 0">Net IP delta per subnet</h2>
+      <table>
+        <thead><tr><th>Subnet</th><th>Name</th><th>CIDR</th><th>Before</th><th>After</th><th>Δ</th></tr></thead>
+        <tbody>
+        {% for d in result.subnets %}
+          <tr><td class="mono">{{ d.subnet_id }}</td><td>{{ d.name }}</td><td class="mono">{{ d.cidr }}</td>
+            <td>{{ d.old }}</td><td>{{ d.new }}</td><td>{{ delta(d.delta) }}</td></tr>
+        {% else %}<tr><td colspan="6" class="muted">No subnets</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </section>
+    <section class="card" style="flex: 1 1 380px">
+      <h2 style="margin-top: 0">Top consumers</h2>
+      <p class="muted small">Resources whose IP count grew the most.</p>
+      <table>
+        <thead><tr><th>Resource</th><th>Type</th><th>Before</th><th>After</th><th>Δ</th></tr></thead>
+        <tbody>
+        {% for c in result.consumers %}
+          <tr><td>{{ c.resource }}</td><td>{{ c.type_label }}</td><td>{{ c.old }}</td><td>{{ c.new }}</td><td>{{ delta(c.delta) }}</td></tr>
+        {% else %}<tr><td colspan="5" class="muted">No resource grew.</td></tr>{% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  <h2>Changes by owner type, ownership and environment</h2>
+  {% for g in result.groups %}
+    <details class="card diff-group" open>
+      <summary><b>{{ g.type_label }}</b> · {{ g.owner }} · env {{ g.env or not_set }}
+        <span class="muted small">· ENIs +{{ g.count('enis', 'added') }} / −{{ g.count('enis', 'removed') }} / ~{{ g.count('enis', 'changed') }}
+          · IPs +{{ g.count('ips', 'added') }} / −{{ g.count('ips', 'removed') }} / ~{{ g.count('ips', 'changed') }}
+          · net {{ delta(g.ip_delta) }}</span></summary>
+      {% if g.enis %}
+      <table>
+        <thead><tr><th>Change</th><th>ENI</th><th>Resource</th><th>Subnet</th><th>Details</th></tr></thead>
+        <tbody>
+        {% for e in g.enis %}
+          <tr><td><span class="badge {{ 'ok' if e.kind == 'added' else 'err' if e.kind == 'removed' else 'warn' }}">{{ e.kind }}</span></td>
+            <td class="mono">{{ e.eni_id }}</td><td>{{ e.resource }}</td><td class="mono">{{ e.subnet_id }}</td>
+            <td class="small">{% if e.kind == 'added' %}{{ e.new_ips | join(', ') }}{% elif e.kind == 'removed' %}{{ e.old_ips | join(', ') }}{% else %}{{ e.details | join('; ') }}{% endif %}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+      {% if g.ips %}
+      <table>
+        <thead><tr><th>Change</th><th>IP</th><th>Resource</th><th>Subnet</th><th>ENI</th></tr></thead>
+        <tbody>
+        {% for i in g.ips %}
+          <tr><td><span class="badge {{ 'ok' if i.kind == 'added' else 'err' if i.kind == 'removed' else 'warn' }}">{{ i.kind }}</span></td>
+            <td class="mono">{{ i.ip }}</td><td>{{ i.resource }}</td><td class="mono">{{ i.subnet_id }}</td>
+            <td class="mono small">{{ i.detail or i.new_eni or i.old_eni }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+    </details>
+  {% else %}
+    <div class="card muted">No ENI or IP changes between these snapshots.</div>
+  {% endfor %}
+{% endif %}
+{% endif %}
+{% endblock %}

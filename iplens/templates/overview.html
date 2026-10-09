@@ -49,7 +49,10 @@
         <tbody>
         {% for s in v.subnets %}
           <tr>
-            <td class="mono"><a href="{{ url_for('subnet', subnet_id=s.subnet_id) }}">{{ s.subnet_id }}</a></td>
+            <td class="mono"><a href="{{ url_for('subnet', subnet_id=s.subnet_id) }}">{{ s.subnet_id }}</a>
+              {% set fc = soon.get(s.subnet_id) %}
+              {% if fc %}<a class="badge err forecast-badge" href="{{ url_for('trends_page', vpc=v.vpc_id) }}#{{ s.subnet_id }}"
+                 title="Forecast from the Trends page: {{ fc.text }}{{ ' · ' ~ fc.confidence_note if fc.confidence_note }}">⚠ {{ fc.text }}</a>{% endif %}</td>
             <td>{{ s.name }}</td>
             <td class="mono">{{ s.cidr }}</td>
             <td>{{ s.az }}</td>

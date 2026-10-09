@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% from "_macros.html" import no_data with context %}
+{% block title %}Trends{% endblock %}
+{% macro forecast_cell(fc) -%}
+  {% if fc.soon %}<span class="badge err">⚠ {{ fc.text }}</span>
+  {% elif fc.status == 'growing' %}<span class="badge warn">{{ fc.text }}</span>
+  {% elif fc.status == 'stable' %}<span class="badge ok">{{ fc.text }}</span>
+  {% else %}<span class="badge">{{ fc.text }}</span>{% endif %}
+  {% if fc.confidence_note %}<div class="muted small confidence-note">{{ fc.confidence_note }}</div>{% endif %}
+{%- endmacro %}
+{% block content %}
+<h1>Trends</h1>
+{% if not snap %}
+  {{ no_data() }}
+{% else %}
+<form method="get" action="{{ url_for('trends_page') }}" class="card row">
+  <div><label for="window">Window</label>
+    <select id="window" name="window" onchange="this.form.submit()">
+      {% for days, label in windows.items() %}<option value="{{ days }}" {{ 'selected' if days == window }}>last {{ label }}</option>{% endfor %}
+    </select></div>
+  <div><label for="vpc">VPC</label>
+    <select id="vpc" name="vpc" onchange="this.form.submit()">
+      <option value="">all VPCs</option>
+      {% for v in data.vpcs %}<option value="{{ v.key }}" {{ 'selected' if v.key == vpc }}>{{ v.key }} {{ v.name }}</option>{% endfor %}
+    </select></div>
+  <noscript><div><button type="submit" class="secondary">Show</button></div></noscript>
+  <div class="muted small" style="flex: 1 1 100%">
+    Used IPs (idle ENIs included) per successful snapshot in the window: {{ data.snapshots }} snapshot(s).
+    The forecast is a linear regression over the window: "full in ~N days" while usage grows toward the limit
+    (usable addresses), else "stable/declining". Fewer than {{ min_points }} points give a low-confidence forecast.
+    Set a scheduled refresh in <a href="{{ url_for('settings_page') }}">Settings</a> to collect history.</div>
+</form>
+
+{% for v in data.vpcs if not vpc or v.key == vpc %}
+  <section class="card trend-vpc">
+    <h2 style="margin-top: 0"><span class="mono">{{ v.key }}</span> {{ v.name }}
+      <span class="muted small">· {{ v.cidr }} · {{ v.latest }} of {{ v.capacity }} usable subnet IPs used</span></h2>
+    <div class="row trend-head">
+      {{ chart(v) }}
+      <div><b>VPC forecast:</b> {{ forecast_cell(v.forecast) }}
+        {% if v.forecast.status in ('growing', 'stable') %}<div class="muted small">trend {{ '%+.2f' % v.forecast.slope_per_day }} IPs/day</div>{% endif %}
+        <div class="muted small">Limit: the usable addresses of its current subnets.</div></div>
+    </div>
+    <table class="trend-table">
+      <thead><tr><th>Subnet</th><th>Name</th><th>CIDR</th><th>History</th><th>Used / limit</th><th>Trend (IPs/day)</th><th>Forecast</th></tr></thead>
+      <tbody>
+      {% for s in data.subnets[v.key] %}
+        <tr id="{{ s.key }}">
+          <td class="mono"><a href="{{ url_for('subnet', subnet_id=s.key) }}">{{ s.key }}</a></td>
+          <td>{{ s.name }}</td>
+          <td class="mono">{{ s.cidr }}</td>
+          <td>{{ chart(s, width=180, height=40, compact=true) }}</td>
+          <td>{{ s.latest }} / {{ s.capacity }}</td>
+          <td>{% if s.forecast.status in ('growing', 'stable') %}{{ '%+.2f' % s.forecast.slope_per_day }}{% else %}<span class="muted">–</span>{% endif %}</td>
+          <td>{{ forecast_cell(s.forecast) }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="muted">No subnets</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <details>
+      <summary>VPC data points ({{ v.points | length }})</summary>
+      <table class="trend-points">
+        <thead><tr><th>Snapshot taken</th><th>Used IPs</th></tr></thead>
+        <tbody>{% for t, n in v.points %}<tr><td>{{ t | localtime }}</td><td>{{ n }}</td></tr>{% endfor %}</tbody>
+      </table>
+    </details>
+  </section>
+{% else %}
+  <div class="card muted">No successful snapshots in the last {{ windows[window] }}.</div>
+{% endfor %}
+{% endif %}
+{% endblock %}
