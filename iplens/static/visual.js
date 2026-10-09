@@ -26,16 +26,22 @@
   const CELL_GAP = 24;         // grid layout: space between two wrapped resource labels
   const BLOCK_GAP_X = 90;      // block layouts: space between two boxes in a row
   const BLOCK_GAP_Y = 60;      // ... and between two rows (box labels are measured)
+  const container = document.getElementById("cy");
+  if (!container || typeof cytoscape === "undefined") return;
+  const extended = container.dataset.mode === "extended";
+  // The Extended view draws bigger icons and labels so that it stays readable at Fit;
+  // Fit never zooms out below MIN_READABLE_ZOOM there (pan or zoom out to see the rest).
+  const ICON = extended ? 56 : 44;
+  const RES_FONT = extended ? 12 : 10;
+  const MIN_READABLE_ZOOM = 0.6;
   // Label line widths in px; full names are wrapped after "- _ . /" to fit.
-  const TEXT_W = { res: 180, subnet: 300, vpc: 420 };
+  const TEXT_W = { res: extended ? 200 : 180, subnet: 300, vpc: 420 };
   const FONTS = {
-    res: "normal normal 10px system-ui, sans-serif",
+    res: `normal normal ${RES_FONT}px system-ui, sans-serif`,
     subnet: "normal normal 11px system-ui, sans-serif",
     vpc: "normal bold 14px system-ui, sans-serif",
   };
-
-  const container = document.getElementById("cy");
-  if (!container || typeof cytoscape === "undefined") return;
+  const NOT_SET = "(not set)";  // mirrors iplens.environment.NOT_SET_LABEL
   const status = document.getElementById("cy-status");
   const note = document.getElementById("cy-note");
   const tip = document.getElementById("cy-tip");
@@ -54,7 +60,7 @@
   const groupBySelect = document.getElementById("group-by");
   const groupTagSelect = document.getElementById("group-tag");
   const expandExportBox = document.getElementById("export-expand");
-  const extended = container.dataset.mode === "extended";
+  const envFilters = document.getElementById("env-filters");
   const view = extended ? "extended" : "ip";  // per-view state key (iplens.viewstate.VIEWS)
   const iconRoot = container.dataset.iconRoot;
   const evidenceBoxes = Array.from(document.querySelectorAll('input[type="checkbox"][name="evidence"]'));
@@ -339,7 +345,81 @@
       if (!roots.length) return [{ key: "tf:", label: "Terraform: unmanaged", unmanaged: true }];
       return roots.map((r) => ({ key: "tf:" + r, label: "Terraform: " + r }));
     }
+    if (mode === "env") {
+      const env = raw.environment || "";
+      return [{ key: "env:" + env, label: "environment: " + (env || NOT_SET), unmanaged: !env }];
+    }
     return [];
+  }
+
+  // -- environment filter (both views) --------------------------------------------------
+
+  const ENV_PARAM = "envoff";  // URL: the unticked environments ("" = not set)
+
+  function environmentsOf(data, extNodes) {
+    const counts = new Map();
+    const add = (env) => counts.set(env || "", (counts.get(env || "") || 0) + 1);
+    allResources(data.vpc).forEach((r) => add(r.environment));
+    (extNodes || []).forEach((n) => add(n.environment));
+    return Array.from(counts.entries())
+      .sort((a, b) => (a[0] === "" ? 1 : 0) - (b[0] === "" ? 1 : 0) || a[0].localeCompare(b[0]));
+  }
+
+  function envOff() {
+    if (!envFilters) return new Set();
+    return new Set(Array.from(envFilters.querySelectorAll('input[name="env"]'))
+      .filter((b) => !b.checked).map((b) => b.value));
+  }
+
+  function populateEnvFilters(envs, onChange) {
+    if (!envFilters) return;
+    const initial = new URLSearchParams(window.location.search).getAll(ENV_PARAM);
+    envFilters.querySelectorAll("label, #env-filters-empty").forEach((el) => el.remove());
+    if (!envs.length) {
+      const none = document.createElement("span");
+      none.className = "muted small";
+      none.id = "env-filters-empty";
+      none.textContent = "No resources.";
+      envFilters.append(none);
+      return;
+    }
+    envs.forEach(([env, count]) => {
+      const label = document.createElement("label");
+      label.className = "edge-filter";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.name = "env";
+      box.value = env;
+      box.checked = !initial.includes(env);
+      box.addEventListener("change", () => {
+        rememberEnvFilter();
+        onChange();
+      });
+      const num = document.createElement("span");
+      num.className = "muted";
+      num.textContent = `(${count})`;
+      label.append(box, ` ${env || NOT_SET} `, num);
+      envFilters.append(label);
+    });
+  }
+
+  function rememberEnvFilter() {
+    const params = new URLSearchParams(window.location.search);
+    params.delete(ENV_PARAM);
+    envOff().forEach((env) => params.append(ENV_PARAM, env));
+    window.history.replaceState(null, "", `${window.location.pathname}?${params}`);
+  }
+
+  /* IP view: resources of unticked environments disappear, and a group whose members are
+     all gone with them (the Extended view folds this into applyServiceFilter). */
+  function applyEnvFilterIp(cy) {
+    const off = envOff();
+    cy.batch(() => {
+      cy.nodes(".res").forEach((n) => { n.toggleClass("filtered", off.has(n.data("raw").environment || "")); });
+      cy.nodes(".group").forEach((g) => {
+        g.toggleClass("filtered", groupMembers(cy, g).every((m) => m.hasClass("filtered")));
+      });
+    });
   }
 
   /* Rebuild the context boxes: one non-compound "ctx" node per SG / tag value / root,
@@ -355,6 +435,7 @@
       if (!mode || laneMode()) return;  // Extended view: swimlanes instead of boxes
       const boxes = new Map();
       cy.nodes(".res").forEach((n) => {
+        if (n.hasClass("filtered")) return;  // environment filter
         const shown = n.hasClass("hidden") ? n.data("memberOf") : n.id();
         contextKeys(n.data("raw"), mode, tagKey, data).forEach((k) => {
           if (!boxes.has(k.key)) boxes.set(k.key, { ...k, shown: new Set(), members: [] });
@@ -428,7 +509,7 @@
   // (unless ``expandAll``: exports with "Expand all groups" keep the member).
   function endpointId(cy, id, expandAll) {
     const n = cy.getElementById("res:" + id);
-    if (n.empty()) return null;
+    if (n.empty() || n.hasClass("filtered")) return null;
     return n.hasClass("hidden") && !expandAll ? n.data("memberOf") : n.id();
   }
 
@@ -488,9 +569,19 @@
   const expandedGroups = new Set(JSON.parse(document.getElementById("visual-expanded").textContent || "[]"));
   let focusId = null;  // node whose neighbourhood is shown (focus mode), else null
 
-  // Swimlanes replace the "Group by" boxes for tags and Terraform roots.
+  // Swimlanes replace the "Group by" boxes for tags, Terraform roots and environments.
   function laneMode() {
-    return extended && Boolean(groupBySelect) && ["tag", "tf"].includes(groupBySelect.value);
+    return extended && Boolean(groupBySelect) && ["tag", "tf", "env"].includes(groupBySelect.value);
+  }
+
+  // Extended view: crawled nodes not linked to this VPC that are drawn on request
+  // ("Not linked" panel), or all of them with "Show all crawled nodes".
+  const extraShown = new Set();
+  const showAllCrawled = document.getElementById("show-all-crawled");
+
+  function shownExtNodes(ext) {
+    const all = showAllCrawled && showAllCrawled.checked;
+    return (ext.nodes || []).concat((ext.hidden || []).filter((n) => all || extraShown.has(n.id)));
   }
 
   function hops() {
@@ -520,7 +611,15 @@
       lanes.set(k.key, k);
       laneOf.set(r.eni_id, k.key);
     });
-    const extNodes = (data.extended.nodes || []).map((n) => n.id);
+    const shownExt = shownExtNodes(data.extended);
+    if (mode === "env") {  // a service with a known environment goes to its lane
+      shownExt.filter((n) => n.environment).forEach((n) => {
+        const k = contextKeys(n, mode, tagKey, data)[0];
+        lanes.set(k.key, k);
+        laneOf.set(n.id, k.key);
+      });
+    }
+    const extNodes = shownExt.map((n) => n.id);
     for (let pass = 0; pass < 3; pass += 1) {
       extNodes.forEach((id) => {
         if (laneOf.has(id)) return;
@@ -557,7 +656,8 @@
         id: n.id, parent: parent, label: extLabel(n), title: extTitle(n),
         icon: iconUrl(n.icon), iconFile: n.icon, service: n.service, raw: n, ...extra,
       },
-      classes: "ext" + (n.broad_access ? " broad" : "") + (extra.memberOf ? " member hidden" : ""),
+      classes: "ext" + (n.broad_access ? " broad" : "") + (n.linked === false ? " unlinked" : "") +
+        (extra.memberOf ? " member hidden" : ""),
     };
   }
 
@@ -641,7 +741,7 @@
     });
 
     const byService = new Map();  // "<lane>|<service>" -> nodes
-    ext.nodes.forEach((n) => {
+    shownExtNodes(ext).forEach((n) => {
       const key = `${lanes ? lanes.of(n.id) : ""}|${n.service}`;
       if (!byService.has(key)) byService.set(key, []);
       byService.get(key).push(n);
@@ -691,16 +791,20 @@
     }
   }
 
-  // Service filter: unticked services disappear, and with them a group of only those.
+  // Service and environment filters: unticked services / environments disappear, and
+  // with them a group of only those.
   function applyServiceFilter(cy) {
     const off = new Set(Array.from(document.querySelectorAll('input[name="service"]'))
       .filter((b) => !b.checked).map((b) => b.value));
+    const envs = envOff();
+    const envGone = (n) => envs.has((n.data("raw") || {}).environment || "");
     cy.batch(() => {
-      cy.nodes(".ext").forEach((n) => { n.toggleClass("filtered", off.has(n.data("service"))); });
-      cy.nodes(".svc").forEach((g) => {
+      cy.nodes(".ext").forEach((n) => { n.toggleClass("filtered", off.has(n.data("service")) || envGone(n)); });
+      cy.nodes(".res").forEach((n) => { n.toggleClass("filtered", envGone(n)); });
+      cy.nodes(".group").forEach((g) => {
         const gone = groupMembers(cy, g).every((m) => m.hasClass("filtered"));
         g.toggleClass("filtered", gone);
-        cy.getElementById("box:" + g.id()).toggleClass("filtered", gone);
+        if (g.hasClass("svc")) cy.getElementById("box:" + g.id()).toggleClass("filtered", gone);
       });
     });
   }
@@ -1031,7 +1135,7 @@
 
   function sortedKids(subnet) {
     return subnet.children()
-      .filter((n) => !n.hasClass("hidden"))
+      .filter((n) => !n.hasClass("hidden") && !n.hasClass("filtered"))
       .sort((a, b) => a.data("order") - b.data("order"));
   }
 
@@ -1146,7 +1250,7 @@
 
     // IP view only; the Extended view has its own left-to-right layout (extLayout).
     const leaves = [];
-    cy.nodes().filter((n) => !n.hasClass("hidden") && !n.hasClass("ctx")).forEach((n) => {
+    cy.nodes().filter((n) => !n.hasClass("hidden") && !n.hasClass("ctx") && !n.hasClass("filtered")).forEach((n) => {
       if (n.isParent()) {
         g.setNode(n.id(), {});
       } else {
@@ -1309,7 +1413,7 @@
       };
       if (kind === "ctx") node.member_ids = n.data("members") || [];
       if (expand && kind === "group") {
-        node.members = groupMembers(cy, n).map((m) => ({
+        node.members = groupMembers(cy, n).filter((m) => !m.hasClass("filtered")).map((m) => ({
           id: m.id(),
           label: m.data("label") || "",
           icon: m.data("iconFile") || "",
@@ -1417,7 +1521,7 @@
   const style = [
     { selector: "node", style: {
       // Labels arrive pre-wrapped by wrapLine; the slack absorbs measuring differences.
-      "label": "data(label)", "font-size": 10, "text-wrap": "wrap", "text-max-width": TEXT_W.res + 4,
+      "label": "data(label)", "font-size": RES_FONT, "text-wrap": "wrap", "text-max-width": TEXT_W.res + 4,
       "color": "#1f2933", "font-family": "system-ui, sans-serif",
     } },
     { selector: ".vpc", style: {
@@ -1441,7 +1545,7 @@
     } },
     { selector: ".subnet.noborder", style: { "border-width": 0, "background-opacity": 0 } },
     { selector: ".res, .group", style: {
-      "shape": "round-rectangle", "width": 44, "height": 44,
+      "shape": "round-rectangle", "width": ICON, "height": ICON,
       "background-color": "#ffffff", "background-image": "data(icon)",
       "background-fit": "contain", "border-width": 0,
       "text-valign": "bottom", "text-halign": "center", "text-margin-y": 5,
@@ -1480,18 +1584,22 @@
     } },
     { selector: ".pin", style: { "width": 1, "height": 1, "opacity": 0, "events": "no", "label": "" } },
     { selector: ".vpcleaf", style: {
-      "shape": "round-rectangle", "width": 44, "height": 44, "background-color": "#f7f3ff",
+      "shape": "round-rectangle", "width": ICON, "height": ICON, "background-color": "#f7f3ff",
       "background-image": "data(icon)", "background-fit": "contain", "border-width": 2,
       "border-color": "#8c4fff", "text-valign": "bottom", "text-halign": "center",
       "text-margin-y": 5, "font-weight": "bold",
     } },
     { selector: ".ext", style: {
-      "shape": "round-rectangle", "width": 44, "height": 44,
+      "shape": "round-rectangle", "width": ICON, "height": ICON,
       "background-color": "#ffffff", "background-image": "data(icon)",
       "background-fit": "contain", "border-width": 0,
       "text-valign": "bottom", "text-halign": "center", "text-margin-y": 5,
     } },
     { selector: ".ext.broad", style: { "border-width": 3, "border-color": "#c2410c", "border-style": "dashed" } },
+    // Crawled but not linked to this VPC (drawn from the "Not linked" panel).
+    { selector: ".ext.unlinked", style: {
+      "border-width": 2, "border-color": "#8a94a3", "border-style": "dotted", "background-image-opacity": 0.75,
+    } },
     { selector: ".hidden, .filtered, .unfocused", style: { "display": "none" } },
     { selector: "node.res:active, node.group:active", style: { "overlay-opacity": 0.15 } },
     { selector: "edge", style: {
@@ -1600,13 +1708,24 @@
         unroute(moved.connectedEdges());
         updateStatus();
       } else {
+        applyEnvFilterIp(cy);
         refreshEdges();
         runLayout(cy, edges);
         applySaved(cy);
       }
       refreshContext();
     };
-    const fitShown = () => cy.fit(cy.elements(":visible"), 30);
+    // Extended view: never below a readable zoom; a larger diagram starts at its top left.
+    const fitShown = () => {
+      const shown = cy.elements(":visible");
+      cy.fit(shown, 30);
+      if (!ext || shown.empty() || cy.zoom() >= MIN_READABLE_ZOOM) return;
+      const bb = shown.boundingBox();
+      cy.zoom(MIN_READABLE_ZOOM);
+      cy.pan({ x: 30 - bb.x1 * MIN_READABLE_ZOOM, y: 30 - bb.y1 * MIN_READABLE_ZOOM });
+      note.textContent = "The diagram is larger than the screen at a readable size: drag to pan, " +
+        "or zoom out with −.";
+    };
     const saveExpanded = () => savePrefs({
       view: view, vpc: vpcId, expanded: JSON.stringify(Array.from(expandedGroups)),
     });
@@ -1635,6 +1754,15 @@
       applyServiceFilter(cy);
       relayout();
     });
+    const refreshEnvFilters = () => populateEnvFilters(
+      environmentsOf(data, ext ? shownExtNodes(ext) : []),
+      () => {
+        if (ext) applyServiceFilter(cy);
+        relayout();
+      },
+    );
+    refreshEnvFilters();
+    if (ext) applyServiceFilter(cy);
     relayout();
     fitShown();
 
@@ -1718,6 +1846,10 @@
         if (evt.key === "Escape" && focusId) setFocus(null);
       });
       setupFlowLogs();
+      setupUnlinked(cy, ext, () => {
+        rebuild();
+        refreshEnvFilters();
+      });
     } else {
       // "onetap" fires only after the double-click window (multiClickDebounceTime) has
       // passed without a second tap, so a double-click never also toggles the highlight.
@@ -1852,14 +1984,81 @@
       status.textContent = `${data.vpc.subnets.length} subnet(s) · ${nRes} resource ENI(s) · ` +
         `${edges.length} connection(s) · snapshot #${data.snapshot_id}` +
         (cut.length ? ` · truncated: ${cut.join(", ")}` : "") +
-        (ext ? ` · ${ext.nodes.length} regional / external node(s)` +
-          (ext.hidden_nodes ? ` (${ext.hidden_nodes} crawled node(s) not linked to this VPC hidden)` : "") +
+        (ext ? ` · ${shownExtNodes(ext).length} regional / external node(s)` +
+          (ext.hidden_nodes ? ` (${ext.hidden_nodes} crawled node(s) not linked to this VPC: see Not linked)` : "") +
           ` · ${drawnCount} line(s) drawn` +
           (ext.crawl ? "" : " · services not crawled yet") +
           (ext.flow ? ` · flow logs: ${ext.flow.pairs} aggregate(s), ${ext.flow.bytes_label} scanned` : "")
           : "");
     }
     updateStatus();
+  }
+
+  // -- extended view: crawled nodes not linked to this VPC (side panel) -----------------
+
+  const MAX_UNLINKED_ITEMS = 300;
+
+  /* "Not linked: N": the crawled regional nodes the diagram leaves out because nothing
+     drawn for this VPC links to them. Clicking one draws it (unlinked, dotted border) and
+     centres on it; clicking it again removes it; "Show all crawled nodes" draws them all.
+     ``redraw`` rebuilds the diagram (which fits it). */
+  function setupUnlinked(cy, ext, redraw) {
+    const panel = document.getElementById("unlinked-panel");
+    if (!panel || !ext.hidden_nodes) return;
+    panel.hidden = false;
+    document.getElementById("unlinked-count").textContent = ext.hidden_nodes;
+    const list = document.getElementById("unlinked-list");
+    const search = document.getElementById("unlinked-search");
+    const more = document.getElementById("unlinked-more");
+    const hidden = ext.hidden || [];
+
+    const reveal = (id) => {
+      let n = cy.getElementById(id);
+      const g = n.nonempty() ? n.data("memberOf") : null;
+      if (g && !expandedGroups.has(g)) n = cy.getElementById(g);
+      if (n.empty() || !n.visible()) return;
+      cy.animate({ center: { eles: n }, zoom: Math.max(cy.zoom(), MIN_READABLE_ZOOM) }, { duration: 250 });
+      n.flashClass("focus", 1500);
+    };
+
+    const draw = () => {
+      const q = search.value.trim().toLowerCase();
+      const all = showAllCrawled.checked;
+      const items = hidden.filter((n) => !q ||
+        `${n.label_name} ${n.service_label} ${n.arn}`.toLowerCase().includes(q));
+      list.replaceChildren(...items.slice(0, MAX_UNLINKED_ITEMS).map((n) => {
+        const shown = all || extraShown.has(n.id);
+        const li = document.createElement("li");
+        li.className = shown ? "shown" : "";
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = n.label_name;
+        btn.title = [n.service_label, n.arn, all ? "Shown (Show all crawled nodes)"
+          : shown ? "Click to remove it from the diagram" : "Click to draw it"].filter(Boolean).join("\n");
+        btn.addEventListener("click", () => {
+          if (!all) {
+            if (extraShown.has(n.id)) extraShown.delete(n.id); else extraShown.add(n.id);
+            redraw();
+            draw();
+          }
+          if (all || extraShown.has(n.id)) reveal(n.id);
+        });
+        const svc = document.createElement("span");
+        svc.className = "muted";
+        svc.textContent = ` · ${n.service_label}`;
+        li.append(btn, svc);
+        return li;
+      }));
+      const rest = items.length - Math.min(items.length, MAX_UNLINKED_ITEMS) + (ext.hidden_nodes - hidden.length);
+      more.hidden = rest <= 0;
+      more.textContent = `… and ${rest} more (narrow the filter)`;
+    };
+    search.addEventListener("input", draw);
+    showAllCrawled.addEventListener("change", () => {
+      redraw();
+      draw();
+    });
+    draw();
   }
 
   // -- extended view: opt-in flow log query (estimate first, then confirm) --------------

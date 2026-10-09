@@ -20,7 +20,8 @@
   <h2 id="ext-title">Extended view</h2>
   <p class="muted">
     Regional services (SNS, SQS, DynamoDB, EventBridge, S3, API Gateway, Step Functions, Lambda,
-    ECS, Secrets Manager names) are drawn outside the VPC; Transit Gateway, peering and internet
+    ECS, Secrets Manager names, Kafka: MSK clusters and self-managed brokers feeding Lambda event
+    source mappings) are drawn outside the VPC; Transit Gateway, peering and internet
     via NAT as external nodes. Every connection carries evidence:
     {% for level in evidence_levels %}<b>{{ evidence_labels[level] }}</b> ({{ evidence_help[level] }}){{ ' > ' if not loop.last }}{% endfor %}.
     Environment variables and IAM policies are only matched against known resource names and
@@ -28,7 +29,7 @@
     <span class="badge err">broad access</span> badge and is never expanded.
   </p>
   <div class="row">
-    <form method="post" action="{{ url_for('visual_extended_crawl') }}">
+    <form method="post" action="{{ url_for('visual_extended_crawl') }}" data-job="crawl">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <input type="hidden" name="vpc" value="{{ vpc }}">
       <button type="submit">{{ 'Re-crawl services' if crawl else 'Crawl services' }}</button>
@@ -102,6 +103,10 @@
     <legend>Labels</legend>
     <label class="edge-filter" title="Cut names longer than {{ short_name_max }} characters in the middle, keeping their start and end"><input type="checkbox" id="shorten-names" {{ 'checked' if prefs.shorten_names }}> Shorten long names</label>
   </fieldset>
+  <fieldset class="edge-filters env-filters" id="env-filters">
+    <legend>Environment</legend>
+    <span class="muted small" id="env-filters-empty">Loading…</span>
+  </fieldset>
   <fieldset class="edge-filters">
     <legend>Group by</legend>
     <select id="group-by" name="group" aria-label="Group by">
@@ -150,7 +155,9 @@
     wrapped at <code>- _ . /</code>; <b>Shorten long names</b> cuts them in the middle instead.
     Border, legend and label toggles are remembered per account. Endpoint reach lines are labelled with the endpoint's
     security group name. <b>Group by</b> draws a dashed box (and a coloured outline) around the
-    resources sharing a security group, a tag value or a Terraform root (loaded under Settings).
+    resources sharing a security group, a tag value, a Terraform root (loaded under Settings) or an
+    environment (colour per environment). <b>Environment</b> shows only the ticked environments
+    (from the Terraform root × environment mapping, else the environment tag set in Settings).
     Exports contain the diagram as currently shown; with <b>Expand all groups</b> (default) every
     collapsed group is exported as its member resources.
     {% if extended %}<br><b>Extended view:</b> one line per pair of nodes, styled by its strongest
@@ -165,9 +172,12 @@
     (Lambda, ECS) → targets; the other layouts keep every box (VPC, subnet, expanded service
     group, swimlane) together as one block. Group by
     tag or Terraform root draws one swimlane per app. Exports contain exactly what is shown
-    (focus, groups and filters).{% endif %}
+    (focus, groups and filters). Crawled regional nodes linked to nothing in this VPC are listed
+    under <b>Not linked</b> beside the diagram: click one to draw it, or tick <b>Show all crawled
+    nodes</b>.{% endif %}
   </div>
 </form>
+<div class="visual-main">
 <div class="cy-wrap">
   <div id="cy" class="card"
        data-src="{{ url_for('visual_data', vpc=vpc, view='extended' if extended else None) }}"
@@ -185,6 +195,17 @@
        data-export-svg="{{ url_for('visual_export_svg') }}"
        data-export-drawio="{{ url_for('visual_export_drawio') }}"></div>
   <div id="cy-tip" class="cy-tip" role="tooltip" hidden></div>
+</div>
+{% if extended %}
+<aside class="card unlinked-panel" id="unlinked-panel" aria-labelledby="unlinked-title" hidden>
+  <h2 id="unlinked-title">Not linked: <span id="unlinked-count">0</span></h2>
+  <p class="muted small">Crawled in this region, but linked to nothing drawn for this VPC.</p>
+  <label class="edge-filter"><input type="checkbox" id="show-all-crawled"> Show all crawled nodes</label>
+  <input type="search" id="unlinked-search" placeholder="filter" aria-label="Filter the nodes not linked" autocomplete="off">
+  <ul id="unlinked-list"></ul>
+  <p class="muted small" id="unlinked-more" hidden></p>
+</aside>
+{% endif %}
 </div>
 {% if extended %}
 <aside class="card edge-detail" id="edge-detail" aria-live="polite" hidden>

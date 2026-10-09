@@ -46,6 +46,8 @@
             <span class="badge {{ 'ok' if e.status == 'ok' else 'warn' if e.status == 'no state' else 'err' }}">{{ e.status }}</span>
             {% if e.status == 'ok' %}<span class="small">{{ e.resources }} id(s)</span>{% endif %}
             {% if e.status_detail %}<div class="muted small">{{ e.status_detail }}</div>{% endif %}
+            {% if e.status == 'wrong account' %}<div class="small">Left out of drift. {% if e.suggest_label %}Suggested account:
+              <b>{{ e.suggest_label }}</b>{% else %}No IPLens account resolves to AWS <span class="mono">{{ e.state_account }}</span> yet.{% endif %}</div>{% endif %}
             <div class="small">{{ e.synced_at | localtime }}</div>
           {% else %}<span class="muted">never</span>{% endif %}
         </td>
@@ -60,7 +62,7 @@
 </form>
 
 {% if envs %}
-<form method="post" action="{{ url_for('terraform_sync') }}">
+<form method="post" action="{{ url_for('terraform_sync') }}" data-job="tfsync">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input type="hidden" name="repo_id" value="{{ repo.id }}">
   <input type="hidden" name="next" value="{{ url_for('settings_tfrepo', repo_id=repo.id) }}">

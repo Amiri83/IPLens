@@ -5,10 +5,11 @@ from __future__ import annotations
 import ipaddress
 import json
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import terraform
+from . import environment, terraform
 from .scope import UNSCOPED, ResolvedScope
 from .visual import EDGE_TYPES, visual_edges
 
@@ -367,6 +368,7 @@ class IpFilter:
     tag_key: str = ""  # rows whose resource carries this tag key...
     tag_value: str = ""  # ...with this value (any value when empty)
     tf: str = ""  # TF_MANAGED | TF_UNMANAGED | a Terraform root name
+    env: str = ""  # an environment, or environment.FILTER_NOT_SET
 
 
 TF_MANAGED, TF_UNMANAGED = "managed", "unmanaged"
@@ -425,12 +427,13 @@ def resource_tags(index: TagIndex, row: dict[str, Any]) -> dict[str, str]:
 
 
 def tag_keys(conn: sqlite3.Connection, snap_id: int) -> list[str]:
-    """Every tag key collected in a snapshot (security group tags excluded)."""
+    """Every tag key of an ENI-owning resource in a snapshot (security group, VPC and
+    subnet tags excluded)."""
     return [
         r["key"]
         for r in conn.execute(
-            "SELECT DISTINCT key FROM resource_tags WHERE snapshot_id=? AND resource_type != 'sg' "
-            "ORDER BY key",
+            "SELECT DISTINCT key FROM resource_tags WHERE snapshot_id=? "
+            "AND resource_type NOT IN ('sg', 'vpc', 'subnet') ORDER BY key",
             (snap_id,),
         )
     ]
@@ -441,6 +444,8 @@ def tf_label(m: dict[str, str]) -> str:
 
 
 def _row_matches(row: dict[str, Any], flt: IpFilter) -> bool:
+    if not environment.matches(row["environment"], flt.env):
+        return False
     if flt.tag_key:
         if flt.tag_key not in row["tags"]:
             return False
@@ -548,13 +553,16 @@ def ip_list(
     snap_id: int,
     flt: IpFilter | None = None,
     scope: ResolvedScope = UNSCOPED,
+    env_keys: Sequence[str] = environment.DEFAULT_TAG_KEYS,
 ) -> list[dict[str, Any]]:
     """Every private IP of a snapshot in ``scope`` matching ``flt``, ordered by address.
 
     Each row carries the IP/ENI columns plus subnet/VPC names, ``lb_type`` and
     endpoint ``service_name`` (when applicable), a derived ``resource_name``, the
-    ENI's ``security_groups`` (ids), the resource's ``tags`` and ``tf`` (Terraform
-    roots/addresses managing the ENI or its owning resource; empty = unmanaged).
+    ENI's ``security_groups`` (ids), the resource's ``tags``, ``tf`` (Terraform
+    roots/addresses managing the ENI or its owning resource; empty = unmanaged) and
+    its ``environment`` / ``env_source`` (:mod:`iplens.environment`, tag keys
+    ``env_keys``).
     """
     flt = flt or IpFilter()
     where = ["i.snapshot_id = ?"]
@@ -588,12 +596,14 @@ def ip_list(
     rows = [dict(r) for r in conn.execute(sql, args)]
     tags = tag_index(conn, snap_id)
     tf_index = terraform.load_index(conn)
+    envs = environment.EnvResolver(conn, snap_id, env_keys, tags=tags, tf_index=tf_index)
     for r in rows:
         r["owner_names"] = owner_names(r)
         r["resource_name"] = resource_name(r)
         r["security_groups"] = json.loads(r.get("security_groups") or "[]")
         r["tags"] = resource_tags(tags, r)
         r["tf"] = terraform.ownership(tf_index, terraform.resource_keys(r))
+        r["environment"], r["env_source"] = envs.for_row(r)
     return [r for r in rows if _row_matches(r, flt)]
 
 
@@ -675,6 +685,8 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
                 "sgs": r["security_groups"],
                 "tags": r["tags"],
                 "tf": r["tf"],
+                "environment": r["environment"],
+                "env_source": r["env_source"],
                 "status": r["status"] or "",
                 "icon": _icon_for(r),
                 "ips": [],
@@ -738,6 +750,7 @@ def visual_data(
     labels: dict[str, str] | None = None,
     edge_types: tuple[str, ...] = EDGE_TYPES,
     scope: ResolvedScope = UNSCOPED,
+    env_keys: Sequence[str] = environment.DEFAULT_TAG_KEYS,
 ) -> dict[str, Any] | None:
     """Nested VPC -> subnets -> resource nodes, plus resource edges, for the Visual page.
 
@@ -755,7 +768,7 @@ def visual_data(
 
     by_subnet: dict[str, list[dict[str, Any]]] = {}
     by_ip: dict[str, str] = {}
-    for r in ip_list(conn, snap_id, IpFilter(vpc=vpc.vpc_id), scope):
+    for r in ip_list(conn, snap_id, IpFilter(vpc=vpc.vpc_id), scope, env_keys):
         by_subnet.setdefault(r["subnet_id"], []).append(r)
         by_ip[r["ip"]] = r["eni_id"]
 

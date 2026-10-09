@@ -5,7 +5,7 @@
 <div class="row" style="justify-content: space-between">
   <h1>Discovery</h1>
   {% if account_choices %}
-  <form method="post" action="{{ url_for('refresh') }}" class="row refresh-form">
+  <form method="post" action="{{ url_for('refresh') }}" class="row refresh-form" data-job="refresh">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label for="refresh-account">Account</label>
     <select id="refresh-account" name="account_id">

@@ -26,10 +26,19 @@ Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (defau
    **VPC → subnet tree** and the per-subnet **address grid**. The history table can delete
    selected snapshots or **Clear history**; both need `DELETE` typed to confirm, and the latest
    snapshot of every account is always kept.
+   Refresh, **Crawl services** and **Terraform sync** run as **background jobs**: a modal shows the
+   current step (e.g. `root apps env dev · terraform init`), done / total, elapsed time, a live log
+   tail and **Cancel** (checked between steps; a running AWS call or terraform command finishes
+   first). Only one job runs per account at a time; reloading the page re-attaches to it. Without
+   JavaScript the forms still work and wait for the job to finish.
 3. **IP List** – one flat table of every private IP in the latest snapshot (IP, subnet, VPC,
-   resource type, resource name/ref, ENI, status), sorted numerically by address. Filter by VPC,
-   subnet, resource type, status or free text; **Export to Excel** downloads the current filter as
-   an `.xlsx` (one sheet, header row frozen, autofilter enabled).
+   resource type, resource name/ref, ENI, status, **environment**), sorted numerically by address.
+   Filter by VPC, subnet, resource type, status, environment or free text; **Export to Excel**
+   downloads the current filter as an `.xlsx` (one sheet, header row frozen, autofilter enabled).
+   A resource's environment comes from the Terraform repo root × environment that manages it,
+   else from the first environment tag (Settings; default `Environment`, `env`, `stage`) on the
+   resource, its subnet or its VPC. Both Visual views filter by environment and can group / colour
+   by it.
 4. **Visual** – nested diagram per VPC: VPC box → subnet boxes (CIDR, used/idle/free) → one node
    per resource ENI with its AWS icon, name and IPs. More than 10 nodes of one type in a subnet are
    collapsed into a group node (click to expand). Scroll/drag to zoom and pan; double-click a node
@@ -60,8 +69,12 @@ Data (SQLite DB, encryption key, default log dir) lives in `$IPLENS_HOME` (defau
    *×count*, drawn wider the more connections it stands for. The Hierarchy layout runs left to right:
    sources (EventBridge, SNS, API Gateway, S3) → compute (Lambda, ECS) → targets, with edges routed
    along dagre's paths. Click a node or search by name / ARN / IP to see only its 1- or 2-hop
-   neighbourhood (**Show all** or Esc to return). Group by tag or Terraform root draws one
-   swimlane per app. Exports contain exactly what is shown.
+   neighbourhood (**Show all** or Esc to return). Group by tag, Terraform root or environment draws
+   one swimlane per app. Exports contain exactly what is shown. **Kafka**: Amazon MSK clusters
+   (`kafka:ListClustersV2`) and Lambda event source mappings from MSK or self-managed Kafka become
+   *Kafka: <cluster or bootstrap host>* nodes. Crawled nodes linked to nothing in the VPC shown are
+   listed in the **Not linked** side panel (click one to draw it, or **Show all crawled nodes**).
+   Icons and labels are larger in the Extended view, and Fit never zooms out below a readable size.
 5. Define **Rules** (GUI or YAML import/export) and review **Suggestions**; anything a rule forbids is
    greyed out together with the IPs it would have saved.
 6. **Logs** shows the application log file.
@@ -97,7 +110,8 @@ warning): `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:Lis
 `ec2:DescribeVpcPeeringConnections`, `ec2:DescribeManagedPrefixLists`,
 `route53:ListHostedZones`, `route53:GetHostedZone`, `route53resolver:List*`,
 `config:DescribeConfigurationRecorderStatus`, `config:GetResourceConfigHistory`,
-`resource-explorer-2:GetIndex`, `resource-explorer-2:ListResources`, `xray:GetServiceGraph`.
+`resource-explorer-2:GetIndex`, `resource-explorer-2:ListResources`, `xray:GetServiceGraph`,
+`kafka:ListClustersV2` (the MSK list call that covers provisioned and serverless clusters).
 Flow logs: `ec2:DescribeFlowLogs`, `logs:DescribeLogGroups`, `logs:StartQuery`,
 `logs:GetQueryResults`, `logs:StopQuery`.
 

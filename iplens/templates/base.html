@@ -71,5 +71,30 @@
   {% endfor %}
   {% block content %}{% endblock %}
 </main>
+{# Background jobs (Refresh, service crawl, Terraform sync): progress modal, see jobs.js. #}
+<div id="job-modal" class="job-modal" role="dialog" aria-modal="true" aria-labelledby="job-title" hidden
+     data-csrf="{{ csrf_token }}"
+     data-current-url="{{ url_for('job_current') }}"
+     data-status-url="{{ url_for('job_status', job_id='__ID__') }}"
+     data-cancel-url="{{ url_for('job_cancel', job_id='__ID__') }}">
+  <div class="job-box card">
+    <h2 id="job-title">Working…</h2>
+    <p class="job-step" id="job-step" aria-live="polite"></p>
+    <progress id="job-progress" max="1" value="0"></progress>
+    <p class="muted small"><span id="job-counts"></span> · elapsed <span id="job-elapsed">0s</span> · <span id="job-state"></span></p>
+    <ul id="job-messages" class="job-messages"></ul>
+    <details class="job-log-box" open>
+      <summary>Log (live)</summary>
+      <pre id="job-log" class="job-log"></pre>
+    </details>
+    <div class="row job-actions">
+      <button type="button" class="danger" id="job-cancel">Cancel</button>
+      <button type="button" class="secondary" id="job-hide" title="Keep it running in the background">Hide</button>
+      <button type="button" id="job-close" hidden>Close and reload</button>
+    </div>
+  </div>
+</div>
+<button type="button" id="job-badge" class="job-badge" hidden></button>
+<script src="{{ url_for('static', filename='jobs.js') }}" defer></script>
 </body>
 </html>

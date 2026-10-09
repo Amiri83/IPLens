@@ -22,9 +22,10 @@ one edge per node pair, evidence filter, service / compute groups, focus mode.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Any
 
+from . import environment
 from .extended import (
     EVIDENCE_HELP,
     EVIDENCE_LABELS,
@@ -55,6 +56,10 @@ EXT_ICONS = {
     "lambda": TYPE_ICONS["lambda"],
     "ecs": TYPE_ICONS["ecs"],
 }
+# Regional services whose environment can be derived: (Terraform kind, resource_tags type).
+ENV_KEYS = {"lambda": ("lambda", "lambda"), "ecs": ("ecs_service", "ecs_service")}
+# Crawled nodes not linked to the VPC shown, listed in the side panel at most.
+MAX_HIDDEN_LISTED = 1000
 FLOW_NODES = {
     INTERNET: ("internet", "public peers (flow logs)"),
     OUTSIDE: ("internet", "private peers outside this snapshot (flow logs)"),
@@ -137,9 +142,22 @@ def _flow_lines(
         )
 
 
-def extended_data(conn: sqlite3.Connection, snap_id: int, data: dict[str, Any]) -> dict[str, Any]:
+def extended_data(
+    conn: sqlite3.Connection,
+    snap_id: int,
+    data: dict[str, Any],
+    env_keys: Sequence[str] = environment.DEFAULT_TAG_KEYS,
+) -> dict[str, Any]:
     """The ``extended`` part of the Visual page data for the VPC in ``data``."""
     vpc_id = data["vpc"]["vpc_id"]
+    envs = environment.EnvResolver(conn, snap_id, env_keys)
+
+    def env_of(service: str, name: str) -> str:
+        if service in ENV_KEYS:
+            tf_kind, tag_type = ENV_KEYS[service]
+            return envs.for_resource(tf_kind, tag_type, name)
+        return environment.NOT_SET
+
     resolve = _Resolver(data)
     annotate_base_edges(data.get("edges") or [])
 
@@ -190,8 +208,8 @@ def extended_data(conn: sqlite3.Connection, snap_id: int, data: dict[str, Any]) 
             (snap_id,),
         )
     }
-    nodes = []
-    for nid in sorted(used):
+
+    def node(nid: str) -> dict[str, Any]:
         row = stored.get(nid)
         service, _, name = nid.partition(":")
         if row is not None:
@@ -200,23 +218,34 @@ def extended_data(conn: sqlite3.Connection, snap_id: int, data: dict[str, Any]) 
         label = {"nat": "Internet via NAT", "igw": "Internet (IGW)"}.get(name, name)
         if flow:
             label = f"Internet / outside: {flow[1]}"
-        nodes.append(
-            {
-                "id": EXT_PREFIX + nid,
-                "node_id": nid,
-                "service": service,
-                "service_label": SERVICE_LABELS.get(service, service),
-                "name": name,
-                "label_name": label,
-                "arn": row["arn"] if row is not None else "",
-                "area": row["area"]
-                if row is not None
-                else ("external" if service in EXTERNAL_SERVICES else "regional"),
-                "icon": EXT_ICONS.get(service, EXT_ICONS["other"]),
-                "broad_access": bool(row["broad_access"]) if row is not None else False,
-                "facts": facts.get(nid, []),
-            }
-        )
+        elif service == "kafka":
+            label = f"Kafka: {name}"
+        return {
+            "id": EXT_PREFIX + nid,
+            "node_id": nid,
+            "service": service,
+            "service_label": SERVICE_LABELS.get(service, service),
+            "name": name,
+            "label_name": label,
+            "arn": row["arn"] if row is not None else "",
+            "area": row["area"]
+            if row is not None
+            else ("external" if service in EXTERNAL_SERVICES else "regional"),
+            "icon": EXT_ICONS.get(service, EXT_ICONS["other"]),
+            "broad_access": bool(row["broad_access"]) if row is not None else False,
+            "facts": facts.get(nid, []),
+            "environment": env_of(service, name),
+        }
+
+    nodes = [node(nid) for nid in sorted(used)]
+    # Crawled, but linked to nothing drawn for this VPC: listed in the side panel and
+    # drawn on demand ("show all crawled nodes"), never linked.
+    hidden = sorted(
+        (node(nid) for nid in set(stored) - used),
+        key=lambda n: (n["service_label"], n["label_name"].lower()),
+    )
+    for n in hidden:
+        n["linked"] = False
 
     services: dict[str, int] = {}
     for n in nodes:
@@ -228,10 +257,12 @@ def extended_data(conn: sqlite3.Connection, snap_id: int, data: dict[str, Any]) 
         "areas": AREAS,
         "nodes": nodes,
         "edges": edges,
-        "hidden_nodes": len(set(stored) - used),
+        "hidden_nodes": len(hidden),
+        "hidden": hidden[:MAX_HIDDEN_LISTED],
         "subnet_facts": {
             k.split(":", 1)[1]: v for k, v in facts.items() if k.startswith("subnet:")
         },
+        "environments": environment.summary(n["environment"] for n in nodes),
         "services": [
             {"service": s, "label": SERVICE_LABELS.get(s, s), "count": c}
             for s, c in sorted(services.items())

@@ -3,7 +3,7 @@
 {% block content %}
 <div class="row" style="justify-content: space-between">
   <h1>Terraform</h1>
-  <form method="post" action="{{ url_for('terraform_sync') }}">
+  <form method="post" action="{{ url_for('terraform_sync') }}" data-job="tfsync">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <input type="hidden" name="next" value="{{ url_for('terraform_page') }}">
     <button type="submit">Sync all repos</button>
@@ -24,6 +24,11 @@
       <td class="mono small"><a href="{{ url_for('settings_tfrepo', repo_id=e.repo_id) }}">{{ e.repo_path }}</a></td>
       <td>{% if e.status %}<span class="badge {{ 'ok' if e.status == 'ok' else 'warn' if e.status == 'no state' else 'err' }}">{{ e.status }}</span>
         {% if e.status_detail %}<span class="muted small">{{ e.status_detail }}</span>{% endif %}
+        {% if e.status == wrong_account %}<div class="small">Left out of drift.
+          {% if e.suggest_label %}Map it to <b>{{ e.suggest_label }}</b> instead:
+            <a href="{{ url_for('settings_tfrepo', repo_id=e.repo_id) }}">review the mapping</a>.
+          {% else %}No IPLens account resolves to AWS <span class="mono">{{ e.state_account }}</span> yet:
+            <a href="{{ url_for('account_new') }}">add it</a> or <a href="{{ url_for('settings_tfrepo', repo_id=e.repo_id) }}">change the mapping</a>.{% endif %}</div>{% endif %}
         {% else %}<span class="muted">not synced yet</span>{% endif %}</td>
       <td>{{ e.resources }}</td>
       <td>{{ e.synced_at | localtime }}</td>
@@ -48,16 +53,24 @@
   <p class="muted small">Roots skipped for "in Terraform, not in AWS":
     {% for s in drift.skipped_roots %}<span class="mono">{{ s.root }}</span> ({{ s.reason }}){{ ', ' if not loop.last }}{% endfor %}</p>
   {% endif %}
+  {% if drift.wrong_account %}
+  <div class="flash warn">{{ drift.wrong_account | length }} root(s) hold resources of another AWS account and are
+    excluded from both drift lists:
+    {% for w in drift.wrong_account %}<span class="mono">{{ w.root_label }} [{{ w.env }}]</span> (state in
+      <span class="mono">{{ w.state_account or '?' }}</span>{% if w.suggest_label %}; suggested account: <b>{{ w.suggest_label }}</b>{% endif %}){{ ', ' if not loop.last }}{% endfor %}.
+  </div>
+  {% endif %}
 
   <h3>In AWS, not in Terraform <span class="badge">{{ drift.not_in_terraform | length }}</span></h3>
   <p class="muted small">Resources of the snapshot that no loaded Terraform root manages.</p>
   <table class="tf-drift">
-    <thead><tr><th>Type</th><th>Resource</th></tr></thead>
+    <thead><tr><th>Type</th><th>Resource</th><th></th></tr></thead>
     <tbody>
     {% for r in drift.not_in_terraform %}
-      <tr><td>{{ r.label }}</td><td class="mono">{{ r.resource_id }}</td></tr>
+      <tr><td>{{ r.label }}</td><td class="mono">{{ r.resource_id }}</td>
+        <td>{{ mark_button('resource', r.resource_id) }}</td></tr>
     {% else %}
-      <tr><td colspan="2" class="muted">None.</td></tr>
+      <tr><td colspan="3" class="muted">None.</td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -66,15 +79,81 @@
   <p class="muted small">Resources of the repo roots mapped to this account that the snapshot does not contain
     ({{ drift.roots | length }} root(s) compared).</p>
   <table class="tf-drift">
-    <thead><tr><th>Root</th><th>Address</th><th>Type</th><th>Resource</th></tr></thead>
+    <thead><tr><th>Root</th><th>Address</th><th>Type</th><th>Resource</th><th></th></tr></thead>
     <tbody>
     {% for r in drift.not_in_aws %}
       <tr><td class="mono small">{{ r.root }}</td><td class="mono small">{{ r.address }}</td>
-        <td class="mono small">{{ r.type }}</td><td class="mono">{{ r.resource_id }}</td></tr>
+        <td class="mono small">{{ r.type }}</td><td class="mono">{{ r.resource_id }}</td>
+        <td>{{ mark_button('resource', r.resource_id) }}</td></tr>
     {% else %}
-      <tr><td colspan="4" class="muted">None.</td></tr>
+      <tr><td colspan="5" class="muted">None.</td></tr>
     {% endfor %}
     </tbody>
   </table>
 {% endif %}
+
+<section class="card" id="managed-elsewhere">
+  <h2 style="margin-top: 0">Managed elsewhere {% if drift %}<span class="badge">{{ drift.managed_elsewhere | length }} excluded</span>{% endif %}</h2>
+  <p class="muted">Resources managed outside these Terraform roots (another team's stack, a landing zone,
+    the console) can be marked here by resource type (e.g. every VPC, subnet or VPC endpoint), resource id or
+    tag; matching resources are left out of both drift lists and the counts above.</p>
+  <table class="tf-markers">
+    <thead><tr><th>Marker</th><th>Applies to</th><th>Note</th><th></th></tr></thead>
+    <tbody>
+    {% for m in markers %}
+      <tr><td>{{ marker_kinds[m.kind] }}: <span class="mono">{{ m.label }}</span></td>
+        <td>{{ 'every account' if m.account_ref is none else 'this account' }}</td>
+        <td class="small">{{ m.note }}</td>
+        <td><form class="inline" method="post" action="{{ url_for('terraform_marker_delete', marker_id=m.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="secondary">Remove</button></form></td></tr>
+    {% else %}
+      <tr><td colspan="4" class="muted">No markers.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if active_account %}
+  <form method="post" action="{{ url_for('terraform_marker_add') }}" class="row" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div><label for="marker-kind">Mark by</label>
+      <select id="marker-kind" name="kind">
+        {% for k, label in marker_kinds.items() %}<option value="{{ k }}">{{ label }}</option>{% endfor %}
+      </select></div>
+    <div><label for="marker-type">Resource type</label>
+      <select id="marker-type" name="value_type">
+        {% for k, label in marker_types %}<option value="{{ k }}">{{ label }}</option>{% endfor %}
+      </select></div>
+    <div><label for="marker-value">…or resource id / tag</label>
+      <input id="marker-value" name="value" size="28" class="mono" placeholder="vpc-0example / team=network"></div>
+    <div><label for="marker-scope">Applies to</label>
+      <select id="marker-scope" name="scope"><option value="account">this account</option><option value="all">every account</option></select></div>
+    <div><label for="marker-note">Note</label>
+      <input id="marker-note" name="note" size="20" maxlength="200" placeholder="e.g. network team"></div>
+    <div><button type="submit">Add marker</button></div>
+  </form>
+  {% endif %}
+  {% if drift and drift.managed_elsewhere %}
+  <details>
+    <summary>{{ drift.managed_elsewhere | length }} resource(s) excluded from drift</summary>
+    <table class="tf-drift">
+      <thead><tr><th>Drift list</th><th>Type</th><th>Resource</th><th>Marker</th></tr></thead>
+      <tbody>
+      {% for r in drift.managed_elsewhere %}
+        <tr><td>{{ 'in AWS, not in Terraform' if r.side == 'aws' else 'in Terraform (' ~ r.root ~ '), not in AWS' }}</td>
+          <td>{{ r.label }}</td><td class="mono">{{ r.resource_id }}</td><td class="small">{{ r.marker }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </details>
+  {% endif %}
+</section>
 {% endblock %}
+
+{% macro mark_button(kind, value) -%}
+  <form class="inline" method="post" action="{{ url_for('terraform_marker_add') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="kind" value="{{ kind }}">
+    <input type="hidden" name="value_{{ kind }}" value="{{ value }}">
+    <button type="submit" class="secondary small" title="Leave this resource out of drift">managed elsewhere</button>
+  </form>
+{%- endmacro %}

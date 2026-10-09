@@ -11,10 +11,14 @@ backend values are never stored, logged or displayed.
 The sync (:func:`sync_env`) runs nothing but the invocations in
 :data:`ALLOWED_INVOCATIONS`, checked by :func:`check_allowlisted` right before
 ``subprocess`` is called with an explicit argv (no shell), ``cwd`` at the root
-directory, ``TF_DATA_DIR`` in the app's cache directory (the repo stays untouched),
-the mapped IPLens account's credentials and a timeout. ``plan``, ``apply``,
-``import``, ``destroy``, ``state`` and every other command or flag are refused.
-Roots on the local backend are read straight from their ``.tfstate`` file instead.
+directory, ``TF_DATA_DIR`` in the app's cache directory (repo-scoped; the repo stays
+untouched), ``TF_PLUGIN_CACHE_DIR`` shared in that cache, the mapped IPLens account's
+credentials and a configurable timeout. ``plan``, ``apply``, ``import``, ``destroy``,
+``state`` and every other command or flag are refused. Roots on the local backend are
+read straight from their ``.tfstate`` file instead. Up to :data:`PARALLEL_ROOTS` pairs
+are synced at once. The AWS account ids in the state's ARNs are checked against the
+mapped account (a mismatch is ``wrong account`` and left out of drift); nothing else
+from the state is kept.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import sqlite3
 import subprocess
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +42,7 @@ from typing import Any
 from . import terraform
 from .accounts import Account
 from .db import closing
+from .jobs import JobCancelled, NullProgress, Progress
 
 log = logging.getLogger(__name__)
 
@@ -723,16 +729,22 @@ def find_terraform() -> str:
 
 # -- sync -----------------------------------------------------------------------------------
 
-OK, INIT_FAILED, NO_STATE, SHOW_FAILED, ERROR = (
+OK, INIT_FAILED, NO_STATE, SHOW_FAILED, ERROR, WRONG_ACCOUNT, CANCELLED = (
     "ok",
     "init failed",
     "no state",
     "show failed",
     "error",
+    "wrong account",
+    "cancelled",
 )
-INIT_TIMEOUT = 300.0
+# Seconds each terraform command may run (Settings: "Terraform timeout").
+DEFAULT_TIMEOUT = 300.0
 WORKSPACE_TIMEOUT = 60.0
-SHOW_TIMEOUT = 180.0
+# Root x environment pairs synced at the same time (a small bounded thread pool).
+PARALLEL_ROOTS = 2
+# Under the cache directory: provider plugins shared by every sync (TF_PLUGIN_CACHE_DIR).
+PLUGIN_CACHE = "plugin-cache"
 # Inherited by terraform; AWS credentials come from the mapped account (below).
 _PASSTHROUGH_ENV = frozenset(
     {
@@ -766,12 +778,18 @@ _KEY_ID_RE = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 
 
 def terraform_env(
-    account: Account, data_dir: Path, base: dict[str, str] | None = None
+    account: Account,
+    data_dir: Path,
+    base: dict[str, str] | None = None,
+    plugin_cache: Path | None = None,
 ) -> dict[str, str]:
     """Environment for terraform: a small passthrough plus the account's credentials.
 
-    ``account`` must have been loaded with ``with_secret=True`` for key / temporary auth.
-    The result holds secrets: it is passed to the child process and never logged.
+    ``data_dir`` (``TF_DATA_DIR``) is the repo-scoped working cache of one root x
+    environment; ``plugin_cache`` (``TF_PLUGIN_CACHE_DIR``) the provider cache shared by
+    every sync, so providers are downloaded once. ``account`` must have been loaded with
+    ``with_secret=True`` for key / temporary auth. The result holds secrets: it is passed
+    to the child process and never logged.
     """
     base = dict(os.environ) if base is None else base
     env = {
@@ -797,6 +815,8 @@ def terraform_env(
         TF_INPUT="0",
         CHECKPOINT_DISABLE="1",
     )
+    if plugin_cache is not None:
+        env["TF_PLUGIN_CACHE_DIR"] = str(plugin_cache)
     return env
 
 
@@ -883,6 +903,11 @@ def _inside(path: Path, base: Path) -> bool:
     return True
 
 
+def expected_account_id(account: Account) -> str:
+    """AWS account id the mapped IPLens account's credentials resolve to (if known)."""
+    return account.last_seen_account_id or account.aws_account_id or ""
+
+
 def sync_env(
     conn: sqlite3.Connection,
     row: dict[str, Any],
@@ -891,12 +916,42 @@ def sync_env(
     cache_dir: Path,
     terraform_bin: str,
     runner: Runner = subprocess.run,
+    timeout: float = DEFAULT_TIMEOUT,
+    progress: Progress | None = None,
 ) -> SyncResult:
-    """Sync one confirmed root x environment (``row`` from :func:`list_envs`)."""
+    """Sync one confirmed root x environment (``row`` from :func:`list_envs`).
+
+    After ``show -json`` the AWS account ids in the state's ARNs are compared with the
+    mapped account: a state whose resources live in another account is ``wrong
+    account`` (its root is left out of drift). ``progress`` reports the current command
+    and is checked for cancellation before each one (a running command finishes first).
+    """
     label = f"{row['root_label']} [{row['env']}]"
+    where = f"root {row['root_label']} env {row['env']}"
+    progress = progress or NullProgress()
+    expected = expected_account_id(account)
 
     def done(status: str, detail: str = "", count: int = 0) -> SyncResult:
         return _record(conn, row, SyncResult(row["id"], label, status, detail, count))
+
+    def ingest(doc: Any, ok_detail: str) -> SyncResult:
+        if not terraform.has_state(doc):
+            return done(NO_STATE, "the backend has no state")
+        try:
+            resources = terraform.parse_document(doc)
+        except ValueError as exc:
+            return done(SHOW_FAILED, str(exc))
+        ids = terraform.state_account_ids(doc)
+        found = expected if expected in ids else max(ids, key=lambda k: (ids[k], k), default="")
+        _store_resources(conn, row, resources)
+        conn.execute("UPDATE tf_repo_envs SET state_account=? WHERE id=?", (found, row["id"]))
+        if ids and expected and expected not in ids:
+            return done(
+                WRONG_ACCOUNT,
+                f"the state's resources are in AWS account {found}, not {expected}",
+                len(resources),
+            )
+        return done(OK, ok_detail, len(resources))
 
     repo = Path(row["repo_path"]).resolve()
     root = (repo / row["root_rel"]).resolve()
@@ -912,12 +967,12 @@ def sync_env(
         )
         if not state.is_file():
             return done(NO_STATE, "no local state file")
+        progress.step(f"{where} · reading the local state file")
         try:
-            _resolved, resources = terraform.read_state_file(str(state))
+            _resolved, doc = terraform.read_state_document(str(state))
         except (ValueError, OSError) as exc:
             return done(SHOW_FAILED, str(exc) if isinstance(exc, ValueError) else "unreadable")
-        _store_resources(conn, row, resources)
-        return done(OK, "local state file", len(resources))
+        return ingest(doc, "local state file")
 
     if not terraform_bin:
         return done(ERROR, "terraform binary not found (PATH or IPLENS_TERRAFORM_BIN)")
@@ -927,26 +982,32 @@ def sync_env(
     cache = cache_dir.resolve()
     if _inside(cache, repo):
         return done(ERROR, "the IPLens cache directory must be outside the repository")
-    data_dir = cache / f"env-{row['id']}"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    for p in (cache, data_dir):
+    # Repo-scoped working directory (kept between runs: modules and the backend are
+    # re-used), and one provider plugin cache shared by every repo and environment.
+    data_dir = cache / f"repo-{row['repo_id']}-env-{row['id']}"
+    plugins = cache / PLUGIN_CACHE
+    for d in (data_dir, plugins):
+        d.mkdir(parents=True, exist_ok=True)
+    for p in (cache, data_dir, plugins):
         with contextlib.suppress(OSError):
             os.chmod(p, 0o700)
-    env = terraform_env(account, data_dir)
+    env = terraform_env(account, data_dir, plugin_cache=plugins)
     secrets = (account.secret_access_key, account.session_token)
 
-    def run(argv: list[str], timeout: float) -> subprocess.CompletedProcess | None:
+    def run(argv: list[str], limit: float) -> subprocess.CompletedProcess | None:
+        progress.check()
+        progress.step(f"{where} · terraform {' '.join(argv[1:3])}")
         try:
             return run_terraform(
                 argv,
                 terraform_bin=terraform_bin,
                 cwd=root,
                 env=env,
-                timeout=timeout,
+                timeout=limit,
                 runner=runner,
             )
         except subprocess.TimeoutExpired:
-            log.warning("terraform %s timed out after %ss", argv[1], int(timeout))
+            log.warning("terraform %s timed out after %ss", argv[1], int(limit))
             return None
 
     init = [terraform_bin, "init", "-input=false", "-lockfile=readonly"]
@@ -956,19 +1017,24 @@ def sync_env(
             return done(INIT_FAILED, "backend config file not found")
         init.append(f"-backend-config={row['backend_config']}")
     try:
-        proc = run(init, INIT_TIMEOUT)
+        proc = run(init, timeout)
         if proc is None:
             return done(INIT_FAILED, "timed out")
         if proc.returncode != 0:
             _log_failure("init", proc, secrets)
             return done(INIT_FAILED, f"exit {proc.returncode}; see the log")
         if row["workspace"]:
-            proc = run([terraform_bin, "workspace", "select", row["workspace"]], WORKSPACE_TIMEOUT)
+            proc = run(
+                [terraform_bin, "workspace", "select", row["workspace"]],
+                min(WORKSPACE_TIMEOUT, timeout),
+            )
             if proc is None or proc.returncode != 0:
                 if proc is not None:
                     _log_failure("workspace select", proc, secrets)
                 return done(INIT_FAILED, "workspace select failed; see the log")
-        proc = run([terraform_bin, "show", "-json"], SHOW_TIMEOUT)
+        proc = run([terraform_bin, "show", "-json"], timeout)
+    except JobCancelled:
+        return done(CANCELLED, "cancelled before the next terraform command")
     except CommandNotAllowed as exc:
         return done(ERROR, str(exc))
     except OSError as exc:
@@ -983,15 +1049,7 @@ def sync_env(
     except ValueError as exc:
         return done(SHOW_FAILED, str(exc))
     del proc  # nothing but the extracted ids outlives parsing
-    if not terraform.has_state(doc):
-        return done(NO_STATE, "the backend has no state")
-    try:
-        resources = terraform.parse_document(doc)
-    except ValueError as exc:
-        return done(SHOW_FAILED, str(exc))
-    del doc
-    _store_resources(conn, row, resources)
-    return done(OK, "", len(resources))
+    return ingest(doc, "")
 
 
 def sync(
@@ -1003,9 +1061,15 @@ def sync(
     account_ref: int | None = None,
     repo_id: int | None = None,
     runner: Runner = subprocess.run,
+    timeout: float = DEFAULT_TIMEOUT,
+    progress: Progress | None = None,
+    parallel: int = PARALLEL_ROOTS,
 ) -> list[SyncResult]:
     """Sync every confirmed, present root x environment (optionally of one account /
-    repository). ``get_account`` returns the account *with* its secrets."""
+    repository), ``parallel`` at a time. ``get_account`` returns the account *with* its
+    secrets. Each pair runs in its own thread with its own database connection; once
+    ``progress`` is cancelled no further pair is started."""
+    progress = progress or NullProgress()
     with closing(db_path) as conn:
         rows = [
             r
@@ -1015,23 +1079,42 @@ def sync(
             and r["account_ref"] is not None
             and (account_ref is None or r["account_ref"] == account_ref)
         ]
-    results = []
+    work = []
     for row in rows:
         account = get_account(row["account_ref"])
-        if account is None:
-            continue
-        with closing(db_path) as conn:
-            results.append(
-                sync_env(
+        if account is not None:
+            work.append((row, account))
+    progress.step(
+        f"terraform sync: {len(work)} root × environment pair(s)", done=0, total=len(work)
+    )
+
+    def one(item: tuple[dict[str, Any], Account]) -> SyncResult:
+        row, account = item
+        with progress.bind():
+            if progress.cancelled:
+                return SyncResult(
+                    row["id"], f"{row['root_label']} [{row['env']}]", CANCELLED, "not started"
+                )
+            with closing(db_path) as conn:
+                result = sync_env(
                     conn,
                     row,
                     account,
                     cache_dir=cache_dir,
                     terraform_bin=terraform_bin,
                     runner=runner,
+                    timeout=timeout,
+                    progress=progress,
                 )
-            )
-    return results
+            progress.advance()
+            return result
+
+    if parallel <= 1 or len(work) <= 1:
+        return [one(w) for w in work]
+    with ThreadPoolExecutor(
+        max_workers=min(parallel, len(work)), thread_name_prefix="iplens-tf"
+    ) as pool:
+        return list(pool.map(one, work))
 
 
 def summarise(results: Sequence[SyncResult]) -> str:
@@ -1081,6 +1164,120 @@ def aws_inventory(conn: sqlite3.Connection, snapshot_id: int) -> dict[str, set[s
     }
 
 
+# -- "managed elsewhere" markers ----------------------------------------------------------
+
+MARKER_KINDS = {
+    "type": "resource type",
+    "resource": "resource id",
+    "tag": "tag (Key or Key=Value)",
+}
+# Drift kind -> resource_tags.resource_type of the same resource (tag markers).
+TAG_TYPES = {
+    "vpc": "vpc",
+    "subnet": "subnet",
+    "sg": "sg",
+    "vpce": "endpoint",
+    "lb": "lb",
+    "lambda": "lambda",
+    "ecs_service": "ecs_service",
+}
+_MARKER_ID_RE = re.compile(r"^[A-Za-z0-9._:/@+=-]{1,256}$")
+MAX_MARKER_NOTE = 200
+
+
+@dataclass(frozen=True)
+class Marker:
+    id: int
+    account_ref: int | None
+    kind: str
+    value: str
+    note: str = ""
+
+    @property
+    def label(self) -> str:
+        if self.kind == "type":
+            return f"every {terraform.KIND_LABELS.get(self.value, self.value)}"
+        if self.kind == "tag":
+            return f"tag {self.value}"
+        return self.value
+
+    def tag_matches(self, tags: dict[str, str]) -> bool:
+        key, sep, value = self.value.partition("=")
+        if key not in tags:
+            return False
+        return not sep or tags[key] == value
+
+
+def validate_marker(kind: str, value: str) -> tuple[str, str]:
+    """``(kind, value)`` of a "managed elsewhere" marker; ValueError if invalid."""
+    kind, value = (kind or "").strip(), (value or "").strip()
+    if kind not in MARKER_KINDS:
+        raise ValueError("choose a marker type: resource type, resource id or tag")
+    if kind == "type":
+        if value not in (*DRIFT_KINDS, "eni"):
+            raise ValueError("unknown resource type")
+    elif kind == "resource":
+        if not _MARKER_ID_RE.match(value):
+            raise ValueError("enter a resource id (letters, digits and . _ : / @ + = -)")
+    else:
+        key, sep, tag_value = value.partition("=")
+        key = key.strip()
+        if not key or len(key) > 128 or len(tag_value) > 256 or "\n" in value:
+            raise ValueError("enter a tag key, or Key=Value (key up to 128 characters)")
+        value = f"{key}={tag_value.strip()}" if sep else key
+    return kind, value
+
+
+def add_marker(
+    conn: sqlite3.Connection, account_ref: int | None, kind: str, value: str, note: str = ""
+) -> int:
+    kind, value = validate_marker(kind, value)
+    row = conn.execute(
+        "SELECT id FROM tf_managed_elsewhere WHERE account_ref IS ? AND kind=? AND value=?",
+        (account_ref, kind, value),
+    ).fetchone()
+    if row:
+        return int(row["id"])
+    cur = conn.execute(
+        "INSERT INTO tf_managed_elsewhere(account_ref, kind, value, note) VALUES(?,?,?,?)",
+        (account_ref, kind, value, (note or "").strip()[:MAX_MARKER_NOTE]),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def delete_marker(conn: sqlite3.Connection, marker_id: int) -> bool:
+    return conn.execute("DELETE FROM tf_managed_elsewhere WHERE id=?", (marker_id,)).rowcount > 0
+
+
+def list_markers(conn: sqlite3.Connection, account_ref: int | None) -> list[Marker]:
+    """Markers of ``account_ref`` and those for every account."""
+    return [
+        Marker(r["id"], r["account_ref"], r["kind"], r["value"], r["note"])
+        for r in conn.execute(
+            "SELECT * FROM tf_managed_elsewhere WHERE account_ref IS NULL OR account_ref=? "
+            "ORDER BY kind, value",
+            (account_ref,),
+        )
+    ]
+
+
+class _MarkerIndex:
+    def __init__(self, markers: Sequence[Marker], tags: dict[tuple[str, str], dict[str, str]]):
+        self.types = {m.value: m for m in markers if m.kind == "type"}
+        self.ids = {m.value: m for m in markers if m.kind == "resource"}
+        self.tag_markers = [m for m in markers if m.kind == "tag"]
+        self.tags = tags
+
+    def match(self, kind: str, rid: str, *, with_tags: bool = True) -> Marker | None:
+        hit = self.ids.get(rid) or self.types.get(kind)
+        if hit or not with_tags or kind not in TAG_TYPES:
+            return hit
+        tags = self.tags.get((TAG_TYPES[kind], rid))
+        if tags:
+            return next((m for m in self.tag_markers if m.tag_matches(tags)), None)
+        return None
+
+
 @dataclass
 class Drift:
     roots: list[str] = field(default_factory=list)  # roots compared ("in TF, not in AWS")
@@ -1088,6 +1285,32 @@ class Drift:
     not_in_aws: list[dict[str, str]] = field(default_factory=list)
     skipped_kinds: list[str] = field(default_factory=list)
     skipped_roots: list[dict[str, str]] = field(default_factory=list)
+    # Excluded from both lists: matched a "managed elsewhere" marker.
+    managed_elsewhere: list[dict[str, str]] = field(default_factory=list)
+    # Roots whose state belongs to another AWS account (excluded from both lists).
+    wrong_account: list[dict[str, Any]] = field(default_factory=list)
+    markers: list[Marker] = field(default_factory=list)
+
+
+def wrong_account_roots(conn: sqlite3.Connection) -> set[str]:
+    """``tf_roots`` names written by a sync whose state is in another AWS account."""
+    return {
+        r["root_name"]
+        for r in conn.execute(
+            "SELECT root_name FROM tf_repo_envs WHERE status=? AND root_name != ''",
+            (WRONG_ACCOUNT,),
+        )
+    }
+
+
+def suggest_for_state(state_account: str, accounts: Sequence[Account]) -> Account | None:
+    """The IPLens account whose credentials resolve to ``state_account``, if any."""
+    if not state_account:
+        return None
+    return next(
+        (a for a in accounts if state_account in (a.last_seen_account_id, a.aws_account_id)),
+        None,
+    )
 
 
 def drift(conn: sqlite3.Connection, account_ref: int, snapshot: Any) -> Drift:
@@ -1097,6 +1320,10 @@ def drift(conn: sqlite3.Connection, account_ref: int, snapshot: Any) -> Drift:
     (repo-synced or loaded from a file) manages; (b) *in Terraform, not in AWS*:
     resources of the repo roots mapped to this account that the snapshot lacks. Roots
     whose guessed region differs from the snapshot's region are skipped for (b).
+
+    Roots whose state is in another AWS account (``wrong account``) count for neither
+    list, and resources matching a "managed elsewhere" marker (by type, id or - for
+    (a) - tag) are listed apart instead of as drift.
     """
     out = Drift()
     inv = aws_inventory(conn, snapshot["id"])
@@ -1104,19 +1331,69 @@ def drift(conn: sqlite3.Connection, account_ref: int, snapshot: Any) -> Drift:
         terraform.KIND_LABELS[k] for k in sorted(_OPTIONAL_KINDS) if not inv.get(k)
     ]
     compared = [k for k in DRIFT_KINDS if k not in _OPTIONAL_KINDS or inv.get(k)]
+    wrong = wrong_account_roots(conn)
     managed = {
         (r["kind"], r["resource_id"])
-        for r in conn.execute("SELECT kind, resource_id FROM tf_resources")
+        for r in conn.execute(
+            "SELECT t.kind, t.resource_id, r.name FROM tf_resources t "
+            "JOIN tf_roots r ON r.id = t.root_id"
+        )
+        if r["name"] not in wrong
     }
+    out.markers = list_markers(conn, account_ref)
+    tags: dict[tuple[str, str], dict[str, str]] = {}
+    if any(m.kind == "tag" for m in out.markers):
+        for r in conn.execute(
+            "SELECT resource_type, resource_id, key, value FROM resource_tags WHERE snapshot_id=?",
+            (snapshot["id"],),
+        ):
+            tags.setdefault((r["resource_type"], r["resource_id"]), {})[r["key"]] = r["value"]
+    markers = _MarkerIndex(out.markers, tags)
+
+    def elsewhere(side: str, kind: str, rid: str, marker: Marker, root: str = "") -> None:
+        out.managed_elsewhere.append(
+            {
+                "side": side,
+                "kind": kind,
+                "label": terraform.KIND_LABELS.get(kind, kind),
+                "resource_id": rid,
+                "root": root,
+                "marker": marker.label,
+            }
+        )
+
     for kind in compared:
         for rid in sorted(inv.get(kind, ())):
-            if (kind, rid) not in managed:
-                out.not_in_terraform.append(
-                    {"kind": kind, "label": terraform.KIND_LABELS[kind], "resource_id": rid}
-                )
+            if (kind, rid) in managed:
+                continue
+            marker = markers.match(kind, rid)
+            if marker:
+                elsewhere("aws", kind, rid, marker)
+                continue
+            out.not_in_terraform.append(
+                {"kind": kind, "label": terraform.KIND_LABELS[kind], "resource_id": rid}
+            )
     region = snapshot["region"]
     for env in list_envs(conn, account_ref=account_ref):
         if not env["present"] or not env["root_name"]:
+            continue
+        if env["status"] == WRONG_ACCOUNT:
+            out.wrong_account.append(
+                {
+                    "status": WRONG_ACCOUNT,
+                    "root": env["root_name"],
+                    "root_label": env["root_label"],
+                    "env": env["env"],
+                    "repo_id": env["repo_id"],
+                    "state_account": env["state_account"],
+                }
+            )
+            out.skipped_roots.append(
+                {
+                    "root": env["root_name"],
+                    "reason": f"wrong account (state in {env['state_account'] or 'another'})",
+                }
+            )
             continue
         if env["guess_region"] and env["guess_region"] != region:
             out.skipped_roots.append(
@@ -1133,14 +1410,19 @@ def drift(conn: sqlite3.Connection, account_ref: int, snapshot: Any) -> Drift:
             kind = r["kind"]
             if kind not in compared and kind != "eni":
                 continue
-            if r["resource_id"] not in inv.get(kind, set()):
-                out.not_in_aws.append(
-                    {
-                        "root": env["root_name"],
-                        "address": r["address"],
-                        "type": r["type"],
-                        "label": terraform.KIND_LABELS.get(kind, kind),
-                        "resource_id": r["resource_id"],
-                    }
-                )
+            if r["resource_id"] in inv.get(kind, set()):
+                continue
+            marker = markers.match(kind, r["resource_id"], with_tags=False)
+            if marker:
+                elsewhere("terraform", kind, r["resource_id"], marker, env["root_name"])
+                continue
+            out.not_in_aws.append(
+                {
+                    "root": env["root_name"],
+                    "address": r["address"],
+                    "type": r["type"],
+                    "label": terraform.KIND_LABELS.get(kind, kind),
+                    "resource_id": r["resource_id"],
+                }
+            )
     return out

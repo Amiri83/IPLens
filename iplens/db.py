@@ -253,7 +253,20 @@ CREATE TABLE IF NOT EXISTS tf_repo_envs (
     status         TEXT NOT NULL DEFAULT '',  -- '' | ok | init failed | no state | ...
     status_detail  TEXT NOT NULL DEFAULT '',
     synced_at      TEXT,
+    state_account  TEXT NOT NULL DEFAULT '',  -- AWS account id found in the state's ARNs
     UNIQUE (repo_id, root_rel, env)
+);
+
+-- "Managed elsewhere" drift markers (tfrepo.py): resources matching one are left out of
+-- both drift lists. kind: resource (a resource id) | type (a drift kind: vpc, subnet, ...)
+-- | tag ("Key" or "Key=Value"). account_ref NULL: every account.
+CREATE TABLE IF NOT EXISTS tf_managed_elsewhere (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_ref INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    UNIQUE (account_ref, kind, value)
 );
 
 CREATE TABLE IF NOT EXISTS tf_resources (
@@ -383,11 +396,37 @@ CREATE TABLE IF NOT EXISTS visual_groups (
     expanded    TEXT NOT NULL,      -- JSON list of group node ids
     PRIMARY KEY (account_ref, view, vpc_id)
 );
+
+-- Background jobs (jobs.py): written when a job starts and ends, so a reloaded page can
+-- re-attach to it and show the outcome. messages / log: JSON lists (no secrets: result
+-- lines and the first line of each log record only).
+CREATE TABLE IF NOT EXISTS jobs (
+    id          TEXT PRIMARY KEY,
+    account_ref INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    label       TEXT NOT NULL DEFAULT '',
+    state       TEXT NOT NULL,      -- running | done | cancelled | error
+    step        TEXT NOT NULL DEFAULT '',
+    done        INTEGER NOT NULL DEFAULT 0,
+    total       INTEGER NOT NULL DEFAULT 0,
+    started_at  TEXT NOT NULL,
+    finished_at TEXT NOT NULL DEFAULT '',
+    elapsed     INTEGER NOT NULL DEFAULT 0,
+    error       TEXT NOT NULL DEFAULT '',
+    messages    TEXT NOT NULL DEFAULT '[]',
+    log         TEXT NOT NULL DEFAULT '[]'
+);
+CREATE INDEX IF NOT EXISTS ix_jobs_account ON jobs(account_ref, started_at);
 """
+
+# Seconds a connection waits for another thread's write lock before failing.
+BUSY_TIMEOUT = 30.0
 
 
 def connect(db_path: Path | str) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(db_path), detect_types=0)
+    """A new connection. Connections are never shared between threads: every request
+    and every background job thread opens its own."""
+    conn = sqlite3.connect(str(db_path), detect_types=0, timeout=BUSY_TIMEOUT)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -406,6 +445,7 @@ _ADDED_COLUMNS = (
     ("visual_prefs", "evidence", "TEXT"),
     ("visual_prefs", "show_legend", "INTEGER NOT NULL DEFAULT 1"),
     ("tf_roots", "origin", "TEXT NOT NULL DEFAULT ''"),
+    ("tf_repo_envs", "state_account", "TEXT NOT NULL DEFAULT ''"),
 )
 
 # Single-account settings rows from before multi-account support.
@@ -425,6 +465,8 @@ _REGROUPED_KEY = "snapshots_regrouped"
 
 def init_db(db_path: Path | str) -> None:
     with closing(db_path) as conn:
+        # WAL: readers (page requests) are not blocked while a background job writes.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
         for table, column, ddl in _ADDED_COLUMNS:
             cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
