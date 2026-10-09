@@ -210,6 +210,31 @@ CREATE TABLE IF NOT EXISTS resource_tags (
     PRIMARY KEY (snapshot_id, resource_type, resource_id, key)
 );
 
+-- AWS-first ownership inputs (ownership.py): tag:GetResources, CloudFormation stack
+-- resources and the optional CloudTrail creator. kind / resource_id as in tf_resources
+-- (vpc, subnet, eni, lb, lambda, ...; other resources "<service>:<type>"). Only identifiers
+-- are kept: stack names and the creating role / user *name*, never ARNs or session names.
+CREATE TABLE IF NOT EXISTS own_resources (
+    snapshot_id  INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    kind         TEXT NOT NULL,
+    resource_id  TEXT NOT NULL,
+    cfn_stack    TEXT NOT NULL DEFAULT '',  -- CloudFormation stack name
+    creator      TEXT NOT NULL DEFAULT '',  -- CloudTrail: role / IAM user name
+    creator_kind TEXT NOT NULL DEFAULT '',  -- role | user | root
+    PRIMARY KEY (snapshot_id, kind, resource_id)
+);
+
+-- Tags from tag:GetResources. value is '' except for the ownership tag keys of Settings
+-- (project / environment / team / owner and the environment keys); aws: keys are not kept.
+CREATE TABLE IF NOT EXISTS own_tags (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,
+    resource_id TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (snapshot_id, kind, resource_id, key)
+);
+
 -- Terraform roots loaded from local state files (read-only). Only resource ids,
 -- addresses and types are kept; attribute values, outputs and secrets never are.
 CREATE TABLE IF NOT EXISTS tf_roots (

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import secrets
@@ -28,7 +29,17 @@ from flask import (
 )
 from markupsafe import Markup
 
-from . import diagram, environment, extgraph, flowlogs, queries, terraform, tfrepo, viewstate
+from . import (
+    diagram,
+    environment,
+    extgraph,
+    flowlogs,
+    ownership,
+    queries,
+    terraform,
+    tfrepo,
+    viewstate,
+)
 from . import rules as rules_mod
 from . import scope as scope_mod
 from . import suggestions as sugg_mod
@@ -81,9 +92,18 @@ GROUP_BY = {
     "tag": "tag",
     "tf": "Terraform root",
     "env": "environment",
+    "owner": "owner (ownership source)",
+    "team": "team",
 }
 # Visual page modes: the IP view is the default; "extended" adds regional services.
 VIEW_MODES = {"ip": "IP view", "extended": "Extended view"}  # keys: viewstate.VIEWS
+# Snapshot warnings shown on the Ownership page (prefixes of the collector's messages).
+OWNERSHIP_APIS = ("tag:GetResources", "cloudformation:", "cloudtrail:")
+# IP list "Owner" filter: an ownership source, or unmanaged.
+OWN_FILTERS = {
+    **{s: label for s, label in ownership.SOURCE_LABELS.items() if s},
+    ownership.FILTER_UNMANAGED: ownership.SOURCE_LABELS[ownership.UNMANAGED],
+}
 MAX_CRAWL_WARNINGS_FLASHED = 8
 
 
@@ -515,13 +535,25 @@ def _register(app: Flask) -> None:
         db_path = _paths().db_path
         accounts = _accounts()
         edit_url = url_for("account_edit", account_id=account.id)
-        tf_sync = _tf_syncer() if tfrepo.list_envs(_db(), account_ref=account.id) else None
+        own = _own()
+        # Terraform is an optional ownership enrichment: mapped repos are only re-synced
+        # with every refresh when it is enabled (the Sync buttons always work).
+        tf_sync = (
+            _tf_syncer()
+            if own.tf_enabled and tfrepo.list_envs(_db(), account_ref=account.id)
+            else None
+        )
 
         def work(ctx: JobContext) -> None:
             try:
                 gw = factory(account)
                 result = Collector(
-                    gw, db_path, account.id, account.display_name, progress=ctx
+                    gw,
+                    db_path,
+                    account.id,
+                    account.display_name,
+                    progress=ctx,
+                    ownership_config=own,
                 ).run()
                 with closing(db_path) as conn:
                     queries.prune_snapshots(conn)
@@ -631,16 +663,19 @@ def _register(app: Flask) -> None:
         snap = _snapshot_or_none()
         if not snap:
             return redirect(url_for("overview"))
-        detail = queries.eni_detail(_db(), snap["id"], eni_id)
+        detail = queries.eni_detail(_db(), snap["id"], eni_id, _own())
         if detail is None:
             abort(404)
         _in_scope_or_404(detail["subnet_id"])
-        return render_template("eni.html", snap=snap, e=detail)
+        return render_template(
+            "eni.html", snap=snap, e=detail, own=_own(), own_fields=ownership.TAG_FIELDS
+        )
 
     def _ip_filter() -> queries.IpFilter:
         a = request.args
         owner = a.get("owner", "")
         state = a.get("state", "")
+        own = a.get("own", "")
         return queries.IpFilter(
             vpc=a.get("vpc", "").strip(),
             subnet=a.get("subnet", "").strip(),
@@ -651,13 +686,20 @@ def _register(app: Flask) -> None:
             tag_value=a.get("tag_value", "").strip()[:256],
             tf=a.get("tf", "").strip()[: terraform.MAX_ROOT_NAME],
             env=a.get("env", "").strip()[:128],
+            own=own if own in OWN_FILTERS else "",
         )
 
     def _env_keys() -> tuple[str, ...]:
-        """Tag keys environments are read from (Settings)."""
+        """Tag keys environments are read from (Settings: Ownership environment key first)."""
         if "env_keys" not in g:
-            g.env_keys = _store().load().env_tag_keys
+            g.env_keys = _store().load().env_keys
         return g.env_keys
+
+    def _own() -> ownership.OwnershipConfig:
+        """Ownership tag keys, CI role patterns and optional sources (Settings)."""
+        if "own_config" not in g:
+            g.own_config = _store().load().ownership_config()
+        return g.own_config
 
     @app.get("/ips")
     def ips():
@@ -666,7 +708,9 @@ def _register(app: Flask) -> None:
         rows, tree, keys, envs = [], [], [], []
         if snap:
             # Without the environment filter first: the dropdown lists every environment.
-            every = queries.ip_list(_db(), snap["id"], replace(flt, env=""), _scope(), _env_keys())
+            every = queries.ip_list(
+                _db(), snap["id"], replace(flt, env=""), _scope(), _env_keys(), _own()
+            )
             envs = environment.summary(r["environment"] for r in every)
             rows = [r for r in every if environment.matches(r["environment"], flt.env)]
             tree = queries.vpc_tree(_db(), snap["id"], _scope())
@@ -685,6 +729,7 @@ def _register(app: Flask) -> None:
             tf_roots=[r["name"] for r in terraform.list_roots(_db())],
             tf_managed=queries.TF_MANAGED,
             tf_unmanaged=queries.TF_UNMANAGED,
+            own_filters=OWN_FILTERS,
             type_label=lambda r: queries.resource_type_label(r, OWNER_LABELS),
         )
 
@@ -692,7 +737,9 @@ def _register(app: Flask) -> None:
     def ips_export():
         snap = _snapshot_or_none()
         flt = _ip_filter()
-        rows = queries.ip_list(_db(), snap["id"], flt, _scope(), _env_keys()) if snap else []
+        rows = (
+            queries.ip_list(_db(), snap["id"], flt, _scope(), _env_keys(), _own()) if snap else []
+        )
         body = ips_to_xlsx(rows, OWNER_LABELS)
         log.info("exported %d IP row(s) to xlsx", len(rows))
         name = f"iplens-ips-snapshot-{snap['id']}.xlsx" if snap else "iplens-ips.xlsx"
@@ -874,6 +921,7 @@ def _register(app: Flask) -> None:
             _edge_types(),
             _scope(),
             _env_keys(),
+            _own(),
         )
         if data is None:
             abort(404)
@@ -1258,9 +1306,26 @@ def _register(app: Flask) -> None:
 
     @app.get("/settings")
     def settings_page():
+        snap = _snapshot_or_none()
+        s = _store().load()
+        # Ownership key dropdowns: the tag keys seen in the active account's latest snapshot
+        # (plus the configured ones, so that saving never drops a key not seen yet).
+        seen = ownership.tag_keys_seen(_db(), snap["id"] if snap else None)
+        configured = [s.own_project_key, s.own_env_key, s.own_team_key, s.own_owner_key]
         return render_template(
             "settings.html",
-            s=_store().load(),
+            s=s,
+            own_fields=ownership.TAG_FIELDS,
+            own_keys={
+                "project": s.own_project_key,
+                "env": s.own_env_key,
+                "team": s.own_team_key,
+                "owner": s.own_owner_key,
+            },
+            seen_tag_keys=seen,
+            tag_key_choices=sorted({*seen, *(k for k in configured if k)}, key=str.lower),
+            cloudtrail_days=ownership.CLOUDTRAIL_DAYS,
+            cloudtrail_max=ownership.MAX_CLOUDTRAIL_LOOKUPS,
             accounts=_account_choices(),
             default_log_dir=_paths().default_log_dir,
             tf_roots=terraform.list_roots(_db()),
@@ -1499,7 +1564,7 @@ def _register(app: Flask) -> None:
             ctx.check()
             ctx.step("finished")
 
-        back = _safe_next(request.form.get("next") or url_for("terraform_page"))
+        back = _safe_next(request.form.get("next") or url_for("ownership_page"))
         return _run_job(_job_account(), "tfsync", work, back)
 
     def _wrong_account_rows(envs: list[dict[str, Any]]) -> None:
@@ -1512,17 +1577,26 @@ def _register(app: Flask) -> None:
                 e["suggest_ref"] = hit.id if hit else None
                 e["suggest_label"] = labels.get(hit.id, "") if hit else ""
 
-    @app.get("/terraform")
-    def terraform_page():
+    @app.get("/ownership")
+    @app.get("/terraform")  # the former Terraform / drift page
+    def ownership_page():
         ref = _active_ref()
         snap = _snapshot_or_none()
+        own = _own()
         envs = tfrepo.list_envs(_db(), account_ref=ref) if ref is not None else []
         _wrong_account_rows(envs)
         drift = tfrepo.drift(_db(), ref, snap) if snap is not None and ref is not None else None
         if drift is not None:
             _wrong_account_rows(drift.wrong_account)
+        warnings = json.loads(snap["warnings"] or "[]") if snap is not None else []
         return render_template(
-            "terraform.html",
+            "ownership.html",
+            own=own,
+            report=ownership.report(_db(), snap["id"], own) if snap is not None else None,
+            # Collection warnings of the ownership sources (missing permissions, caps).
+            own_warnings=[w for w in warnings if w.startswith(OWNERSHIP_APIS)],
+            cloudtrail_days=ownership.CLOUDTRAIL_DAYS,
+            cloudtrail_max=ownership.MAX_CLOUDTRAIL_LOOKUPS,
             envs=envs,
             snap=snap,
             drift=drift,
@@ -1534,6 +1608,20 @@ def _register(app: Flask) -> None:
             ],
             wrong_account=tfrepo.WRONG_ACCOUNT,
         )
+
+    @app.post("/ownership/terraform")
+    def ownership_terraform_toggle():
+        enabled = request.form.get("enabled") == "1"
+        _store().save_ownership(tf_enrichment=enabled)
+        log.info("terraform ownership enrichment %s", "enabled" if enabled else "disabled")
+        flash(
+            "Terraform enrichment enabled: Terraform roots now count as an ownership source "
+            "and mapped repos are re-synced with every Refresh."
+            if enabled
+            else "Terraform enrichment disabled.",
+            "ok",
+        )
+        return redirect(url_for("ownership_page") + "#terraform")
 
     @app.post("/terraform/markers")
     def terraform_marker_add():
@@ -1547,10 +1635,10 @@ def _register(app: Flask) -> None:
                 tfrepo.add_marker(conn, scope_ref, kind, value, f.get("note", ""))
         except ValueError as exc:
             flash(f"Marker not saved: {exc}", "error")
-            return redirect(url_for("terraform_page") + "#managed-elsewhere")
+            return redirect(url_for("ownership_page") + "#managed-elsewhere")
         log.info("managed-elsewhere marker added (account=%s, kind=%s)", scope_ref, kind)
         flash("Marked as managed elsewhere: left out of drift.", "ok")
-        return redirect(url_for("terraform_page") + "#managed-elsewhere")
+        return redirect(url_for("ownership_page") + "#managed-elsewhere")
 
     @app.post("/terraform/markers/<int:marker_id>/delete")
     def terraform_marker_delete(marker_id: int):
@@ -1560,7 +1648,7 @@ def _register(app: Flask) -> None:
         with closing(_paths().db_path) as conn:
             tfrepo.delete_marker(conn, marker_id)
         flash("Marker removed.", "ok")
-        return redirect(url_for("terraform_page") + "#managed-elsewhere")
+        return redirect(url_for("ownership_page") + "#managed-elsewhere")
 
     @app.post("/settings")
     def settings_save():
@@ -1576,13 +1664,26 @@ def _register(app: Flask) -> None:
             tf_timeout=timeout,
             env_tag_keys=f.get("env_tag_keys") if "env_tag_keys" in f else None,
         )
+        if "own_form" in f:  # the Ownership section (checkboxes are absent when unticked)
+            _store().save_ownership(
+                keys={name: f.get(f"own_{name}_key", "") for name in ownership.TAG_FIELDS},
+                ci_patterns=f.get("ci_patterns", ""),
+                tf_enrichment=f.get("tf_enrichment") == "1",
+                cloudtrail_lookup=f.get("cloudtrail_lookup") == "1",
+            )
         saved = _store().load()
         new_dir = apply_log_dir(current_app, saved)
         log.info(
-            "settings saved: log_dir=%s tf_timeout=%ss env_tag_keys=%s",
+            "settings saved: log_dir=%s tf_timeout=%ss env_tag_keys=%s ownership keys=%s "
+            "tf_enrichment=%s cloudtrail=%s",
             new_dir,
             saved.tf_timeout,
             ",".join(saved.env_tag_keys),
+            ",".join(
+                (saved.own_project_key, saved.own_env_key, saved.own_team_key, saved.own_owner_key)
+            ),
+            saved.tf_enrichment,
+            saved.cloudtrail_lookup,
         )
         flash("Settings saved", "ok")
         return redirect(url_for("settings_page"))

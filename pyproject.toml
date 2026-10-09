@@ -19,7 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "moto[ec2,ecs,lambda,elbv2,sts,iam,sns,sqs,dynamodb,s3,stepfunctions,secretsmanager,events,logs]>=5.0",
+    "moto[ec2,ecs,lambda,elbv2,sts,iam,sns,sqs,dynamodb,s3,stepfunctions,secretsmanager,events,logs,cloudformation,resourcegroupstaggingapi,cloudtrail]>=5.0",
     "ruff>=0.5",
 ]
 

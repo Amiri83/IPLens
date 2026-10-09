@@ -6,16 +6,39 @@ account 123456789012 and made-up resource ids/names.
 
 from __future__ import annotations
 
+import importlib.util
 import ipaddress
 import json
 import logging
 import os
+import sys
+import types
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from iplens.db import closing, init_db
+
+
+def _stub_openapi_spec_validator() -> None:
+    """moto's CloudFormation backend imports its API Gateway models, which need
+    ``openapi_spec_validator`` (the ``moto[cloudformation]`` extra). Without the package
+    a tiny stand-in is registered: IPLens never creates API Gateway specs in tests."""
+    if importlib.util.find_spec("openapi_spec_validator") is not None:
+        return
+    names = (
+        "openapi_spec_validator",
+        "openapi_spec_validator.validation",
+        "openapi_spec_validator.validation.exceptions",
+    )
+    for name in names:
+        sys.modules[name] = types.ModuleType(name)
+    sys.modules[names[0]].validate = lambda *_a, **_k: None
+    sys.modules[names[2]].OpenAPIValidationError = type("OpenAPIValidationError", (Exception,), {})
+
+
+_stub_openapi_spec_validator()
 
 
 @pytest.fixture(autouse=True)

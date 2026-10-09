@@ -13,6 +13,7 @@ from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
+from . import ownership
 from .attribution import Attribution, attribute_eni, lambda_eni_index, lambda_owners
 from .aws import AwsGateway
 from .db import closing
@@ -21,7 +22,11 @@ from .jobs import JobCancelled, NullProgress, Progress
 log = logging.getLogger(__name__)
 
 # Progress steps of one collection (see Collector._step).
-COLLECT_STEPS = 11
+COLLECT_STEPS = 14
+# tag:GetResources page size (the API maximum).
+_TAG_PAGE = 100
+# CloudTrail events read per looked-up resource.
+_CLOUDTRAIL_EVENTS = 50
 
 
 @dataclass
@@ -209,6 +214,21 @@ def _task_eni_ids(task: dict[str, Any]) -> list[str]:
     return out
 
 
+def _creator(cloudtrail: Any, resource_id: str) -> ownership.Principal | None:
+    """Principal of the oldest ``Create*`` / ``RunInstances`` event naming ``resource_id``
+    (CloudTrail keeps 90 days of management events; events come newest first)."""
+    found = None
+    pages = cloudtrail.get_paginator("lookup_events").paginate(
+        LookupAttributes=[{"AttributeKey": "ResourceName", "AttributeValue": resource_id}],
+        PaginationConfig={"MaxItems": _CLOUDTRAIL_EVENTS},
+    )
+    for page in pages:
+        for event in page.get("Events", []):
+            if ownership.is_create_event(event.get("EventName", "")):
+                found = ownership.principal_from_event(event) or found
+    return found
+
+
 class Collector:
     def __init__(
         self,
@@ -217,8 +237,11 @@ class Collector:
         account_ref: int | None = None,
         account_name: str = "",
         progress: Progress | None = None,
+        ownership_config: ownership.OwnershipConfig | None = None,
     ):
         self.gw = gateway
+        # Which tag values are kept, the CI role patterns and the optional sources.
+        self.own = ownership_config or ownership.OwnershipConfig()
         self.db_path = db_path
         self.account_ref = account_ref  # IPLens account record the snapshot belongs to
         # The record's display name, frozen on the snapshot (later renames do not apply).
@@ -320,6 +343,11 @@ class Collector:
         self._step("tags")
         lb_tags = self._collect_lb_tags(result, lbs)
         lambda_tags = self._collect_lambda_tags(result, lambdas)
+        self._step("tag:GetResources")
+        tagged = self._optional(result, "tag:GetResources", self._fetch_tagged_resources)
+        self._step("cloudformation:ListStacks")
+        stacks = self._optional(result, "cloudformation:ListStacks", self._fetch_stack_resources)
+        own_resources, own_tags = self._ownership_rows(tagged, stacks)
         self._step("writing the snapshot")
 
         lambda_index = lambda_eni_index(lambdas)
@@ -568,6 +596,21 @@ class Collector:
                 "key, value) VALUES(?,?,?,?,?)",
                 [(snap_id, *row) for row in tag_rows],
             )
+            conn.executemany(
+                "INSERT OR IGNORE INTO own_resources(snapshot_id, kind, resource_id, cfn_stack) "
+                "VALUES(?,?,?,?)",
+                [(snap_id, kind, rid, stack) for (kind, rid), stack in own_resources.items()],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO own_tags(snapshot_id, kind, resource_id, key, value) "
+                "VALUES(?,?,?,?,?)",
+                [(snap_id, *row) for row in own_tags],
+            )
+
+        self._step("cloudtrail:LookupEvents")
+        if self.own.cloudtrail:
+            self._collect_creators(result, snap_id)
+        with closing(self.db_path) as conn:
             conn.execute(
                 "UPDATE snapshots SET status='ok', account_id=?, account_alias=?, warnings=? "
                 "WHERE id=?",
@@ -582,6 +625,101 @@ class Collector:
             ip_count,
         )
         return result
+
+    # -- ownership sources (see iplens.ownership) ---------------------------------------
+
+    def _fetch_tagged_resources(self) -> list[tuple[ownership.ResourceKey, list[tuple[str, str]]]]:
+        """Every tagged resource of the region with its tags (tag:GetResources, paginated)."""
+        client = self.gw.client("resourcegroupstaggingapi")
+        out = []
+        for page in client.get_paginator("get_resources").paginate(ResourcesPerPage=_TAG_PAGE):
+            self.progress.check()
+            for item in page.get("ResourceTagMappingList", []):
+                key = ownership.arn_key(item.get("ResourceARN", ""))
+                if key:
+                    out.append((key, tag_pairs(item.get("Tags"))))
+        log.info("tag:GetResources: %d resource(s)", len(out))
+        return out
+
+    def _fetch_stack_resources(self) -> list[tuple[ownership.ResourceKey, str]]:
+        """``(resource key, stack name)`` of every physical resource of a live stack."""
+        cfn = self.gw.client("cloudformation")
+        out = []
+        stacks = _paginate(cfn, "list_stacks", "StackSummaries")
+        live = [s for s in stacks if s.get("StackStatus") != "DELETE_COMPLETE"]
+        for stack in live:
+            self.progress.check()
+            name = stack.get("StackName", "")
+            for r in _paginate(
+                cfn, "list_stack_resources", "StackResourceSummaries", StackName=name
+            ):
+                key = ownership.cfn_key(r.get("ResourceType", ""), r.get("PhysicalResourceId", ""))
+                if key:
+                    out.append((key, name))
+        log.info("CloudFormation: %d stack(s), %d resource(s)", len(live), len(out))
+        return out
+
+    def _ownership_rows(
+        self,
+        tagged: list[tuple[ownership.ResourceKey, list[tuple[str, str]]]],
+        stacks: list[tuple[ownership.ResourceKey, str]],
+    ) -> tuple[dict[ownership.ResourceKey, str], list[tuple[str, str, str, str]]]:
+        """``own_resources`` (key -> stack name) and ``own_tags`` rows.
+
+        Only the values of the ownership tag keys are kept; ``aws:`` tags are dropped
+        (``aws:cloudformation:stack-name`` only maps a resource to its stack when
+        ListStackResources did not).
+        """
+        value_keys = self.own.value_keys()
+        resources: dict[ownership.ResourceKey, str] = {}
+        tags: list[tuple[str, str, str, str]] = []
+        for key, stack in stacks:
+            resources.setdefault(key, stack)
+        for key, pairs in tagged:
+            resources.setdefault(key, "")
+            for k, v in pairs:
+                if k == ownership.CFN_STACK_TAG and not resources[key]:
+                    resources[key] = v[:128]
+                if k.lower().startswith("aws:"):
+                    continue
+                tags.append((key[0], key[1], k, v if k.lower() in value_keys else ""))
+        return resources, tags
+
+    def _collect_creators(self, result: CollectResult, snap_id: int) -> None:
+        """Opt-in: the creator of every resource still unowned after the other sources
+        (cloudtrail:LookupEvents, at most MAX_CLOUDTRAIL_LOOKUPS resources per Refresh)."""
+        with closing(self.db_path) as conn:
+            idx = ownership.load_index(conn, snap_id, self.own)
+            unowned = sorted(
+                k for k in ownership.inventory(conn, snap_id) if not idx.resolve([k]).source
+            )
+        if not unowned:
+            return
+        limit = ownership.MAX_CLOUDTRAIL_LOOKUPS
+        if len(unowned) > limit:
+            result.warnings.append(
+                f"cloudtrail:LookupEvents limited to {limit} of {len(unowned)} unowned resources"
+            )
+        ct = self.gw.client("cloudtrail")
+
+        def lookup() -> list[tuple[ownership.ResourceKey, ownership.Principal]]:
+            found = []
+            for key in unowned[:limit]:
+                self.progress.check()
+                principal = _creator(ct, key[1])
+                if principal:
+                    found.append((key, principal))
+            return found
+
+        creators = self._optional(result, "cloudtrail:LookupEvents", lookup)
+        with closing(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO own_resources(snapshot_id, kind, resource_id, creator, creator_kind) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(snapshot_id, kind, resource_id) DO UPDATE SET "
+                "creator=excluded.creator, creator_kind=excluded.creator_kind",
+                [(snap_id, k[0], k[1], p.name, p.kind) for k, p in creators],
+            )
+        log.info("CloudTrail: creator found for %d of %d resource(s)", len(creators), len(unowned))
 
     def _collect_lb_targets(self, result: CollectResult, lbs: list[Any]) -> LbTargetData:
         """Optional enrichment: target groups of each load balancer and their targets.

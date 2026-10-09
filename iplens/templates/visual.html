@@ -157,8 +157,10 @@
     wrapped at <code>- _ . /</code>; <b>Shorten long names</b> cuts them in the middle instead.
     Border, legend and label toggles are remembered per account. Endpoint reach lines are labelled with the endpoint's
     security group name. <b>Group by</b> draws a dashed box (and a coloured outline) around the
-    resources sharing a security group, a tag value, a Terraform root (loaded under Settings) or an
-    environment (colour per environment). <b>Environment</b> shows only the ticked environments
+    resources sharing a security group, a tag value, a Terraform root (loaded under Settings), an
+    environment (colour per environment), an owner (ownership source and value: CloudFormation stack,
+    IaC tag, Terraform, CloudTrail creator or unmanaged — see the Ownership page) or a team (the team
+    tag key of Settings → Ownership). <b>Environment</b> shows only the ticked environments
     (from the Terraform root × environment mapping, else the environment tag set in Settings).
     Exports contain the diagram as currently shown; with <b>Expand all groups</b> (default) every
     collapsed group is exported as its member resources.
@@ -231,7 +233,7 @@
     <span class="legend-item"><i class="box-swatch box-subnet"></i> Subnet</span>
     <span class="legend-item"><i class="node-swatch node-idle"></i> Idle ENI (available)</span>
     <span class="legend-item"><i class="node-swatch node-group"></i> Group (click to expand)</span>
-    <span class="legend-item"><i class="box-swatch box-ctx"></i> Group by: security group / tag / Terraform root</span>
+    <span class="legend-item"><i class="box-swatch box-ctx"></i> Group by: security group / tag / Terraform root / owner / team</span>
     {% if not extended %}
     {% for t in edge_types %}
       <span class="legend-item"><i class="edge-swatch edge-{{ t }}"></i> {{ edge_labels[t] }}</span>
