@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>IPLens</title>
+  <rect width="32" height="32" rx="6" fill="#232f3e"/>
+  <g stroke="#7aa7d8" stroke-width="1.6" stroke-linecap="round">
+    <line x1="14" y1="14" x2="7" y2="8"/>
+    <line x1="14" y1="14" x2="7" y2="21"/>
+    <line x1="14" y1="14" x2="21" y2="7"/>
+  </g>
+  <circle cx="7" cy="8" r="2.4" fill="#7aa7d8"/>
+  <circle cx="7" cy="21" r="2.4" fill="#7aa7d8"/>
+  <circle cx="21" cy="7" r="2.4" fill="#7aa7d8"/>
+  <circle cx="14" cy="14" r="6" fill="none" stroke="#ff9900" stroke-width="2.4"/>
+  <circle cx="14" cy="14" r="2.4" fill="#ff9900"/>
+  <line x1="18.5" y1="18.5" x2="26" y2="26" stroke="#ff9900" stroke-width="3.2" stroke-linecap="round"/>
+</svg>
