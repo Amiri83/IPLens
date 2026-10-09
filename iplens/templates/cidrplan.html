@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% from "_macros.html" import no_data with context %}
+{% block title %}CIDR Planner{% endblock %}
+{% macro status_badge(v) -%}
+  {% if v.status == 'rejected' %}<span class="badge err">rejected</span>
+  {% elif v.status == 'warning' %}<span class="badge warn">check warnings</span>
+  {% else %}<span class="badge ok">no conflict found</span>{% endif %}
+{%- endmacro %}
+{% macro reasons(v) -%}
+  {% if v.rejects or v.warnings %}
+  <ul class="small" style="margin: .2rem 0 0; padding-left: 1.1rem">
+    {% for r in v.rejects %}<li><b>✗</b> {{ r }}</li>{% endfor %}
+    {% for w in v.warnings %}<li class="muted">⚠ {{ w }}</li>{% endfor %}
+  </ul>
+  {% endif %}
+{%- endmacro %}
+{% macro snippet(id, text) -%}
+  <div class="tf-snippet">
+    <button type="button" class="secondary" data-copy="#{{ id }}">Copy</button>
+    <pre class="mono" id="{{ id }}">{{ text }}</pre>
+  </div>
+{%- endmacro %}
+{% block content %}
+<h1>CIDR Planner</h1>
+{% if not snap %}
+  {{ no_data() }}
+{% elif not vpc %}
+  <div class="card muted">No VPC in this snapshot{{ ' (or in scope)' if scope_count }}.</div>
+{% else %}
+<p class="muted small">Read-only: everything below is computed from the latest snapshot and proposed as
+  Terraform to copy. Nothing is created in AWS.</p>
+<form method="get" action="{{ url_for('cidr_planner') }}" class="card row">
+  <div><label for="vpc">VPC</label>
+    <select id="vpc" name="vpc" onchange="this.form.submit()">
+      {% for v in vpcs %}<option value="{{ v.vpc_id }}" {{ 'selected' if v.vpc_id == vpc.vpc_id }}>{{ v.vpc_id }} {{ v.name }} · {{ v.cidrs | join(', ') }}</option>{% endfor %}
+    </select></div>
+  <noscript><div><button type="submit" class="secondary">Show</button></div></noscript>
+</form>
+{% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+<h2>CIDR map</h2>
+{% for m in plan.maps %}
+<section class="card cidr-block">
+  <h3 style="margin-top: 0"><span class="mono">{{ m.cidr }}</span>
+    <span class="badge">{{ 'primary' if m.primary else 'secondary' }}</span>
+    <span class="muted small">· {{ m.allocated }} of {{ m.size }} addresses in subnets ·
+      {{ m.free_total }} free in {{ m.free_range_count }} range(s) ·
+      fragmentation {{ '%.2f' % m.fragmentation }}</span></h3>
+  <div class="cidr-map" role="img" aria-label="subnets and free blocks of {{ m.cidr }}">
+    {% for g in m.segments %}
+      {% if g.free %}<span class="free" style="width: {{ g.pct }}%" title="free {{ g.cidr }}"></span>
+      {% else %}<a class="subnet" style="width: {{ g.pct }}%" href="{{ url_for('subnet', subnet_id=g.subnet_id) }}" title="{{ g.subnet_id }} {{ g.name }} {{ g.cidr }} {{ g.az }}"></a>{% endif %}
+    {% endfor %}
+  </div>
+  <div class="legend"><span><i style="background: var(--used)"></i>subnet</span><span><i style="background: var(--free)"></i>free</span></div>
+  <div class="row" style="align-items: flex-start">
+    <table style="flex: 2 1 420px">
+      <thead><tr><th>Block</th><th>Subnet / free</th><th>AZ</th><th>Addresses</th></tr></thead>
+      <tbody>
+      {% for g in m.segments %}
+        <tr>
+          <td class="mono">{{ g.cidr }}</td>
+          <td>{% if g.free %}<span class="badge ok">free</span>{% else %}<a class="mono" href="{{ url_for('subnet', subnet_id=g.subnet_id) }}">{{ g.subnet_id }}</a> {{ g.name }}{% endif %}</td>
+          <td>{{ g.az }}</td>
+          <td>{{ 2 ** (32 - (g.cidr.split('/')[1] | int)) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <table style="flex: 1 1 260px">
+      <thead><tr><th>Size</th><th>Aligned blocks free</th><th>First free</th></tr></thead>
+      <tbody>
+      {% for p in sizes %}{% set n, first = m.per_size[p] %}
+        <tr><td>/{{ p }}</td><td>{{ n }}</td><td class="mono">{{ first or '–' }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="muted small">Largest free block: <span class="mono">{{ m.largest_free or 'none' }}</span>.
+    Fragmentation = 1 − largest contiguous free range ÷ total free (0: all free space in one range;
+    near 1: scattered small gaps).</p>
+</section>
+{% endfor %}
+
+<h2>Fit subnets</h2>
+<form method="get" action="{{ url_for('cidr_planner') }}" class="card">
+  <input type="hidden" name="vpc" value="{{ vpc.vpc_id }}">
+  <input type="hidden" name="prefix" value="{{ prefix }}">
+  <p class="muted small" style="margin-top: 0">Request subnet sizes (and AZs); each is placed in an aligned block
+    of its size from the free space of every VPC CIDR (largest first, smallest block that fits).
+    AWS reserves 5 addresses per subnet.</p>
+  {% for i in range(fit_rows) %}{% set r = requests[i] if i < requests | length else none %}
+  <div class="fit-row">
+    <select name="size" aria-label="size {{ i + 1 }}">
+      <option value="">–</option>
+      {% for p in fit_sizes %}<option value="{{ p }}" {{ 'selected' if r and r.prefix == p }}>/{{ p }}</option>{% endfor %}
+    </select>
+    <input name="az" list="azs" placeholder="AZ (optional)" value="{{ r.az if r else '' }}" aria-label="AZ {{ i + 1 }}">
+  </div>
+  {% endfor %}
+  <datalist id="azs">{% for az in plan.azs %}<option value="{{ az }}">{% endfor %}</datalist>
+  <button type="submit">Fit</button>
+</form>
+{% if plan.fit %}
+<section class="card fit-result">
+  {% if plan.fit.fits %}
+    <p><span class="badge ok">fits</span> All {{ plan.fit.placements | length }} subnet(s) fit in the free space.</p>
+  {% else %}
+    <p><span class="badge err">doesn't fit</span> {{ plan.fit.missing | length }} of {{ plan.fit.placements | length }}
+      subnet(s) don't fit → need a secondary CIDR (at least /{{ plan.fit.needed_prefix() }}).</p>
+  {% endif %}
+  <table>
+    <thead><tr><th>Requested</th><th>AZ</th><th>Proposed CIDR</th><th>Usable IPs</th></tr></thead>
+    <tbody>
+    {% for p in plan.fit.placements %}
+      <tr><td>/{{ p.request.prefix }}</td><td>{{ p.request.az }}</td>
+        <td class="mono">{{ p.cidr or '' }}{% if not p.cidr %}<span class="badge err">no room</span>{% endif %}</td>
+        <td>{{ p.usable }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if plan.fit_tf %}{{ snippet('tf-fit', plan.fit_tf) }}{% endif %}
+  {% if plan.overflow %}
+    <h3>With a secondary CIDR <span class="mono">{{ plan.overflow.cidr }}</span> {{ status_badge(plan.overflow) }}</h3>
+    {{ reasons(plan.overflow) }}
+    <table>
+      <thead><tr><th>Requested</th><th>AZ</th><th>Proposed CIDR</th></tr></thead>
+      <tbody>{% for p in plan.overflow_fit.placements %}<tr><td>/{{ p.request.prefix }}</td><td>{{ p.request.az }}</td><td class="mono">{{ p.cidr }}</td></tr>{% endfor %}</tbody>
+    </table>
+    {{ snippet('tf-overflow', plan.overflow_tf) }}
+  {% elif not plan.fit.fits %}
+    <p class="muted">No conflict-free secondary CIDR candidate found automatically; check one below.</p>
+  {% endif %}
+</section>
+{% endif %}
+
+<h2>Secondary CIDR</h2>
+<form method="get" action="{{ url_for('cidr_planner') }}" class="card row">
+  <input type="hidden" name="vpc" value="{{ vpc.vpc_id }}">
+  {% for r in requests %}<input type="hidden" name="size" value="{{ r.prefix }}"><input type="hidden" name="az" value="{{ r.az }}">{% endfor %}
+  <div><label for="prefix">Size</label>
+    <select id="prefix" name="prefix">{% for p in vpc_prefixes %}<option value="{{ p }}" {{ 'selected' if p == prefix }}>/{{ p }}</option>{% endfor %}</select></div>
+  <div><label for="check">Check a CIDR</label>
+    <input id="check" name="check" class="mono" placeholder="e.g. 10.0.0.0/16" value="{{ custom }}"></div>
+  <div><button type="submit">Propose / check</button></div>
+  <div class="muted small" style="flex: 1 1 100%">Candidates are checked against every account's VPCs known to IPLens
+    and the Transit Gateway / VPC peering routes of the latest service crawl (Visual → Extended → Crawl services),
+    plus AWS secondary-CIDR restrictions. Accounts that were never refreshed or crawled are not covered.</div>
+</form>
+{% set ns = namespace(i=0) %}
+{% for v in ([plan.custom] if plan.custom else []) + plan.candidates %}{% set ns.i = ns.i + 1 %}
+<section class="card candidate">
+  <b class="mono">{{ v.cidr }}</b> {{ status_badge(v) }}
+  {% if v.pool %}<span class="muted small">from {{ v.pool }}{{ ' (shared address space, RFC 6598)' if v.pool == '100.64.0.0/10' }}</span>
+  {% else %}<span class="muted small">your CIDR</span>{% endif %}
+  {{ reasons(v) }}
+  {% if v.status != 'rejected' %}{{ snippet('tf-cand-' ~ ns.i, tf_secondary(vpc.vpc_id, v.cidr)) }}{% endif %}
+</section>
+{% else %}
+<div class="card muted">No free /{{ prefix }} candidate in the primary's RFC 1918 range or 100.64.0.0/10.</div>
+{% endfor %}
+{% endif %}
+<script src="{{ url_for('static', filename='copy.js') }}" defer></script>
+{% endblock %}
