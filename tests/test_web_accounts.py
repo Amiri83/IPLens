@@ -773,6 +773,35 @@ def test_reset_layout_keeps_views_apart(client, two_accounts):
     assert f"res:{ENI_A}" in client.get(f"/visual?vpc={VPC_A}").data.decode()
 
 
+def test_positions_restored_only_for_their_layout(client, two_accounts):
+    key = f"{VPC_A}:extended"
+    url = f"/visual?vpc={VPC_A}&view=extended"
+    grid = {f"res:{ENI_A}": {"x": 10.0, "y": 20.0}}
+    dagre = {f"res:{ENI_A}": {"x": 30.0, "y": 40.0}}
+    for layout, pos in (("grid", grid), ("dagre", dagre)):
+        resp = _post(
+            client, "/visual/layout", {"vpc": key, "layout": layout, "positions": json.dumps(pos)}
+        )
+        assert resp.status_code == 204
+
+    def shown(page: str) -> dict:
+        return json.loads(page.split('id="visual-positions">', 1)[1].split("</script>", 1)[0])
+
+    def choose(layout: str) -> None:
+        resp = _post(client, "/visual/prefs", {"view": "extended", "layout": layout})
+        assert resp.status_code == 204
+
+    page = client.get(url).data.decode()
+    assert 'data-positions-layout="grid"' in page and shown(page) == grid
+    choose("dagre")
+    page = client.get(url).data.decode()
+    assert 'data-positions-layout="dagre"' in page and shown(page) == dagre
+    choose("circle")
+    assert shown(client.get(url).data.decode()) == {}
+    resp = _post(client, "/visual/layout", {"vpc": key, "layout": "spiral", "positions": "{}"})
+    assert resp.status_code == 400
+
+
 @pytest.mark.parametrize(
     "positions",
     ["not json", "[]", '{"a": {"x": "1", "y": 2}}', '{"a": {"x": 1e99, "y": 2}}', '{"a": 1}'],

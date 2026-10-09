@@ -87,6 +87,35 @@ def test_positions_keyed_per_view():
     assert viewstate.layout_key("", "extended") == ""
 
 
+def test_positions_saved_per_layout(conn):
+    key = viewstate.layout_key(VPC, "extended")
+    grid = {"res:eni-0example0000001": {"x": 10.0, "y": 20.0}}
+    dagre = {"res:eni-0example0000001": {"x": -5.0, "y": 7.5}}
+    viewstate.save_layout(conn, 1, key, grid, "grid")
+    viewstate.save_layout(conn, 1, key, dagre, "dagre")  # keeps the Grid positions
+    assert viewstate.get_layout(conn, 1, key, "grid") == grid
+    assert viewstate.get_layout(conn, 1, key, "dagre") == dagre
+    assert viewstate.get_layout(conn, 1, key, "circle") == {}
+    assert viewstate.get_layouts(conn, 1, key) == {"grid": grid, "dagre": dagre}
+    assert viewstate.get_layout(conn, 2, key, "grid") == {}
+    with pytest.raises(ValueError, match="layout"):
+        viewstate.save_layout(conn, 1, key, grid, "spiral")
+    assert viewstate.reset_layout(conn, 1, key)  # forgets every layout of the view
+    assert viewstate.get_layouts(conn, 1, key) == {}
+
+
+def test_positions_saved_before_layouts_belong_to_the_chosen_layout(conn):
+    legacy = {"res:eni-0example0000001": {"x": 1.0, "y": 2.0}}
+    conn.execute(
+        "INSERT INTO visual_layouts(account_ref, vpc_id, positions) VALUES(1, ?, ?)",
+        (VPC, json.dumps(legacy)),
+    )
+    assert viewstate.get_layout(conn, 1, VPC, "dagre") == legacy
+    assert viewstate.get_layouts(conn, 1, VPC, "dagre") == {"dagre": legacy}
+    viewstate.save_layout(conn, 1, VPC, {}, "grid")  # the legacy row is upgraded
+    assert viewstate.get_layouts(conn, 1, VPC) == {"grid": {}}
+
+
 # -- visual.js wiring (source checks) -------------------------------------------------------
 
 
@@ -116,6 +145,23 @@ def test_toolbar_buttons_are_wired_for_both_views():
     # Both views go through the same layout dispatcher.
     assert "const routes = runLayout(cy, edges, drawn);" in src  # Extended view
     assert "\n        runLayout(cy, edges);" in src  # IP view
+
+
+def test_fit_and_layout_change_wiring():
+    src = _js()
+    # Fit shows everything; only the page load stops at a readable zoom.
+    assert 'getElementById("zoom-fit").addEventListener("click", () => fitShown());' in src
+    assert src.count("fitShown(true)") == 1
+    assert "if (!firstLoad || !ext ||" in src
+    # Saved positions belong to one layout; a layout change lays out afresh.
+    assert "if (savedLayout !== layoutSelect.value) return cy.collection();" in src
+    change = src[src.index('layoutSelect.addEventListener("change"') :]
+    assert change.index("savedLayout = null;") < change.index("relayout();")
+    assert "layout: savedLayout, positions: JSON.stringify(saved)" in src
+    # A failing layout is logged and shown, not swallowed.
+    run = src[src.index("\n  function runLayout(") : src.index("// -- focus (single click)")]
+    assert "console.error(" in run and "layoutError.hidden = false" in run
+    assert "console.warn(" not in run
 
 
 # -- block layout run under node with the vendored cytoscape.js ----------------------------

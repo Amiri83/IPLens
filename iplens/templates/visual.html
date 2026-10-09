@@ -151,8 +151,10 @@
     (more than 10 resources of one type in a subnet) to expand or collapse it. Solid lines are
     load balancer targets and ECS services; dashed lines are security group based: endpoint reach
     (the endpoint's security group allows tcp/443 from the resource) and SG references.
-    Drag resources to rearrange them: positions are saved for this account, VPC and view and
-    override the automatic layout until you press <b>Reset layout</b>. <b>Layout</b> (Grid by
+    Drag resources to rearrange them: positions are saved for this account, VPC, view and layout,
+    and restored when the page is opened with that layout until you press <b>Reset layout</b>;
+    choosing another layout always lays the diagram out afresh. <b>Fit</b> shows every visible
+    node. <b>Layout</b> (Grid by
     default) and the expanded groups are remembered per account and view. Full names are shown,
     wrapped at <code>- _ . /</code>; <b>Shorten long names</b> cuts them in the middle instead.
     Border, legend and label toggles are remembered per account. Endpoint reach lines are labelled with the endpoint's
@@ -187,6 +189,7 @@
        data-src="{{ url_for('visual_data', vpc=vpc, view='extended' if extended else None) }}"
        data-vpc="{{ vpc }}"
        data-layout-key="{{ layout_key }}"
+       data-positions-layout="{{ layout }}"
        data-mode="{{ view_mode }}"
        data-icon-root="{{ url_for('static', filename='icons/') }}"
        data-icons="{{ url_for('static', filename='icons/aws/') }}"
@@ -219,6 +222,7 @@
 {% endif %}
 <script type="application/json" id="visual-positions">{{ positions | tojson }}</script>
 <script type="application/json" id="visual-expanded">{{ expanded | tojson }}</script>
+<p class="flash error" id="cy-layout-error" role="alert" hidden></p>
 <p class="muted" id="cy-status"></p>
 <p class="muted small" id="cy-note" aria-live="polite"></p>
 <section class="card visual-legend" id="visual-legend" aria-labelledby="legend-title" {{ 'hidden' if not prefs.show_legend }}>

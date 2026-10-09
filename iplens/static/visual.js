@@ -29,8 +29,9 @@
   const container = document.getElementById("cy");
   if (!container || typeof cytoscape === "undefined") return;
   const extended = container.dataset.mode === "extended";
-  // The Extended view draws bigger icons and labels so that it stays readable at Fit;
-  // Fit never zooms out below MIN_READABLE_ZOOM there (pan or zoom out to see the rest).
+  // The Extended view draws bigger icons and labels so that it stays readable; its first
+  // fit when the page loads stops at MIN_READABLE_ZOOM (pan or zoom out to see the rest),
+  // while the Fit button always shows every visible node.
   const ICON = extended ? 56 : 44;
   const RES_FONT = extended ? 12 : 10;
   const MIN_READABLE_ZOOM = 0.6;
@@ -84,8 +85,12 @@
   const PALETTE = ["#2457c5", "#c2410c", "#2f8f4e", "#9333ea", "#b0469b", "#0e7490",
     "#a16207", "#be123c", "#4d7c0f", "#475569"];
   const UNMANAGED_COLOR = "#8a94a3";
-  // Dragged positions for this account + VPC: {node id: {x, y}}.
+  // Dragged positions for this account, VPC and view in the layout savedLayout:
+  // {node id: {x, y}}. They are restored only while that layout is shown; choosing
+  // another layout lays the diagram out afresh (the server keeps every layout's positions).
   let saved = JSON.parse(document.getElementById("visual-positions").textContent || "{}");
+  let savedLayout = container.dataset.positionsLayout || layoutSelect.value;
+  const layoutError = document.getElementById("cy-layout-error");
 
   // -- labels (full names arrive as label_*; the page wraps or shortens them) ---------
 
@@ -1333,8 +1338,10 @@
     return !extended || (!focusId && !laneMode());
   }
 
-  // Returns the nodes moved to a saved position.
+  // Returns the nodes moved to a saved position (none unless the saved positions were
+  // dragged in the layout shown).
   function applySaved(cy) {
+    if (savedLayout !== layoutSelect.value) return cy.collection();
     const moved = leaves(cy).filter((n) => Boolean(saved[n.id()]));
     cy.batch(() => {
       moved.forEach((n) => {
@@ -1351,14 +1358,20 @@
       note.textContent = "Positions are not saved in focus mode or with swimlanes.";
       return;
     }
+    // First drag in a freshly laid out layout: its positions start from what is shown.
+    if (savedLayout !== layoutSelect.value) {
+      saved = {};
+      savedLayout = layoutSelect.value;
+    }
     // Merge, so members of a collapsed group keep their saved spot.
     leaves(cy).forEach((n) => {
       const p = n.position();
       saved[n.id()] = { x: Math.round(p.x * 10) / 10, y: Math.round(p.y * 10) / 10 };
     });
     clearTimeout(saveTimer);
+    const fields = { vpc: layoutKey, layout: savedLayout, positions: JSON.stringify(saved) };
     saveTimer = setTimeout(() => {
-      post(container.dataset.layoutUrl, { vpc: layoutKey, positions: JSON.stringify(saved) })
+      post(container.dataset.layoutUrl, fields)
         .then(() => { note.textContent = "Layout saved for this account, VPC and view."; })
         .catch((err) => { note.textContent = `Could not save the layout (${err.message}).`; });
     }, SAVE_DELAY_MS);
@@ -1481,9 +1494,11 @@
 
   /* The chosen layout of either view: dagre (IP view: top-down dagreLayout, Extended
      view: left-to-right extLayout, which returns dagre's edge routes), else blockLayout.
-     Falls back to the grid. Returns the edge routes (empty unless dagre). */
+     A failure is logged to the console and shown above the status line, and the grid
+     layout is used instead. Returns the edge routes (empty unless dagre). */
   function runLayout(cy, edges, drawn) {
     const name = layoutSelect.value;
+    layoutError.hidden = true;
     try {
       if (name === "dagre") {
         if (extended) return extLayout(cy, drawn);
@@ -1493,9 +1508,22 @@
         blockLayout(cy, name);
       }
     } catch (err) {
-      console.warn(`${name} layout failed, using the grid layout`, err);
-      cy.nodes(".pin").remove();
-      blockLayout(cy, "grid");
+      console.error(`The ${name} layout failed`, err);
+      const label = layoutSelect.selectedOptions[0] ? layoutSelect.selectedOptions[0].textContent : name;
+      let fallback = " Showing the Grid layout instead.";
+      if (name !== "grid") {
+        try {
+          cy.nodes(".pin").remove();
+          blockLayout(cy, "grid");
+        } catch (gridErr) {
+          console.error("The grid layout failed too", gridErr);
+          fallback = "";
+        }
+      } else {
+        fallback = "";
+      }
+      layoutError.textContent = `The ${label} layout failed (${err.message}).${fallback}`;
+      layoutError.hidden = false;
     }
     return new Map();
   }
@@ -1707,7 +1735,7 @@
       applyFocus(cy, focused);
     };
     const refreshContext = () => syncContext(cy, data);
-    // Saved (dragged) positions always win over the automatic layout.
+    // Dragged positions of the layout shown win over the automatic layout.
     const relayout = () => {
       if (ext) {
         const drawn = syncExtEdges(cy, edges);
@@ -1725,11 +1753,12 @@
       }
       refreshContext();
     };
-    // Extended view: never below a readable zoom; a larger diagram starts at its top left.
-    const fitShown = () => {
+    // Fits every visible element. Only the first fit of the Extended view (page load)
+    // stops at a readable zoom: a larger diagram then starts at its top left.
+    const fitShown = (firstLoad = false) => {
       const shown = cy.elements(":visible");
       cy.fit(shown, 30);
-      if (!ext || shown.empty() || cy.zoom() >= MIN_READABLE_ZOOM) return;
+      if (!firstLoad || !ext || shown.empty() || cy.zoom() >= MIN_READABLE_ZOOM) return;
       const bb = shown.boundingBox();
       cy.zoom(MIN_READABLE_ZOOM);
       cy.pan({ x: 30 - bb.x1 * MIN_READABLE_ZOOM, y: 30 - bb.y1 * MIN_READABLE_ZOOM });
@@ -1774,7 +1803,7 @@
     refreshEnvFilters();
     if (ext) applyServiceFilter(cy);
     relayout();
-    fitShown();
+    fitShown(true);
 
     if (ext) {
       // Click a node: its neighbourhood only. Click a group: expand / collapse it;
@@ -1898,7 +1927,7 @@
     };
     document.getElementById("zoom-in").addEventListener("click", () => zoomBy(1.25));
     document.getElementById("zoom-out").addEventListener("click", () => zoomBy(0.8));
-    document.getElementById("zoom-fit").addEventListener("click", fitShown);
+    document.getElementById("zoom-fit").addEventListener("click", () => fitShown());
     const expandAll = (on) => {
       cy.nodes(".group").forEach((g) => (ext ? setExpanded(cy, g, on) : toggleGroup(cy, g, on)));
       relayout();
@@ -1907,7 +1936,10 @@
     };
     document.getElementById("expand-all").addEventListener("click", () => expandAll(true));
     document.getElementById("collapse-all").addEventListener("click", () => expandAll(false));
+    // A new layout is laid out afresh: dragged positions are restored only on page load,
+    // for the layout they were dragged in (the server keeps them).
     layoutSelect.addEventListener("change", () => {
+      savedLayout = null;
       relayout();
       fitShown();
       savePrefs({ view: view, layout: layoutSelect.value });
