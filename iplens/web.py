@@ -772,6 +772,11 @@ def _register(app: Flask) -> None:
         # Each view keeps its own layout choice, expanded groups and dragged positions.
         layout_key = viewstate.layout_key(vpc, mode)
         has_state = ref is not None and bool(vpc)
+        layout = (
+            viewstate.get_view_layout(_db(), ref, mode)
+            if ref is not None
+            else viewstate.DEFAULT_LAYOUT
+        )
         return render_template(
             "visual.html",
             snap=snap,
@@ -798,11 +803,10 @@ def _register(app: Flask) -> None:
             group_by=group_by if group_by in GROUP_BY else "",
             group_tag=request.args.get("tag", "")[:128],
             layouts=viewstate.LAYOUTS,
-            layout=viewstate.get_view_layout(_db(), ref, mode)
-            if ref is not None
-            else viewstate.DEFAULT_LAYOUT,
+            layout=layout,
             layout_key=layout_key,
-            positions=viewstate.get_layout(_db(), ref, layout_key) if has_state else {},
+            # Only the positions dragged in the chosen layout are restored.
+            positions=viewstate.get_layout(_db(), ref, layout_key, layout) if has_state else {},
             expanded=viewstate.get_expanded(_db(), ref, mode, vpc) if has_state else [],
             legend_icons=_legend_icons(),
         )
@@ -869,12 +873,16 @@ def _register(app: Flask) -> None:
     def visual_layout_save():
         ref = _active_or_400()
         vpc = _visual_vpc()
+        # The layout the positions were dragged in (older pages: the default layout).
+        layout = request.form.get("layout", viewstate.DEFAULT_LAYOUT)
+        if layout not in viewstate.LAYOUTS:
+            abort(400, "invalid layout")
         try:
             positions = viewstate.parse_positions(request.form.get("positions", ""))
         except ValueError as exc:
             abort(400, str(exc))
         with closing(_paths().db_path) as conn:
-            viewstate.save_layout(conn, ref, vpc, positions)
+            viewstate.save_layout(conn, ref, vpc, positions, layout)
         return "", 204
 
     @app.post("/visual/layout/reset")

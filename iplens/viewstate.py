@@ -37,6 +37,9 @@ DEFAULT_LAYOUT = "grid"
 # The Extended view's dragged positions are stored under "<vpc id>:extended", so that
 # dragging in one view never moves nodes in the other (the IP view keeps the bare id).
 EXT_LAYOUT_SUFFIX = ":extended"
+# A saved layout row holds {"layouts": {layout name: {node id: {x, y}}}}: dragged positions
+# belong to the layout they were dragged in and are restored only for that layout.
+LAYOUTS_FIELD = "layouts"
 
 
 def get_prefs(conn: sqlite3.Connection, account_ref: int) -> dict[str, bool]:
@@ -115,21 +118,47 @@ def _coord(v: Any) -> bool:
     )
 
 
-def get_layout(conn: sqlite3.Connection, account_ref: int, vpc_id: str) -> dict[str, Any]:
+def get_layouts(
+    conn: sqlite3.Connection, account_ref: int, vpc_id: str, legacy_layout: str = DEFAULT_LAYOUT
+) -> dict[str, dict[str, Any]]:
+    """Dragged positions of ``vpc_id`` per layout name: ``{layout: {node id: {x, y}}}``.
+
+    Rows written before positions were kept per layout hold a bare ``{node id: {x, y}}``
+    and are read as positions of ``legacy_layout`` (the view's chosen layout)."""
     row = conn.execute(
         "SELECT positions FROM visual_layouts WHERE account_ref=? AND vpc_id=?",
         (account_ref, vpc_id),
     ).fetchone()
-    return json.loads(row["positions"]) if row else {}
+    doc = json.loads(row["positions"]) if row else {}
+    if not isinstance(doc, dict):
+        return {}
+    if LAYOUTS_FIELD in doc:
+        return {k: v for k, v in doc[LAYOUTS_FIELD].items() if k in LAYOUTS}
+    return {legacy_layout: doc} if doc else {}
+
+
+def get_layout(
+    conn: sqlite3.Connection, account_ref: int, vpc_id: str, layout: str = DEFAULT_LAYOUT
+) -> dict[str, Any]:
+    """Dragged positions of ``vpc_id`` saved under ``layout``."""
+    return get_layouts(conn, account_ref, vpc_id, layout).get(layout, {})
 
 
 def save_layout(
-    conn: sqlite3.Connection, account_ref: int, vpc_id: str, positions: dict[str, Any]
+    conn: sqlite3.Connection,
+    account_ref: int,
+    vpc_id: str,
+    positions: dict[str, Any],
+    layout: str = DEFAULT_LAYOUT,
 ) -> None:
+    """Store ``positions`` as the dragged positions of ``layout``; other layouts keep theirs."""
+    if layout not in LAYOUTS:
+        raise ValueError(f"unknown layout: {layout!r}")
+    layouts = {**get_layouts(conn, account_ref, vpc_id, layout), layout: positions}
     conn.execute(
         "INSERT INTO visual_layouts(account_ref, vpc_id, positions) VALUES(?,?,?) "
         "ON CONFLICT(account_ref, vpc_id) DO UPDATE SET positions=excluded.positions",
-        (account_ref, vpc_id, json.dumps(positions)),
+        (account_ref, vpc_id, json.dumps({LAYOUTS_FIELD: layouts})),
     )
 
 
