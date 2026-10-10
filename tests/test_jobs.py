@@ -204,3 +204,20 @@ def test_jobs_script_parses():
         [shutil.which("node"), "--check", str(path)], capture_output=True, text=True, timeout=30
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_shutdown_cancels_running_jobs_and_waits_for_them(db_path):
+    mgr = jobs.JobManager(db_path)
+    started = threading.Event()
+
+    def work(ctx):
+        started.set()
+        while True:
+            ctx.check()
+            threading.Event().wait(0.01)
+
+    job = mgr.start(1, "refresh", work)
+    assert started.wait(WAIT)
+    assert mgr.shutdown(timeout=WAIT) == [job["id"]]
+    assert mgr.status(job["id"])["state"] == jobs.CANCELLED
+    assert mgr.shutdown() == []  # nothing left running

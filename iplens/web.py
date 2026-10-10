@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -115,14 +116,30 @@ OWN_FILTERS = {
 MAX_CRAWL_WARNINGS_FLASHED = 8
 
 
-def host_allowed(host: str, port: int | None) -> bool:
+def _ip_literal(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name.removeprefix("[").removesuffix("]"))
+    except ValueError:
+        return False
+    return True
+
+
+def host_allowed(host: str, port: int | None, *, ip_literals: bool = False) -> bool:
     """True if ``host`` (a raw Host header) names this local server.
 
     With a known ``port`` the header must carry exactly that port (a bare name
     is only valid for port 80). With ``port=None`` any numeric port is accepted.
+    ``ip_literals`` (``iplens --allow-remote``) also accepts any IP address as the
+    name: DNS rebinding always arrives under a hostname, never an IP literal.
     """
-    name, sep, host_port = host.strip().lower().partition(":")
-    if name not in ALLOWED_HOSTS:
+    host = host.strip().lower()
+    if host.startswith("["):  # [IPv6]:port
+        name, _, rest = host.partition("]")
+        name += "]"
+        sep, host_port = (":", rest[1:]) if rest.startswith(":") else ("", rest)
+    else:
+        name, sep, host_port = host.partition(":")
+    if name not in ALLOWED_HOSTS and not (ip_literals and _ip_literal(name)):
         return False
     if port is None:
         return not sep or host_port.isdigit()
@@ -200,13 +217,15 @@ def create_app(
     terraform_bin: str | None = None,
     terraform_runner: tfrepo.Runner | None = None,
     scheduler_enabled: bool | None = None,
+    allow_remote: bool = False,
 ) -> Flask:
     """Build the app. ``port`` is the port the server listens on; when given,
     the Host header must be ``127.0.0.1:<port>`` or ``localhost:<port>``.
     ``terraform_bin`` (default: found on PATH at sync time) and ``terraform_runner``
     (default: the cancellable :func:`tfrepo.run_process`) are for tests; the command
     allowlist applies to both. ``scheduler_enabled`` (default: not ``testing``) starts the
-    scheduled-Refresh thread (:mod:`iplens.scheduler`)."""
+    scheduled-Refresh thread (:mod:`iplens.scheduler`). ``allow_remote`` (``iplens
+    --allow-remote``) also accepts IP-address Host headers (see :func:`host_allowed`)."""
     paths = default_paths(home).ensure()
     init_db(paths.db_path)
     box = SecretBox.from_path(paths.key_path)
@@ -229,6 +248,7 @@ def create_app(
         "accounts": account_store,
         "gateway_factory": gateway_factory or AwsGateway.from_account,
         "port": port,
+        "allow_remote": allow_remote,
         "terraform_bin": terraform_bin,
         "tf_runner": terraform_runner or tfrepo.run_process,
         # Encrypts the "extra backend-config" values of s3-backend roots at rest.
@@ -249,6 +269,21 @@ def create_app(
     if scheduler_enabled if scheduler_enabled is not None else not testing:
         sched.start()
     return app
+
+
+def shutdown_app(app: Flask, timeout: float = 10.0) -> None:
+    """Stop the app's background work (server shutdown): the scheduled-Refresh thread,
+    running jobs (cancelled, waited for up to ``timeout`` seconds) and any terraform
+    process still left."""
+    ext = app.extensions["iplens"]
+    ext["scheduler"].stop()
+    cancelled = ext["jobs"].shutdown(timeout)
+    stopped = tfrepo.stop_all_processes()
+    log.info(
+        "IPLens stopped (%d job(s) cancelled, %d terraform process(es) stopped)",
+        len(cancelled),
+        stopped,
+    )
 
 
 def _ext() -> dict[str, Any]:
@@ -427,7 +462,7 @@ def _register(app: Flask) -> None:
     def _trusted_host() -> None:
         # Raw header: werkzeug's request.host drops default ports.
         host = request.headers.get("Host", "")
-        if not host_allowed(host, _ext()["port"]):
+        if not host_allowed(host, _ext()["port"], ip_literals=_ext()["allow_remote"]):
             log.warning(
                 "rejected request %s with untrusted Host header %r", request.path, host[:100]
             )

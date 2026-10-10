@@ -41,6 +41,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -765,6 +766,10 @@ KILL_GRACE = 5.0
 # How often a running command checks for a cancel request.
 POLL_INTERVAL = 0.1
 
+# Terraform processes run_process() has started and not yet reaped (stop_all_processes).
+_live: set[subprocess.Popen] = set()
+_live_lock = threading.Lock()
+
 
 class CommandCancelled(JobCancelled):
     """The job was cancelled while a terraform command ran; the process was stopped."""
@@ -826,6 +831,8 @@ def run_process(
         shell=False,
         start_new_session=os.name == "posix",
     )
+    with _live_lock:
+        _live.add(proc)
     try:
         while True:
             try:
@@ -841,6 +848,19 @@ def run_process(
     except BaseException:
         stop_process(proc, grace)  # cancel, timeout or anything else: never leave it running
         raise
+    finally:
+        with _live_lock:
+            _live.discard(proc)
+
+
+def stop_all_processes(grace: float = KILL_GRACE) -> int:
+    """Stop every terraform process :func:`run_process` still has running (shutdown);
+    returns how many were stopped."""
+    with _live_lock:
+        procs = list(_live)
+    for proc in procs:
+        stop_process(proc, grace)
+    return len(procs)
 
 
 def run_terraform(

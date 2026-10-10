@@ -204,6 +204,31 @@ def test_host_allowed(host, port, ok):
     assert host_allowed(host, port) is ok
 
 
+@pytest.mark.parametrize(
+    "host, ok",
+    [
+        ("10.0.0.5:8077", True),  # --allow-remote: an IP address is no rebinding vector
+        ("[2001:db8::5]:8077", True),
+        ("localhost:8077", True),
+        ("10.0.0.5:9999", False),  # the port still has to match
+        ("[2001:db8::5]", False),
+        ("evil.example:8077", False),
+        ("10.0.0.5.evil.example:8077", False),
+    ],
+)
+def test_host_allowed_with_ip_literals(host, ok):
+    assert host_allowed(host, 8077, ip_literals=True) is ok
+    if ok and not host.startswith("localhost"):
+        assert host_allowed(host, 8077) is False  # local-only by default
+
+
+def test_ip_host_header_is_served_only_when_remote_is_allowed(home):
+    for allow in (False, True):
+        app = create_app(home, testing=True, port=8077, allow_remote=allow)
+        resp = app.test_client().get("/", headers={"Host": "10.0.0.5:8077"})
+        assert (resp.status_code == 400) is not allow
+
+
 def test_dns_rebinding_host_rejected(home):
     app = create_app(home, testing=True, port=8077)
     c = app.test_client()
