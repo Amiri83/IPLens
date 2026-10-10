@@ -266,3 +266,19 @@ def test_cancel_leaves_no_orphan_process(app, repo, tmp_path):
     assert result.status == tfrepo.CANCELLED
     assert _envs(app, repo_id)[KEY]["status"] == "cancelled"
     assert not data_dir.exists()
+
+
+def test_stop_all_processes_stops_commands_still_running():
+    spawner = Spawner()
+    runner = functools.partial(tfrepo.run_process, popen=spawner, poll=0.01)
+    thread = threading.Thread(
+        target=runner, args=([TF, "show", "-json"],), kwargs={"cwd": ".", "env": {}, "timeout": 60}
+    )
+    thread.start()
+    assert spawner.started.wait(5)
+    assert tfrepo.stop_all_processes(grace=0.2) == 1
+    thread.join(5)
+    (proc,) = spawner.procs
+    assert proc.terminated and proc.returncode is not None
+    assert not thread.is_alive()
+    assert tfrepo.stop_all_processes() == 0  # reaped processes leave the registry

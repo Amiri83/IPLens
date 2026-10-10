@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.1 – unreleased
+
+### Changed
+
+- `iplens` now serves the UI with **waitress** (8 threads, no `Server` header) instead of the
+  Flask development server, which is only used with `--debug`.
+- Clean startup: one line `IPLens <version> running at http://127.0.0.1:<port>  (Ctrl+C to stop)
+  · data: <dir> · log: <file>` instead of the Flask / Werkzeug banner; the UI opens in the web
+  browser when a desktop session is available (`--no-browser` to skip).
+- Graceful shutdown on Ctrl+C / SIGTERM: the scheduled Refresh stops, running jobs are cancelled
+  and any terraform process left is stopped.
+
+### Security
+
+- A non-loopback `--host` is refused unless `--allow-remote` is passed; IPLens then prints a
+  warning that there is no authentication and accepts IP-address `Host` headers (hostnames other
+  than `localhost` stay rejected as DNS-rebinding protection).
+
 ## 1.0.0 – unreleased
 
 First public release, published to PyPI as `aws-iplens` (command `iplens`).

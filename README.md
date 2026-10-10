@@ -50,9 +50,14 @@ python3 -m venv .venv
 iplens                         # http://127.0.0.1:8077
 iplens --port 8080             # another port
 iplens --home /path/to/data    # another data directory (default: $IPLENS_HOME or ~/.iplens)
+iplens --no-browser            # do not open the browser
+iplens --debug                 # Flask development server with the debugger (development only)
 ```
 
-Open the printed URL in a browser. AWS credentials are configured per account in the UI
+IPLens is served by [waitress](https://docs.pylonsproject.org/projects/waitress/) and prints one
+line with its URL, data directory and log file. With a desktop session the UI opens in the web
+browser; otherwise open the printed URL. Ctrl+C stops it cleanly (running jobs are cancelled and
+terraform processes stopped). AWS credentials are configured per account in the UI
 (Settings → Accounts); see below.
 
 ## Data location
@@ -71,8 +76,9 @@ mode `0700`). Delete it to reset IPLens completely.
 ## Security
 
 - **Local only.** The server binds to `127.0.0.1` by default and rejects requests whose `Host`
-  header is not a local name (DNS-rebinding protection). Do not expose it with `--host 0.0.0.0`
-  on a shared network: it has no login.
+  header is not a local name (DNS-rebinding protection). A non-loopback `--host` is refused
+  unless `--allow-remote` is passed (IP-address `Host` headers are then accepted too); it has no
+  login, so only do that on a trusted network.
 - **Read-only AWS access.** Every AWS call goes through an allowlist guard (see
   [Read-only by construction](#read-only-by-construction)); IPLens never changes your account.
 - **Secrets.** Access keys and session tokens are Fernet-encrypted in SQLite (or kept in memory

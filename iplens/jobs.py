@@ -445,6 +445,18 @@ class JobManager:
         log.info("job %s: cancel requested", job_id)
         return True
 
+    def shutdown(self, timeout: float = 10.0) -> list[str]:
+        """Cancel every running job and wait up to ``timeout`` seconds in total for
+        their threads (a running terraform command is stopped by its cancel check);
+        returns the ids of the jobs that were cancelled."""
+        with self._lock:
+            ids = [j.id for j in self._jobs.values() if j.state == RUNNING]
+        cancelled = [job_id for job_id in ids if self.cancel(job_id)]
+        deadline = time.monotonic() + timeout
+        for job_id in cancelled:
+            self.wait(job_id, max(deadline - time.monotonic(), 0.0))
+        return cancelled
+
     def wait(self, job_id: str, timeout: float | None = None) -> bool:
         """Block until a background job ends (tests); True if it has."""
         with self._lock:
