@@ -1,6 +1,33 @@
 # IPLens
 Local web app for private IPv4 usage visibility &amp; optimization across one or more AWS accounts
 
+## Features
+
+- **Discovery** – read-only snapshots of VPCs, subnets, ENIs and their private IPs per account,
+  with a VPC → subnet tree and a per-subnet address grid.
+- **IP List** – every private IP in one filterable table (VPC, subnet, resource type, status,
+  environment, owner), exportable to Excel.
+- **Visual** – per-VPC diagram of subnets and resource ENIs with AWS icons, several layouts and
+  SVG / draw.io export.
+- **Extended view** – optional crawl of regional services (SNS, SQS, DynamoDB, EventBridge, S3,
+  API Gateway, Step Functions, Lambda, ECS, MSK, ...) and network edges, each connection ranked by
+  evidence; opt-in flow log analysis.
+- **Ownership** – who manages each resource: CloudFormation, IaC tags, optional Terraform state,
+  optional CloudTrail creator, or unmanaged; plus tag gaps.
+- **Trends** – scheduled refresh, snapshot retention with daily downsampling, used-IP charts and
+  a "full in ~N days" forecast per subnet and VPC.
+- **Diff** – compare two snapshots: ENIs / IPs added, removed and changed, net delta per subnet,
+  top consumers.
+- **CIDR planner** – free blocks and fragmentation per VPC CIDR, a Fit tool for new subnets and
+  secondary-CIDR proposals checked for overlaps.
+- **Report** – one self-contained, printable HTML report per account, optionally with identifiers
+  redacted.
+- **Rules & Suggestions** – IP-saving suggestions, filtered by your own rules (GUI or YAML).
+- **Terraform** (optional) – read-only sync of local Terraform repos for ownership, environments
+  and drift.
+- **Multi-account, local and read-only** – one local app for many accounts; every AWS call passes
+  a read-only allowlist guard.
+
 ## Install
 
 Requires Python 3.11+. The PyPI distribution is `aws-iplens`; the command it installs is `iplens`.
@@ -143,6 +170,69 @@ mode `0700`). Delete it to reset IPLens completely.
    greyed out together with the IPs it would have saved.
 7. **Logs** shows the application log file.
 
+## Trends
+
+**Settings → Accounts** sets a scheduled Refresh per account (off, every hour, every 6 hours,
+every 24 hours); it runs while the app is running. **Settings → Snapshot retention** bounds the
+history: snapshots older than the retention window (default 90 days) are deleted and those older
+than the downsample threshold (default 7 days) are thinned to one per UTC day; each account's
+latest snapshot is always kept. The **Trends** page charts used IPs per subnet and VPC over 7, 30
+or 90 days and fits a linear forecast ("full in ~N days" or "stable/declining", with a confidence
+note below 5 points). Subnets forecast to fill within 30 days get a badge on Discovery.
+
+## Diff
+
+**Diff** compares two successful snapshots of the active account (by default the latest and the
+one before). It lists ENIs and IPs added, removed and changed, grouped by resource type, owner and
+environment, with the net IP delta per subnet and the top consumers – the resources whose IP count
+grew the most.
+
+## CIDR planner
+
+**CIDR Planner** shows, per VPC CIDR, the subnets, the free blocks between them, how many aligned
+/20 … /28 blocks still fit and a fragmentation score. The **Fit** tool carves requested subnet
+sizes (optionally per AZ) out of the free space. **Secondary CIDR** proposals – or a CIDR you type
+in – are checked against the AWS association restrictions and for overlaps with every network
+IPLens knows about: all accounts' VPCs and routes to Transit Gateways and peering connections. It
+works on stored snapshot data only and never creates anything; a Terraform snippet is shown to
+copy.
+
+## Report
+
+**Report** renders one self-contained HTML document per account (inline CSS and SVG, no scripts
+or external assets) to print to PDF or share: summary and at-risk subnets, top IP consumers, the
+used-IP trend, suggestions allowed / blocked by rules, CIDR headroom with a secondary-CIDR
+recommendation and ownership coverage. It can be limited to one environment. The **redact
+identifiers** option replaces account ids, ARNs, IPs / CIDRs and resource ids with stable
+keyed-hash placeholders (e.g. `[ip:3fa2c1d0e4]/24`), so relations inside the report survive
+while the values cannot be recovered.
+
+## Ownership
+
+The **Ownership** page shows who manages each resource, first match wins: CloudFormation stack,
+IaC tag, Terraform state (optional, off by default), CloudTrail creator (opt-in, last 90 days
+only) or *unmanaged*. It counts resources per source and lists unmanaged resources and tag gaps.
+Tag keys and CI role patterns are chosen in **Settings → Ownership**. See
+[Using IPLens](#using-iplens) step 5 for details.
+
+## Extended view
+
+The **Extended view** tab of Visual adds regional services and external nodes (Transit Gateway,
+peering, internet) around a VPC. **Crawl services** is opt-in and every source is optional: a
+missing permission becomes a crawl warning. Each connection carries its strongest evidence
+(*observed* > *configured* > *permitted* > *referenced*); **Flow logs** is a separate opt-in that
+shows the estimated scan size first and stores only aggregates. See
+[Using IPLens](#using-iplens) step 4 for details.
+
+## Terraform (optional)
+
+Terraform is **not required**: ownership is AWS-first, and the Terraform enrichment is off by
+default. When enabled, IPLens discovers roots and environments in local repositories and reads
+their state – straight from S3 for `s3` backends, from the file for local backends, otherwise
+through an allowlisted `terraform init` / `show -json` (never `plan`, `apply` or `state`). The
+state adds ownership, environments, drift (in AWS but not in Terraform and vice versa) and
+"managed elsewhere" markers, shown in the collapsed Terraform section of the Ownership page.
+
 ## Read-only by construction
 
 Every boto3 client is created through `iplens.aws.AwsGateway`, which registers a botocore
@@ -181,6 +271,35 @@ warning): `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:Lis
 `kafka:ListClustersV2` (the MSK list call that covers provisioned and serverless clusters).
 Flow logs: `ec2:DescribeFlowLogs`, `logs:DescribeLogGroups`, `logs:StartQuery`,
 `logs:GetQueryResults`, `logs:StopQuery`.
+
+### AWS permissions per feature
+
+All permissions are read-only. **Required** ones are needed for a Refresh; **optional** ones can
+be left out – the feature or source is skipped with a Refresh / crawl warning (or, for opt-in
+sources, simply not enabled).
+
+| feature | AWS permissions | required? |
+|---|---|---|
+| Discovery / Refresh (also IP List, Visual IP view, scheduled Refresh) | `sts:GetCallerIdentity`, `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, `ec2:DescribeNetworkInterfaces`, `ec2:DescribeVpcEndpoints`, `lambda:ListFunctions`, `elasticloadbalancing:DescribeLoadBalancers` | **required** |
+| Account alias in the header | `iam:ListAccountAliases` | optional (falls back to account id / display name) |
+| Visual: LB → target and security group connections | `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth`, `ec2:DescribeSecurityGroups` | optional (connections left out) |
+| Ownership: tags, CloudFormation | `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources` | optional (skipped with warning) |
+| Ownership: CloudTrail creator | `cloudtrail:LookupEvents` | optional, **opt-in** in Settings |
+| Extended view: services | `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:ListTables`, `dynamodb:DescribeTable`, `events:List*`, `s3:ListAllMyBuckets`, `s3:GetBucketNotification`, `apigateway:GET`, `states:List*`, `states:DescribeStateMachine`, `secretsmanager:ListSecrets`, `lambda:ListEventSourceMappings`, `ecs:List*`, `ecs:Describe*`, `kafka:ListClustersV2` | optional, each source skipped with warning |
+| Extended view: IAM evidence | `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, `iam:GetRolePolicy`, `iam:GetPolicy`, `iam:GetPolicyVersion` | optional, skipped with warning |
+| Extended view: network | `ec2:DescribeRouteTables`, `ec2:DescribeNetworkAcls`, `ec2:DescribeTransitGateway*`, `ec2:GetTransitGatewayRouteTablePropagations`, `ec2:DescribeVpcPeeringConnections`, `ec2:DescribeManagedPrefixLists`, `route53:ListHostedZones`, `route53:GetHostedZone`, `route53resolver:List*` | optional, skipped with warning |
+| Extended view: AWS Config | `config:DescribeConfigurationRecorderStatus`, `config:GetResourceConfigHistory` | optional, skipped with warning |
+| Extended view: Resource Explorer | `resource-explorer-2:GetIndex`, `resource-explorer-2:ListResources` | optional, skipped with warning |
+| Extended view: X-Ray | `xray:GetServiceGraph` | optional, skipped with warning |
+| Flow logs | `ec2:DescribeFlowLogs`, `logs:DescribeLogGroups`, `logs:StartQuery`, `logs:GetQueryResults`, `logs:StopQuery` | optional, **opt-in** per run |
+| Trends, Diff, CIDR planner, Report | none – computed from stored snapshots | – |
+| Terraform sync | `sts:GetCallerIdentity`; S3 backends: `s3:ListBucket`, `s3:GetObject` on the state object, and `sts:AssumeRole` when the backend names a role; other backends: whatever `terraform init` needs to read their state | optional (enrichment off by default) |
+
+Besides the `Describe` / `List` / `Get` prefixes, the guard's explicit allowlist is exactly:
+`logs:StartQuery`, `logs:GetQueryResults`, `logs:StopQuery`, `logs:FilterLogEvents` (CloudWatch
+Logs reads for flow logs), `sts:AssumeRole` (Terraform S3 backends with a role), and the ownership
+sources `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources` and
+`cloudtrail:LookupEvents`.
 
 ## Rules
 
