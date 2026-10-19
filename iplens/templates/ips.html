@@ -6,7 +6,9 @@
 {% if not snap %}
   {{ no_data() }}
 {% else %}
-<form method="get" action="{{ url_for('ips') }}" class="card row" id="ip-filter">
+{# Live filter (ipfilter.js): typing / changing a filter reloads only the results below. #}
+<form method="get" action="{{ url_for('ips') }}" class="card row" id="ip-filter"
+      data-rows-url="{{ url_for('ips_rows') }}">
   <div><label for="vpc">VPC</label>
     <select id="vpc" name="vpc" onchange="this.form.subnet.value=''; this.form.submit()">
       <option value="">all</option>
@@ -59,41 +61,19 @@
       {% for value, label in own_filters.items() %}<option value="{{ value }}" {{ 'selected' if value == f.own }}>{{ label }}</option>{% endfor %}
     </select></div>
   <div><label for="q">Search</label>
-    <input id="q" name="q" value="{{ f.q }}" placeholder="IP, name, ENI, subnet, VPC, description…" size="36"></div>
+    <span class="search-box">
+      <input id="q" name="q" value="{{ f.q }}" placeholder="IP, instance id or name, ENI, subnet, VPC, description…" size="36" autocomplete="off">
+      <button type="button" class="search-clear" id="q-clear" title="Clear the search (Esc)" aria-label="Clear the search"{{ ' hidden' if not f.q }}>&times;</button>
+    </span></div>
   <div class="row" style="gap: .5rem">
-    <button type="submit">Filter</button>
+    <noscript><button type="submit">Filter</button></noscript>
     <a class="btn secondary" href="{{ url_for('ips') }}">Reset</a>
     <button type="submit" class="secondary" formaction="{{ url_for('ips_export') }}">Export to Excel</button>
   </div>
 </form>
-<p class="muted">{{ rows | length }} IP(s) · snapshot #{{ snap.id }} · sorted by address</p>
-<table class="ip-list">
-  <thead><tr><th>IP</th><th>Subnet</th><th>VPC</th><th>Resource type</th><th>Resource name / ref</th><th>ENI</th><th>Status</th><th>Owner</th><th>Environment</th><th>Tags</th><th>Terraform</th></tr></thead>
-  <tbody>
-  {% for r in rows %}
-    <tr>
-      <td class="mono">{{ r.ip }}{% if r.is_primary %} <span class="badge">primary</span>{% endif %}</td>
-      <td><a class="mono" href="{{ url_for('subnet', subnet_id=r.subnet_id) }}">{{ r.subnet_id }}</a>
-        {% if r.subnet_name %}<div class="muted">{{ r.subnet_name }}</div>{% endif %}</td>
-      <td><span class="mono">{{ r.vpc_id }}</span>
-        {% if r.vpc_name %}<div class="muted">{{ r.vpc_name }}</div>{% endif %}</td>
-      <td>{{ type_label(r) }}</td>
-      <td>{{ r.resource_name }}
-        {% if r.owner_names | length > 1 %}<div class="muted">shared by {{ r.owner_names | length }} functions</div>
-        {% elif r.owner_ref and r.owner_ref != r.resource_name %}<div class="muted mono">{{ r.owner_ref }}</div>{% endif %}</td>
-      <td class="mono"><a href="{{ url_for('eni', eni_id=r.eni_id) }}">{{ r.eni_id }}</a></td>
-      <td><span class="badge {{ 'warn' if r.status == 'available' else '' }}">{{ r.status }}</span></td>
-      <td class="owner-cell">{% if r.owner.source %}{{ r.owner.value }}<div class="muted">{{ r.owner.label }}{% if r.owner.detail %} · <span class="mono">{{ r.owner.detail }}</span>{% endif %}</div>
-        {% else %}<span class="muted">unmanaged</span>{% endif %}</td>
-      <td class="env-cell">{% if r.environment %}{{ r.environment }}<div class="muted">{{ env_sources.get(r.env_source, r.env_source) }}</div>{% else %}<span class="muted">–</span>{% endif %}</td>
-      <td class="tags">{% for k, v in r.tags.items() %}<span class="tag mono small">{{ k }}={{ v }}</span> {% endfor %}</td>
-      <td class="small">{% for m in r.tf %}<div>managed by <b>{{ m.root }}</b>: <span class="mono">{{ m.address }}</span></div>
-        {% else %}{% if tf_roots %}<span class="muted">unmanaged</span>{% endif %}{% endfor %}</td>
-    </tr>
-  {% else %}
-    <tr><td colspan="11" class="muted">No matches</td></tr>
-  {% endfor %}
-  </tbody>
-</table>
+<div id="ip-results" aria-live="polite">
+{% include "_ip_rows.html" %}
+</div>
+<script src="{{ url_for('static', filename='ipfilter.js') }}" defer></script>
 {% endif %}
 {% endblock %}

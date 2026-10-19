@@ -19,7 +19,7 @@
     <tr><th>Status</th><td><span class="badge {{ 'warn' if e.status == 'available' else '' }}">{{ e.status }}</span>{% if e.status == 'available' %} not attached (idle){% endif %}</td></tr>
     <tr><th>Interface type</th><td class="mono">{{ e.interface_type or '' }}</td></tr>
     <tr><th>Requester</th><td class="mono">{{ e.requester_id or '' }}{% if e.requester_managed %} <span class="badge">AWS-managed</span>{% endif %}</td></tr>
-    <tr><th>Instance</th><td class="mono">{{ e.instance_id or '' }}</td></tr>
+    <tr><th>Instance</th><td><span class="mono">{{ e.instance_id or '' }}</span>{% if e.instance_name %} · {{ e.instance_name }}{% endif %}</td></tr>
     <tr><th>Description</th><td>{{ e.description }}</td></tr>
     <tr><th>VPC / subnet / AZ</th><td class="mono">{{ e.vpc_id }} / {{ e.subnet_id }} / {{ e.az }}</td></tr>
     <tr><th>Security groups</th><td>{% for g in e.sg_details %}

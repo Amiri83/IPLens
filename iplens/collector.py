@@ -22,7 +22,7 @@ from .jobs import JobCancelled, NullProgress, Progress
 log = logging.getLogger(__name__)
 
 # Progress steps of one collection (see Collector._step).
-COLLECT_STEPS = 14
+COLLECT_STEPS = 15
 # tag:GetResources page size (the API maximum).
 _TAG_PAGE = 100
 # CloudTrail events read per looked-up resource.
@@ -68,6 +68,52 @@ def _paginate(client: Any, op: str, key: str, **kwargs: Any) -> list[Any]:
 def _chunks(items: list[str], size: int) -> Iterable[list[str]]:
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+@dataclass(frozen=True)
+class InstanceEni:
+    """An ENI as attached to an EC2 instance (``ec2:DescribeInstances``)."""
+
+    instance_id: str
+    name: str  # the instance's Name tag
+    ips: tuple[dict[str, Any], ...]  # the attachment's PrivateIpAddresses (primary + secondary)
+
+
+def instance_eni_index(reservations: Iterable[dict[str, Any]]) -> dict[str, InstanceEni]:
+    """``eni id -> InstanceEni`` for every network interface of every instance."""
+    out: dict[str, InstanceEni] = {}
+    for res in reservations:
+        for inst in res.get("Instances", []) or []:
+            instance_id = inst.get("InstanceId") or ""
+            name = _name_tag(inst.get("Tags"))
+            for ni in inst.get("NetworkInterfaces", []) or []:
+                eni_id = ni.get("NetworkInterfaceId")
+                if eni_id and instance_id:
+                    ips = tuple(ni.get("PrivateIpAddresses") or [])
+                    out[eni_id] = InstanceEni(instance_id, name, ips)
+    return out
+
+
+def eni_private_ips(eni: dict[str, Any], inst: InstanceEni | None = None) -> list[dict[str, Any]]:
+    """Every private IPv4 of an ENI, primary and secondary, once each.
+
+    Merges the ENI's ``PrivateIpAddresses``, the instance attachment's list (when the
+    ENI belongs to an instance) and the ENI's primary ``PrivateIpAddress``; an address
+    is primary, and keeps its public association, if any source says so.
+    """
+    sources = [*(eni.get("PrivateIpAddresses") or []), *(inst.ips if inst else ())]
+    if eni.get("PrivateIpAddress"):
+        sources.append({"PrivateIpAddress": eni["PrivateIpAddress"], "Primary": True})
+    merged: dict[str, dict[str, Any]] = {}
+    for p in sources:
+        ip = p.get("PrivateIpAddress")
+        if not ip:
+            continue
+        seen = merged.setdefault(ip, {"PrivateIpAddress": ip, "Primary": False})
+        seen["Primary"] = bool(seen["Primary"] or p.get("Primary"))
+        if p.get("Association") and not seen.get("Association"):
+            seen["Association"] = p["Association"]
+    return list(merged.values())
 
 
 def _arn_name(arn: str) -> str:
@@ -313,6 +359,14 @@ class Collector:
         subnets = _paginate(ec2, "describe_subnets", "Subnets")
         self._step("ec2:DescribeNetworkInterfaces")
         enis = _paginate(ec2, "describe_network_interfaces", "NetworkInterfaces")
+        self._step("ec2:DescribeInstances")
+        instances = instance_eni_index(
+            self._optional(
+                result,
+                "ec2:DescribeInstances",
+                lambda: _paginate(ec2, "describe_instances", "Reservations"),
+            )
+        )
         self._step("ec2:DescribeVpcEndpoints")
         endpoints = self._optional(
             result,
@@ -404,6 +458,11 @@ class Collector:
                 )
             ip_count = 0
             for e in enis:
+                inst = instances.get(e["NetworkInterfaceId"])
+                attachment = e.get("Attachment") or {}
+                if inst and not attachment.get("InstanceId"):
+                    # Map the ENI to its instance even when the ENI view lacks the attachment.
+                    e = {**e, "Attachment": {**attachment, "InstanceId": inst.instance_id}}
                 attr = attribute_eni(e)
                 task = ecs.task_enis.get(e["NetworkInterfaceId"])
                 if task:
@@ -418,8 +477,8 @@ class Collector:
                 conn.execute(
                     "INSERT INTO enis(snapshot_id, eni_id, subnet_id, vpc_id, az, status, "
                     "interface_type, requester_id, requester_managed, description, instance_id, "
-                    "security_groups, owner_type, owner_ref, name, owner_names) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "security_groups, owner_type, owner_ref, name, owner_names, instance_name) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         snap_id,
                         e["NetworkInterfaceId"],
@@ -437,11 +496,10 @@ class Collector:
                         attr.owner_ref,
                         _name_tag(e.get("TagSet")),
                         json.dumps(owner_names),
+                        inst.name if inst else "",
                     ),
                 )
-                for p in e.get("PrivateIpAddresses", []) or [
-                    {"PrivateIpAddress": e.get("PrivateIpAddress"), "Primary": True}
-                ]:
+                for p in eni_private_ips(e, inst):
                     ip = p.get("PrivateIpAddress")
                     if not ip:
                         continue

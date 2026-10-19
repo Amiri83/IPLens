@@ -16,7 +16,7 @@ def store(db_path):
 
 def test_defaults(store):
     assert store.load().log_dir == ""
-    # init_db's migration created the default account and made it active
+    # the db_path fixture added a test account and made it active
     assert store.active_account_id() == 1
 
 

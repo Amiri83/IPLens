@@ -492,7 +492,8 @@ _IP_COLUMNS = (
     "i.ip, i.ip_int, i.eni_id, i.subnet_id, i.vpc_id, i.is_primary, i.public_ip, i.owner_type, "
     "e.owner_ref, e.owner_names, e.status, e.description, e.az, e.instance_id, "
     "e.interface_type, e.security_groups, "
-    "e.name AS eni_name, s.name AS subnet_name, s.cidr AS subnet_cidr, v.name AS vpc_name, "
+    "e.name AS eni_name, e.instance_name, s.name AS subnet_name, s.cidr AS subnet_cidr, "
+    "v.name AS vpc_name, "
     "lb.lb_type, ep.service_name"
 )
 _IP_SEARCH_COLUMNS = (
@@ -507,6 +508,7 @@ _IP_SEARCH_COLUMNS = (
     "e.owner_names",
     "e.description",
     "e.instance_id",
+    "e.instance_name",
     "e.name",
     "ep.service_name",
 )
@@ -548,10 +550,13 @@ def endpoint_service_short(service_name: str) -> str:
 
 
 def resource_name(row: dict[str, Any]) -> str:
-    """Best display name for the owning resource: Name tag, endpoint service, then the
-    owner(s) - every function of a shared Lambda ENI, comma-separated."""
+    """Best display name for the owning resource: Name tag (the ENI's, else its EC2
+    instance's), endpoint service, then the owner(s) - every function of a shared
+    Lambda ENI, comma-separated."""
     if row.get("eni_name"):
         return row["eni_name"]
+    if row.get("instance_name"):
+        return row["instance_name"]
     if row.get("service_name"):
         return endpoint_service_short(row["service_name"])
     names = row["owner_names"] if isinstance(row.get("owner_names"), list) else owner_names(row)

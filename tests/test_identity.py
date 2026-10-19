@@ -97,9 +97,9 @@ def test_migration_reuses_existing_records_and_copies_layouts(tmp_path, box):
     with closing(path) as conn:
         # undo the "already migrated" marker to simulate an older multi-account database
         conn.execute("DELETE FROM settings WHERE key='snapshots_regrouped'")
-        conn.execute(
-            "INSERT INTO accounts(display_name, region, auth_mode) "
-            "VALUES('example-b', 'us-east-1', 'env')"
+        conn.executemany(
+            "INSERT INTO accounts(display_name, region, auth_mode) VALUES(?, 'us-east-1', 'env')",
+            [("example-a",), ("example-b",)],
         )
         mixed = _snap(conn, OTHER_ID, vpc=VPC_B)
         conn.execute("UPDATE snapshots SET account_ref=1 WHERE id=?", (mixed,))

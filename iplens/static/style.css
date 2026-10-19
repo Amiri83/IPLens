@@ -74,6 +74,14 @@ input, select, textarea { font: inherit; padding: .35rem .5rem; border: 1px soli
 label { display: block; font-weight: 600; margin: .6rem 0 .2rem; }
 .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
 .inline { display: inline; }
+/* search field with one clear (x) control inside it (IP List live filter) */
+.search-box { position: relative; display: inline-block; }
+.search-box input { padding-right: 1.8rem; }
+.search-clear { position: absolute; right: .2rem; top: 50%; transform: translateY(-50%);
+                padding: 0 .4rem; background: none; color: var(--muted); font-size: 1.1rem;
+                line-height: 1; }
+.search-clear:hover, .search-clear:focus-visible { color: var(--fg); }
+.search-clear[hidden] { display: none; }
 
 /* usage bars */
 .bar { display: flex; height: 12px; border-radius: 3px; overflow: hidden; background: var(--free);

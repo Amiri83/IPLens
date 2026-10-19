@@ -255,6 +255,8 @@ lambda:ListFunctions  elasticloadbalancing:DescribeLoadBalancers  sts:GetCallerI
 
 Optional: `iam:ListAccountAliases` shows the account alias in the header (without it, IPLens
 shows the account id only, or the *Account display name* set in Settings).
+`ec2:DescribeInstances` adds the EC2 instance Name tag (shown and searchable in the IP List) and
+the instance attachment's secondary private IPs; without it ENIs keep their own IP list.
 `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth` and
 `ec2:DescribeSecurityGroups` add load balancer → target and security group reference
 connections to the Visual page; without them those connections are left out.
@@ -288,6 +290,7 @@ sources, simply not enabled).
 |---|---|---|
 | Discovery / Refresh (also IP List, Visual IP view, scheduled Refresh) | `sts:GetCallerIdentity`, `ec2:DescribeVpcs`, `ec2:DescribeSubnets`, `ec2:DescribeNetworkInterfaces`, `ec2:DescribeVpcEndpoints`, `lambda:ListFunctions`, `elasticloadbalancing:DescribeLoadBalancers` | **required** |
 | Account alias in the header | `iam:ListAccountAliases` | optional (falls back to account id / display name) |
+| EC2 instance names and attachment IPs | `ec2:DescribeInstances` | optional (skipped with warning) |
 | Visual: LB → target and security group connections | `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth`, `ec2:DescribeSecurityGroups` | optional (connections left out) |
 | Ownership: tags, CloudFormation | `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources` | optional (skipped with warning) |
 | Ownership: CloudTrail creator | `cloudtrail:LookupEvents` | optional, **opt-in** in Settings |

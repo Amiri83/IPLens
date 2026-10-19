@@ -68,13 +68,34 @@ def _hermetic_aws(monkeypatch, tmp_path):
 
 @pytest.fixture
 def home(tmp_path) -> Path:
-    return tmp_path / "home"
+    """A data directory whose database has one active test account."""
+    p = tmp_path / "home"
+    p.mkdir()
+    init_db(p / "iplens.db")
+    add_test_account(p / "iplens.db")
+    return p
+
+
+def add_test_account(db_path: Path) -> int:
+    """Add an ``env``-auth account and make it active (a fresh database has none)."""
+    with closing(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO accounts(display_name, region, auth_mode) VALUES('', 'us-east-1', 'env')"
+        )
+        account_id = int(cur.lastrowid or 0)
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('active_account', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(account_id),),
+        )
+    return account_id
 
 
 @pytest.fixture
 def db_path(tmp_path) -> Path:
     p = tmp_path / "test.db"
     init_db(p)
+    add_test_account(p)
     return p
 
 
@@ -159,14 +180,15 @@ class SnapshotBuilder:
         requester_managed: bool = False,
         name: str = "",
         instance_id: str | None = None,
+        instance_name: str = "",
     ) -> SnapshotBuilder:
         vpc_id = self._subnet_vpc[subnet_id]
         with closing(self.db_path) as conn:
             conn.execute(
                 "INSERT INTO enis(snapshot_id, eni_id, subnet_id, vpc_id, az, status, "
                 "interface_type, requester_id, requester_managed, description, instance_id, "
-                "security_groups, owner_type, owner_ref, name) "
-                "VALUES(?,?,?,?,?,?,'interface',NULL,?,?,?,?,?,?,?)",
+                "security_groups, owner_type, owner_ref, name, instance_name) "
+                "VALUES(?,?,?,?,?,?,'interface',NULL,?,?,?,?,?,?,?,?)",
                 (
                     self.id,
                     eni_id,
@@ -181,6 +203,7 @@ class SnapshotBuilder:
                     owner_type,
                     owner_ref,
                     name,
+                    instance_name,
                 ),
             )
             for i, ip in enumerate(ips):
