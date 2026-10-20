@@ -81,6 +81,7 @@ CREATE TABLE IF NOT EXISTS enis (
     owner_ref         TEXT,
     name              TEXT,
     owner_names       TEXT,          -- JSON list of every owning resource (shared Lambda ENIs)
+    instance_name     TEXT,          -- Name tag of the attached EC2 instance
     PRIMARY KEY (snapshot_id, eni_id)
 );
 
@@ -478,6 +479,7 @@ _ADDED_COLUMNS = (
     ("accounts", "aws_account_id", "TEXT"),
     ("accounts", "last_seen_account_id", "TEXT"),
     ("enis", "owner_names", "TEXT"),
+    ("enis", "instance_name", "TEXT"),
     ("visual_prefs", "shorten_names", "INTEGER NOT NULL DEFAULT 0"),
     ("visual_prefs", "evidence", "TEXT"),
     ("visual_prefs", "show_legend", "INTEGER NOT NULL DEFAULT 1"),
@@ -523,14 +525,18 @@ def migrate_accounts(conn: sqlite3.Connection) -> int | None:
     The legacy auth settings (mode, profile, key id, region, display name and the
     already-encrypted secret, copied as ciphertext) become one account; existing
     snapshots are assigned to it and it becomes the active account. A fresh
-    database gets a default account using the environment credential chain, which
-    was the previous default. Returns the new account id, or None if already done.
+    database (no legacy settings, no snapshots) gets no account: the inventory
+    starts empty until the user adds one. Returns the new account id, or None.
     """
     if conn.execute("SELECT 1 FROM settings WHERE key=?", (_MIGRATED_KEY,)).fetchone():
         return None
     raw = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM settings")}
+    legacy = (
+        any(k in raw for k in _LEGACY_AUTH_KEYS)
+        or conn.execute("SELECT 1 FROM snapshots LIMIT 1").fetchone()
+    )
     account_id = None
-    if conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0:
+    if legacy and conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0:
         mode = raw.get("auth_mode") or "env"
         cur = conn.execute(
             "INSERT INTO accounts(display_name, region, auth_mode, profile, access_key_id, "

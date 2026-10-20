@@ -108,7 +108,8 @@ def test_ctrl_c_shuts_down_cleanly(served, home, capsys):
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "192.0.2.10", "::", "example.invalid"])  # noqa: S104
-def test_non_loopback_host_is_refused(served, home, host, capsys):
+def test_non_loopback_host_is_refused(served, tmp_path, host, capsys):
+    home = tmp_path / "fresh-home"
     with pytest.raises(SystemExit) as exc:
         main(["--home", str(home), "--host", host])
     assert exc.value.code == 2

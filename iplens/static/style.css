@@ -17,6 +17,8 @@
   --blocked-bg: #eef0f3; --blocked-fg: #545e69; --blocked-link: #3b5689;
 }
 * { box-sizing: border-box; }
+/* The hidden attribute always wins, even over a display set by a class or element rule. */
+[hidden] { display: none !important; }
 body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
        background: var(--bg); color: var(--fg); }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
@@ -74,6 +76,13 @@ input, select, textarea { font: inherit; padding: .35rem .5rem; border: 1px soli
 label { display: block; font-weight: 600; margin: .6rem 0 .2rem; }
 .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
 .inline { display: inline; }
+/* search field with one clear (x) control inside it (IP List live filter) */
+.search-box { position: relative; display: inline-block; }
+.search-box input { padding-right: 1.8rem; }
+.search-clear { position: absolute; right: .2rem; top: 50%; transform: translateY(-50%);
+                padding: 0 .4rem; background: none; color: var(--muted); font-size: 1.1rem;
+                line-height: 1; }
+.search-clear:hover, .search-clear:focus-visible { color: var(--fg); }
 
 /* usage bars */
 .bar { display: flex; height: 12px; border-radius: 3px; overflow: hidden; background: var(--free);
@@ -110,7 +119,6 @@ table.ip-list td .muted { font-size: 12px; }
           background: var(--nav-bg); color: var(--nav-fg-active); border-radius: 4px;
           padding: .35rem .55rem; font-size: 12px; white-space: pre-wrap; word-break: break-word;
           box-shadow: 0 2px 8px rgba(0, 0, 0, .2); }
-.cy-tip[hidden] { display: none; }
 fieldset.edge-filters { border: 1px solid var(--line); border-radius: 5px; margin: 0;
                         padding: .2rem .7rem .4rem; display: flex; flex-wrap: wrap; gap: .2rem 1rem; }
 fieldset.edge-filters legend { font-weight: 600; padding: 0 .3rem; }
@@ -195,7 +203,6 @@ details.advanced > summary { cursor: pointer; font-weight: 600; margin: 1rem 0 .
 /* Background job modal (jobs.js): --fg on --card, the log --fg on --bg. */
 .job-modal { position: fixed; inset: 0; background: rgba(31, 41, 51, .45); z-index: 50;
              display: flex; align-items: flex-start; justify-content: center; padding-top: 8vh; }
-.job-modal[hidden] { display: none; }
 .job-box { width: min(760px, 94vw); max-height: 84vh; overflow: auto; }
 .job-box h2 { margin-top: 0; }
 .job-step { font-weight: 600; margin: .3rem 0 .5rem; word-break: break-word; }
@@ -207,7 +214,6 @@ pre.job-log { background: var(--bg); color: var(--fg); border: 1px solid var(--l
 .job-actions { gap: .5rem; justify-content: flex-end; }
 .job-badge { position: fixed; right: 1rem; bottom: 1rem; z-index: 40; max-width: 60vw;
              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.job-badge[hidden] { display: none; }
 
 /* Visual: environment filter and the "not linked" side panel of the Extended view. */
 .env-filters label { white-space: nowrap; }

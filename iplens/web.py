@@ -950,18 +950,29 @@ def _register(app: Flask) -> None:
             g.own_config = _store().load().ownership_config()
         return g.own_config
 
+    def _ip_rows(snap: Any, flt: queries.IpFilter) -> tuple[list[dict[str, Any]], list[Any]]:
+        """IP List rows matching ``flt`` and the environment summary of the unfiltered ones."""
+        # Without the environment filter first: the dropdown lists every environment.
+        every = queries.ip_list(
+            _db(), snap["id"], replace(flt, env=""), _scope(), _env_keys(), _own()
+        )
+        envs = environment.summary(r["environment"] for r in every)
+        return [r for r in every if environment.matches(r["environment"], flt.env)], envs
+
+    def _ip_rows_context() -> dict[str, Any]:
+        return {
+            "env_sources": environment.SOURCE_LABELS,
+            "tf_roots": [r["name"] for r in terraform.list_roots(_db())],
+            "type_label": lambda r: queries.resource_type_label(r, OWNER_LABELS),
+        }
+
     @app.get("/ips")
     def ips():
         snap = _snapshot_or_none()
         flt = _ip_filter()
         rows, tree, keys, envs = [], [], [], []
         if snap:
-            # Without the environment filter first: the dropdown lists every environment.
-            every = queries.ip_list(
-                _db(), snap["id"], replace(flt, env=""), _scope(), _env_keys(), _own()
-            )
-            envs = environment.summary(r["environment"] for r in every)
-            rows = [r for r in every if environment.matches(r["environment"], flt.env)]
+            rows, envs = _ip_rows(snap, flt)
             tree = queries.vpc_tree(_db(), snap["id"], _scope())
             keys = queries.tag_keys(_db(), snap["id"])
         return render_template(
@@ -974,13 +985,20 @@ def _register(app: Flask) -> None:
             tag_keys=keys,
             environments=envs,
             env_not_set=environment.FILTER_NOT_SET,
-            env_sources=environment.SOURCE_LABELS,
-            tf_roots=[r["name"] for r in terraform.list_roots(_db())],
             tf_managed=queries.TF_MANAGED,
             tf_unmanaged=queries.TF_UNMANAGED,
             own_filters=OWN_FILTERS,
-            type_label=lambda r: queries.resource_type_label(r, OWNER_LABELS),
+            **_ip_rows_context(),
         )
+
+    @app.get("/ips/rows")
+    def ips_rows():
+        """The IP List results alone (same filters as /ips): the page's live filter."""
+        snap = _snapshot_or_none()
+        if not snap:
+            return Response("", status=204)
+        rows, _envs = _ip_rows(snap, _ip_filter())
+        return render_template("_ip_rows.html", snap=snap, rows=rows, **_ip_rows_context())
 
     @app.get("/ips/export.xlsx")
     def ips_export():

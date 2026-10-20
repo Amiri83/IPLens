@@ -94,3 +94,37 @@ def test_prune_and_history_are_per_account(db_path, snapshot_builder):
         assert queries.prune_snapshots(conn, keep=1) == 3
         remaining = {r["id"] for r in conn.execute("SELECT id FROM snapshots")}
     assert remaining == {a[2], a_failed, b[1], running}
+
+
+def test_fresh_database_has_no_seeded_account(tmp_path):
+    p = tmp_path / "fresh.db"
+    init_db(p)
+    with closing(p) as c:
+        assert c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
+        assert c.execute("SELECT value FROM settings WHERE key='active_account'").fetchone() is None
+    init_db(p)  # a restart does not seed it either
+    with closing(p) as c:
+        assert c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
+
+
+def test_existing_database_does_not_recreate_a_removed_account(db_path):
+    with closing(db_path) as c:
+        c.execute("DELETE FROM accounts")
+    init_db(db_path)
+    with closing(db_path) as c:
+        assert c.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 0
+
+
+def test_legacy_single_account_settings_still_migrate(tmp_path):
+    p = tmp_path / "legacy.db"
+    init_db(p)
+    with closing(p) as c:  # a pre-multi-account install: auth lived in settings
+        c.execute("DELETE FROM settings WHERE key='accounts_migrated'")
+        c.executemany(
+            "INSERT INTO settings(key, value) VALUES(?, ?)",
+            [("auth_mode", "profile"), ("profile", "example-profile"), ("region", "eu-west-1")],
+        )
+    init_db(p)
+    with closing(p) as c:
+        rows = c.execute("SELECT auth_mode, profile, region FROM accounts").fetchall()
+    assert [tuple(r) for r in rows] == [("profile", "example-profile", "eu-west-1")]

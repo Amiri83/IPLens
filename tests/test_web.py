@@ -633,3 +633,60 @@ def test_nav_marks_active_page(client):
     page = client.get("/ips").data.decode()
     assert '<a href="/ips" class="active" aria-current="page">IP List</a>' in page
     assert '<a href="/logs">Logs</a>' in page
+
+
+def test_fresh_install_shows_empty_state_and_no_placeholder_account(tmp_path):
+    client = create_app(tmp_path / "fresh-home", testing=True).test_client()
+    for url in ("/", "/ips"):
+        page = client.get(url).data.decode()
+        assert "No AWS account yet" in page
+        assert 'id="account-select"' not in page  # no seeded entry in the account list
+        assert "Account 1" not in page
+    assert "add an AWS account" in client.get("/").data.decode()
+    assert client.get("/ips/rows?q=10.0").status_code == 204  # nothing to filter yet
+
+
+def _search_form(page: str) -> str:
+    start = page.index('<form method="get" action="/ips"')
+    return page[start : page.index("</form>", start)]
+
+
+def test_ip_search_is_a_live_filter_with_one_clear_control(client, seeded):
+    page = client.get("/ips").data.decode()
+    form = _search_form(page)
+    assert 'data-rows-url="/ips/rows"' in form and "ipfilter.js" in page
+    assert form.count('class="search-clear"') == 1 and 'id="q-clear"' in form
+    assert (
+        'id="q-clear" title="Clear the search (Esc)" aria-label="Clear the search" hidden' in form
+    )
+    assert 'type="search"' not in form  # no second, browser-native clear (x)
+    for leftover in (">Cancel<", ">Hide<", 'id="job-cancel"', 'id="job-hide"'):
+        assert leftover not in form
+    # The submit button is only a no-JavaScript fallback: typing filters by itself.
+    assert '<noscript><button type="submit">Filter</button></noscript>' in form
+    # With a query the clear control is shown from the start.
+    assert 'aria-label="Clear the search">' in _search_form(client.get("/ips?q=10.0").data.decode())
+
+
+def test_ip_rows_endpoint_filters_as_you_type(client, seeded, snapshot_builder):
+    with closing(_db(client.application)) as conn:  # an EC2 instance with a secondary IP
+        conn.execute(
+            "UPDATE enis SET instance_id='i-0abc1234', instance_name='test-server-a' "
+            "WHERE eni_id='eni-0000000001'"
+        )
+    full = client.get("/ips/rows")
+    assert full.status_code == 200 and full.mimetype == "text/html"
+    body = full.data.decode()
+    assert "<html" not in body and "<form" not in body  # the results only, no page chrome
+    assert "4 IP(s)" in body and "10.0.1.50" in body
+    # Each keystroke is a request: every prefix narrows the same way the page does.
+    for q, expected in (("test", 3), ("test-ser", 3), ("test-server-a", 3), ("test-server-ax", 0)):
+        resp = client.get(f"/ips/rows?q={q}").data.decode()
+        assert f"{expected} IP(s)" in resp, q
+    for q in ("i-0abc1234", "10.0.1.11"):
+        resp = client.get(f"/ips/rows?q={q}").data.decode()
+        assert "10.0.1.11" in resp and "10.0.1.50" not in resp, q
+    assert "test-server-a" in client.get("/ips/rows?q=i-0abc1234").data.decode()
+    # The other filters combine with the search, like on the full page.
+    assert "1 IP(s)" in client.get("/ips/rows?state=idle&q=10.0.1").data.decode()
+    assert "No matches" in client.get("/ips/rows?q=no-such-thing").data.decode()

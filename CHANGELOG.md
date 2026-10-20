@@ -12,6 +12,18 @@
 - Graceful shutdown on Ctrl+C / SIGTERM: the scheduled Refresh stops, running jobs are cancelled
   and any terraform process left is stopped.
 
+### Fixed
+
+- A fresh install no longer creates a placeholder account ("Account 1") on first start: the
+  account list and inventory start empty, with an empty state that links to adding an account.
+  Existing databases keep their accounts; a legacy single-account install still migrates.
+- EC2 instances: each ENI is mapped to its instance (instance id and the instance's **Name**
+  tag, via the optional `ec2:DescribeInstances`), and the attachment's secondary private IPs are
+  included next to the primary. IP List search matches the instance id, Name tag and every IP.
+- IP List search is a live filter: results update as you type (and when a filter changes)
+  without a submit, with one clear (×) control (also Esc); the Filter button is only a
+  no-JavaScript fallback.
+
 ### Security
 
 - A non-loopback `--host` is refused unless `--allow-remote` is passed; IPLens then prints a
