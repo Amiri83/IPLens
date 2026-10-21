@@ -83,6 +83,19 @@
   <p class="muted small">Applied after every Refresh: snapshots older than the window are deleted, and older than
     the downsample threshold only the newest successful snapshot of each day is kept (Trends stay bounded).
     The latest successful snapshot of each account is always kept.</p>
+  <h2 id="discovery">Discovery timeouts</h2>
+  <div class="row">
+    <div><label for="resource_timeout">Per-resource timeout (seconds)</label>
+      <input id="resource_timeout" name="resource_timeout" type="number" value="{{ s.resource_timeout }}"
+             min="{{ timeout_limits.resource[0] }}" max="{{ timeout_limits.resource[1] }}" size="6"></div>
+    <div><label for="discovery_timeout_min">Overall discovery timeout (minutes)</label>
+      <input id="discovery_timeout_min" name="discovery_timeout_min" type="number" value="{{ s.discovery_timeout_min }}"
+             min="{{ timeout_limits.overall[0] }}" max="{{ timeout_limits.overall[1] }}" size="6"></div>
+  </div>
+  <p class="muted small">A Refresh collects one resource type at a time (e.g. <span class="mono">ec2:DescribeInstances</span>).
+    One that runs past its timeout is skipped and the others still run; once the overall limit is reached the
+    remaining ones are skipped. VPCs, subnets and ENIs are required: if one of them times out the Refresh fails.
+    Defaults 120 seconds and 15 minutes; a change applies from the next Refresh.</p>
   <h2>Environments</h2>
   <label for="env_tag_keys">Environment tag keys</label>
   <input id="env_tag_keys" name="env_tag_keys" value="{{ s.env_tag_keys_text }}" size="40" class="mono" placeholder="Environment, env, stage">

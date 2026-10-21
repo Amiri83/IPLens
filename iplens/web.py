@@ -62,7 +62,7 @@ from .accounts import (
 )
 from .attribution import OWNER_LABELS, OWNER_TYPES
 from .aws import AwsGateway, check_connection, is_credential_failure
-from .collector import Collector
+from .collector import Collector, ResourceTimeout
 from .config import AppPaths, default_paths
 from .crypto import SecretBox
 from .db import closing, connect, init_db
@@ -73,7 +73,19 @@ from .jobs import KINDS as JOB_KINDS
 from .jobs import JobBusy, JobCancelled, JobContext, JobFailed, JobManager, Progress
 from .logging_setup import LEVELS, configure_logging, read_log
 from .queries import LB_ICONS, TYPE_ICONS
-from .settings import MAX_DISPLAY_NAME, REGIONS, Settings, SettingsStore, parse_tf_timeout
+from .settings import (
+    MAX_DISCOVERY_TIMEOUT_MIN,
+    MAX_DISPLAY_NAME,
+    MAX_RESOURCE_TIMEOUT,
+    MIN_DISCOVERY_TIMEOUT_MIN,
+    MIN_RESOURCE_TIMEOUT,
+    REGIONS,
+    Settings,
+    SettingsStore,
+    parse_discovery_timeout,
+    parse_resource_timeout,
+    parse_tf_timeout,
+)
 from .visual import (
     DEFAULT_EDGE_TYPES,
     EDGE_TYPE_LABELS,
@@ -87,6 +99,8 @@ log = logging.getLogger(__name__)
 GatewayFactory = Callable[[Account], AwsGateway]
 # Typed on the Discovery page to confirm deleting snapshots.
 DELETE_CONFIRMATION = "DELETE"
+# Session key: id of the job whose progress box the user hid (see job_hide).
+JOB_HIDDEN_KEY = "job_hidden"
 HISTORY_ROWS = 50
 # Snapshots offered by the Diff page's pickers (newest first).
 DIFF_CHOICES = 500
@@ -565,7 +579,8 @@ def _register(app: Flask) -> None:
     def job_current():
         """The active account's running job, else its last one (a reload re-attaches)."""
         job = _jobs().current(_job_account())
-        return jsonify({"job": job, "kinds": JOB_KINDS})
+        hidden = bool(job) and session.get(JOB_HIDDEN_KEY) == job["id"]
+        return jsonify({"job": job, "kinds": JOB_KINDS, "hidden": hidden})
 
     @app.get("/jobs/<job_id>")
     def job_status(job_id: str):
@@ -578,6 +593,22 @@ def _register(app: Flask) -> None:
     def job_cancel(job_id: str):
         ok = _jobs().cancel(job_id[:64], _job_account())
         return jsonify({"ok": ok, "job": _jobs().status(job_id[:64], _job_account())})
+
+    # Hide / show the progress box: kept in the (server-signed) session, so the box stays
+    # hidden on every page and tab until the user opens it again from the badge.
+    @app.post("/jobs/<job_id>/hide")
+    def job_hide(job_id: str):
+        job = _jobs().status(job_id[:64], _job_account())
+        if job is None:
+            abort(404)
+        session[JOB_HIDDEN_KEY] = job["id"]
+        return jsonify({"ok": True, "hidden": True})
+
+    @app.post("/jobs/<job_id>/show")
+    def job_show(job_id: str):
+        if session.get(JOB_HIDDEN_KEY) == job_id[:64]:
+            session.pop(JOB_HIDDEN_KEY)
+        return jsonify({"ok": True, "hidden": False})
 
     @app.post("/refresh")
     def refresh():
@@ -609,7 +640,12 @@ def _register(app: Flask) -> None:
         accounts = _accounts()
         edit_url = url_for("account_edit", account_id=account.id)
         own = _own()
-        policy = _store().load().retention_policy
+        saved = _store().load()
+        policy = saved.retention_policy
+        # Read at every start, so a changed timeout applies from the next Refresh on.
+        resource_timeout = saved.resource_timeout
+        overall_timeout = saved.discovery_timeout_min * 60
+        settings_url = url_for("settings_page") + "#discovery"
         # Terraform is an optional ownership enrichment: mapped repos are only re-synced
         # with every refresh when it is enabled (the Sync buttons always work).
         tf_sync = (
@@ -628,6 +664,8 @@ def _register(app: Flask) -> None:
                     account.display_name,
                     progress=ctx,
                     ownership_config=own,
+                    resource_timeout=resource_timeout,
+                    overall_timeout=overall_timeout,
                 ).run()
                 with closing(db_path) as conn:
                     pruned = retention_mod.apply(conn, policy)
@@ -635,6 +673,15 @@ def _register(app: Flask) -> None:
                     log.info("retention: deleted %d snapshot(s)", pruned)
             except (JobCancelled, JobFailed):
                 raise
+            except ResourceTimeout as exc:
+                # VPCs, subnets or ENIs: without them there is no snapshot to save.
+                ctx.message(
+                    "error",
+                    f"Refresh failed: {exc}; the snapshot needs it. Retry, or raise the timeout in",
+                    settings_url,
+                    "Settings",
+                )
+                raise JobFailed("Refresh failed") from None
             except Exception as exc:
                 # Full details (type, message, traceback) go to the log file only;
                 # raw errors can carry ARNs, account ids or request ids.
@@ -1608,6 +1655,10 @@ def _register(app: Flask) -> None:
                 "keep": (retention_mod.MIN_RETENTION_DAYS, retention_mod.MAX_RETENTION_DAYS),
                 "thin": (retention_mod.MIN_DOWNSAMPLE_DAYS, retention_mod.MAX_DOWNSAMPLE_DAYS),
             },
+            timeout_limits={
+                "resource": (MIN_RESOURCE_TIMEOUT, MAX_RESOURCE_TIMEOUT),
+                "overall": (MIN_DISCOVERY_TIMEOUT_MIN, MAX_DISCOVERY_TIMEOUT_MIN),
+            },
             default_log_dir=_paths().default_log_dir,
             tf_roots=terraform.list_roots(_db()),
             tf_types=sorted(terraform.MANAGED_TYPES),
@@ -1937,6 +1988,14 @@ def _register(app: Flask) -> None:
         # Fields missing from the form keep their value.
         try:
             timeout = parse_tf_timeout(f["tf_timeout"]) if "tf_timeout" in f else None
+            resource_timeout = (
+                parse_resource_timeout(f["resource_timeout"]) if "resource_timeout" in f else None
+            )
+            discovery_timeout = (
+                parse_discovery_timeout(f["discovery_timeout_min"])
+                if "discovery_timeout_min" in f
+                else None
+            )
             if "retention_days" in f:
                 _store().save_retention(f["retention_days"], f.get("downsample_days", ""))
         except ValueError as exc:
@@ -1946,6 +2005,8 @@ def _register(app: Flask) -> None:
             log_dir=f.get("log_dir", ""),
             tf_timeout=timeout,
             env_tag_keys=f.get("env_tag_keys") if "env_tag_keys" in f else None,
+            resource_timeout=resource_timeout,
+            discovery_timeout_min=discovery_timeout,
         )
         if "own_form" in f:  # the Ownership section (checkboxes are absent when unticked)
             _store().save_ownership(
@@ -1957,10 +2018,13 @@ def _register(app: Flask) -> None:
         saved = _store().load()
         new_dir = apply_log_dir(current_app, saved)
         log.info(
-            "settings saved: log_dir=%s tf_timeout=%ss env_tag_keys=%s ownership keys=%s "
+            "settings saved: log_dir=%s tf_timeout=%ss resource_timeout=%ss "
+            "discovery_timeout=%smin env_tag_keys=%s ownership keys=%s "
             "tf_enrichment=%s cloudtrail=%s retention=%sd downsample=%sd",
             new_dir,
             saved.tf_timeout,
+            saved.resource_timeout,
+            saved.discovery_timeout_min,
             ",".join(saved.env_tag_keys),
             ",".join(
                 (saved.own_project_key, saved.own_env_key, saved.own_team_key, saved.own_owner_key)

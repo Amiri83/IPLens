@@ -47,6 +47,11 @@ MAX_DISPLAY_NAME = 64
 # Terraform repo sync: seconds each allowlisted terraform command may run.
 DEFAULT_TF_TIMEOUT = 120
 MIN_TF_TIMEOUT, MAX_TF_TIMEOUT = 10, 3600
+# Refresh (discovery): seconds one resource type may take, and minutes for the whole run.
+DEFAULT_RESOURCE_TIMEOUT = 120
+MIN_RESOURCE_TIMEOUT, MAX_RESOURCE_TIMEOUT = 10, 3600
+DEFAULT_DISCOVERY_TIMEOUT_MIN = 15
+MIN_DISCOVERY_TIMEOUT_MIN, MAX_DISCOVERY_TIMEOUT_MIN = 1, 240
 # Ownership tag key settings and their defaults; a stored "-" means "not used".
 _OWN_KEY_DEFAULTS = {
     "project": ownership.DEFAULT_PROJECT_KEY,
@@ -61,6 +66,9 @@ _KEY_UNUSED = "-"
 class Settings:
     log_dir: str = ""
     tf_timeout: int = DEFAULT_TF_TIMEOUT
+    # Refresh timeouts (see iplens.collector): per resource type (s) and overall (min).
+    resource_timeout: int = DEFAULT_RESOURCE_TIMEOUT
+    discovery_timeout_min: int = DEFAULT_DISCOVERY_TIMEOUT_MIN
     # Tag keys an environment is read from, in order (see iplens.environment).
     env_tag_keys: tuple[str, ...] = DEFAULT_TAG_KEYS
     # Ownership (see iplens.ownership): tag keys, CI role patterns and optional sources.
@@ -114,6 +122,34 @@ def parse_tf_timeout(value: str | int | None) -> int:
     return seconds
 
 
+def _parse_bounded(value: str | int | None, what: str, unit: str, lo: int, hi: int) -> int:
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"the {what} must be a whole number of {unit}") from None
+    if not lo <= n <= hi:
+        raise ValueError(f"the {what} must be {lo}-{hi} {unit}")
+    return n
+
+
+def parse_resource_timeout(value: str | int | None) -> int:
+    """Per-resource Refresh timeout in seconds; ValueError outside the bounds."""
+    return _parse_bounded(
+        value, "per-resource timeout", "seconds", MIN_RESOURCE_TIMEOUT, MAX_RESOURCE_TIMEOUT
+    )
+
+
+def parse_discovery_timeout(value: str | int | None) -> int:
+    """Overall Refresh timeout in minutes; ValueError outside the bounds."""
+    return _parse_bounded(
+        value,
+        "overall discovery timeout",
+        "minutes",
+        MIN_DISCOVERY_TIMEOUT_MIN,
+        MAX_DISCOVERY_TIMEOUT_MIN,
+    )
+
+
 def mask_key_id(key_id: str) -> str:
     if not key_id:
         return ""
@@ -145,6 +181,18 @@ class SettingsStore:
         except ValueError:
             timeout = DEFAULT_TF_TIMEOUT
         try:
+            resource_timeout = parse_resource_timeout(
+                self._get("resource_timeout") or DEFAULT_RESOURCE_TIMEOUT
+            )
+        except ValueError:
+            resource_timeout = DEFAULT_RESOURCE_TIMEOUT
+        try:
+            discovery_timeout = parse_discovery_timeout(
+                self._get("discovery_timeout_min") or DEFAULT_DISCOVERY_TIMEOUT_MIN
+            )
+        except ValueError:
+            discovery_timeout = DEFAULT_DISCOVERY_TIMEOUT_MIN
+        try:
             keep = int(self._get("retention_days") or retention.RETENTION_DAYS)
             thin = int(self._get("downsample_days") or retention.DOWNSAMPLE_AFTER_DAYS)
             retention.validate(keep, thin)
@@ -155,6 +203,8 @@ class SettingsStore:
         return Settings(
             log_dir=self._get("log_dir"),
             tf_timeout=timeout,
+            resource_timeout=resource_timeout,
+            discovery_timeout_min=discovery_timeout,
             env_tag_keys=parse_tag_keys(raw_keys) if raw_keys else DEFAULT_TAG_KEYS,
             **{
                 f"own_{name}_key": self._key_setting(name, default)
@@ -186,11 +236,17 @@ class SettingsStore:
         log_dir: str = "",
         tf_timeout: int | None = None,
         env_tag_keys: str | None = None,
+        resource_timeout: int | None = None,
+        discovery_timeout_min: int | None = None,
     ) -> None:
         """Store the settings; ``None`` keeps a value unchanged."""
         self._set("log_dir", log_dir.strip())
         if tf_timeout is not None:
             self._set("tf_timeout", str(parse_tf_timeout(tf_timeout)))
+        if resource_timeout is not None:
+            self._set("resource_timeout", str(parse_resource_timeout(resource_timeout)))
+        if discovery_timeout_min is not None:
+            self._set("discovery_timeout_min", str(parse_discovery_timeout(discovery_timeout_min)))
         if env_tag_keys is not None:
             keys = parse_tag_keys(env_tag_keys)
             self._set("env_tag_keys", ",".join(keys or DEFAULT_TAG_KEYS))

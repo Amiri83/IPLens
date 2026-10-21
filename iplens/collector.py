@@ -1,25 +1,45 @@
-"""Read-only collection of VPC/subnet/ENI (and optional ECS) data into an SQLite snapshot."""
+"""Read-only collection of VPC/subnet/ENI (and optional ECS) data into an SQLite snapshot.
+
+Each resource type (one AWS API family, e.g. ``ec2:DescribeInstances``) runs in a helper
+thread bounded by the per-resource timeout and by what is left of the overall limit
+(Settings → Discovery). A resource past its timeout is abandoned: it is reported as
+skipped, its pagination loop stops at the next page, and the botocore connect / read
+timeouts (:func:`iplens.aws.call_timeouts`) end a call stuck on the network. The other
+resource types still run. VPCs, subnets and ENIs are the snapshot itself: when one of
+them times out the Refresh fails instead of saving an empty snapshot.
+
+The snapshot is written in one transaction with a savepoint per resource type, so a
+failed write never leaves a resource half-saved.
+"""
 
 from __future__ import annotations
 
 import ipaddress
 import json
 import logging
-from collections.abc import Iterable
+import math
+import sqlite3
+import threading
+import time
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from botocore.exceptions import BotoCoreError, ClientError
 
 from . import ownership
 from .attribution import Attribution, attribute_eni, lambda_eni_index, lambda_owners
-from .aws import AwsGateway
+from .aws import AwsGateway, call_timeouts
 from .db import closing
-from .jobs import JobCancelled, NullProgress, Progress
+from .jobs import RES_DONE, RES_RUNNING, SKIPPED, JobCancelled, NullProgress, Progress
+from .settings import DEFAULT_DISCOVERY_TIMEOUT_MIN, DEFAULT_RESOURCE_TIMEOUT
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # Progress steps of one collection (see Collector._step).
 COLLECT_STEPS = 15
@@ -27,6 +47,48 @@ COLLECT_STEPS = 15
 _TAG_PAGE = 100
 # CloudTrail events read per looked-up resource.
 _CLOUDTRAIL_EVENTS = 50
+# Seconds between checks of a running resource for its timeout and for Cancel.
+_POLL = 0.1
+
+# The resource types of a Refresh, in collection order (rows of the progress box).
+CORE_RESOURCES = ("ec2:DescribeVpcs", "ec2:DescribeSubnets", "ec2:DescribeNetworkInterfaces")
+RESOURCES = (
+    "sts:GetCallerIdentity",
+    "iam:ListAccountAliases",
+    *CORE_RESOURCES,
+    "ec2:DescribeInstances",
+    "ec2:DescribeVpcEndpoints",
+    "lambda:ListFunctions",
+    "elasticloadbalancing:DescribeLoadBalancers",
+    "elasticloadbalancing:DescribeTargetGroups",
+    "elasticloadbalancing:DescribeTargetHealth",
+    "ec2:DescribeSecurityGroups",
+    "ECS services and tasks",
+    "elasticloadbalancing:DescribeTags",
+    "lambda:ListTags",
+    "tag:GetResources",
+    "cloudformation:ListStacks",
+)
+CLOUDTRAIL_RESOURCE = "cloudtrail:LookupEvents"
+
+
+class ResourceTimeout(Exception):  # noqa: N818 - named like JobCancelled
+    """A resource type ran past its timeout (or past the Refresh's overall limit)."""
+
+    def __init__(self, resource: str, reason: str):
+        self.resource, self.reason = resource, reason
+        super().__init__(f"{resource} skipped ({reason})")
+
+
+# The abandon flag of the resource running in this helper thread (see Collector._timed).
+_abandon = threading.local()
+
+
+def _check_abandoned() -> None:
+    """Stop an abandoned resource at its next page / call instead of finishing it."""
+    event = getattr(_abandon, "event", None)
+    if event is not None and event.is_set():
+        raise ResourceTimeout("resource", "abandoned")
 
 
 @dataclass
@@ -39,6 +101,8 @@ class CollectResult:
     enis: int = 0
     ips: int = 0
     warnings: list[str] = field(default_factory=list)
+    # (resource type, reason) of every resource type that was skipped.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
 def _name_tag(tags: Iterable[dict[str, str]] | None) -> str:
@@ -61,6 +125,7 @@ def tag_pairs(tags: Iterable[dict[str, str]] | None) -> list[tuple[str, str]]:
 def _paginate(client: Any, op: str, key: str, **kwargs: Any) -> list[Any]:
     out: list[Any] = []
     for page in client.get_paginator(op).paginate(**kwargs):
+        _check_abandoned()
         out.extend(page.get(key, []))
     return out
 
@@ -284,6 +349,8 @@ class Collector:
         account_name: str = "",
         progress: Progress | None = None,
         ownership_config: ownership.OwnershipConfig | None = None,
+        resource_timeout: float = DEFAULT_RESOURCE_TIMEOUT,
+        overall_timeout: float = DEFAULT_DISCOVERY_TIMEOUT_MIN * 60,
     ):
         self.gw = gateway
         # Which tag values are kept, the CI role patterns and the optional sources.
@@ -295,13 +362,102 @@ class Collector:
         # Background job reporting; cancellation is checked between API calls.
         self.progress: Progress = progress or NullProgress()
         self._done = 0
+        # Seconds one resource type may run, and the whole collection.
+        self.resource_timeout = float(resource_timeout)
+        self.overall_timeout = float(overall_timeout)
+        self._deadline = math.inf
+        self._touched: set[str] = set()
+        self._planned: list[str] = []
+        if isinstance(gateway, AwsGateway):
+            gateway.call_config = call_timeouts(self.resource_timeout)
 
     def _step(self, text: str) -> None:
         self.progress.check()
         self.progress.step(f"collect · {text}", done=self._done, total=COLLECT_STEPS)
         self._done += 1
 
+    def _tick(self) -> None:
+        """Between AWS calls of a resource: honour Cancel and the resource's timeout."""
+        self.progress.check()
+        _check_abandoned()
+
+    def _mark(self, what: str, status: str, reason: str = "", timeout: int | None = None) -> None:
+        self._touched.add(what)
+        self.progress.resource(what, status, reason, timeout=timeout)
+
+    def _skip(self, result: CollectResult, what: str, reason: str) -> None:
+        self._mark(what, SKIPPED, reason)
+        result.skipped.append((what, reason))
+
+    def _timed(self, result: CollectResult, what: str, fn: Callable[[], T]) -> T:
+        """Run one resource type in a helper thread, bounded by the per-resource timeout
+        and what is left of the overall limit. Past it the resource is abandoned (its
+        thread stops at the next page; botocore timeouts end a stuck call), recorded as
+        skipped and :class:`ResourceTimeout` is raised. Errors of ``fn`` are re-raised."""
+        left = self._deadline - time.monotonic()
+        overall = left < self.resource_timeout  # the overall limit is the tighter one
+        budget = min(self.resource_timeout, left)
+        if budget <= 0:
+            return self._timed_out(result, what, overall=True)
+        self._mark(what, RES_RUNNING, timeout=math.ceil(budget))
+        abandon = threading.Event()
+        box: dict[str, Any] = {}
+
+        def target() -> None:
+            _abandon.event = abandon
+            with self.progress.bind():
+                try:
+                    box["value"] = fn()
+                except BaseException as exc:  # noqa: BLE001 - handed to the caller
+                    box["error"] = exc
+
+        worker = threading.Thread(target=target, name="iplens-collect-resource", daemon=True)
+        worker.start()
+        end = time.monotonic() + budget
+        while worker.is_alive():
+            worker.join(max(min(_POLL, end - time.monotonic()), 0.0))
+            if worker.is_alive() and self.progress.cancelled:
+                abandon.set()
+                self.progress.check()  # raises JobCancelled
+            if time.monotonic() >= end:
+                break
+        if worker.is_alive():
+            abandon.set()
+            return self._timed_out(result, what, overall=overall)
+        if "error" in box:
+            raise box["error"]
+        self._mark(what, RES_DONE)
+        return box["value"]
+
+    def _timed_out(self, result: CollectResult, what: str, *, overall: bool) -> Any:
+        if overall:
+            minutes = math.ceil(self.overall_timeout / 60)
+            reason = f"overall time limit of {minutes} min reached"
+        else:
+            reason = f"timeout after {math.ceil(self.resource_timeout)}s"
+        msg = f"{what} skipped ({reason})"
+        log.warning(msg)
+        result.warnings.append(msg)
+        self._skip(result, what, reason)
+        raise ResourceTimeout(what, reason)
+
+    def _required(self, result: CollectResult, what: str, fn: Callable[[], list[Any]]) -> list[Any]:
+        """VPCs, subnets and ENIs: any error, a timeout included, fails the collection."""
+        try:
+            return self._timed(result, what, fn)
+        except ResourceTimeout:
+            raise
+        except (BotoCoreError, ClientError) as exc:
+            code = exc.response["Error"]["Code"] if isinstance(exc, ClientError) else ""
+            self._skip(result, what, code or type(exc).__name__)
+            raise
+
     def run(self) -> CollectResult:
+        self._deadline = time.monotonic() + self.overall_timeout
+        self._planned = [*RESOURCES, *([CLOUDTRAIL_RESOURCE] if self.own.cloudtrail else [])]
+        self.progress.plan_resources(
+            self._planned, math.ceil(self.resource_timeout), math.ceil(self.overall_timeout)
+        )
         region = self.gw.region or ""
         started = datetime.now(UTC).isoformat(timespec="seconds")
         with closing(self.db_path) as conn:
@@ -320,6 +476,9 @@ class Collector:
             if isinstance(exc, JobCancelled):
                 log.info("collection cancelled snapshot=%s", snap_id)
                 error = "cancelled"
+            elif isinstance(exc, ResourceTimeout):
+                log.warning("collection failed snapshot=%s: %s", snap_id, exc)
+                error = str(exc)
             else:
                 log.exception("collection failed snapshot=%s", snap_id)
                 error = f"{type(exc).__name__}: {exc}"
@@ -337,6 +496,13 @@ class Collector:
             result.ips,
             len(result.warnings),
         )
+        if result.skipped:
+            log.warning(
+                "collection snapshot=%s skipped %d resource type(s): %s",
+                snap_id,
+                len(result.skipped),
+                "; ".join(f"{what} ({reason})" for what, reason in result.skipped),
+            )
         return result
 
     def _collect(self, snap_id: int) -> CollectResult:
@@ -346,19 +512,32 @@ class Collector:
         account_id = ""
         self._step("sts:GetCallerIdentity")
         try:
-            account_id = self.gw.caller_identity()["account"]
+            account_id = self._timed(result, "sts:GetCallerIdentity", self.gw.caller_identity)[
+                "account"
+            ]
+        except ResourceTimeout:
+            pass  # recorded as a warning by _timed
         except (BotoCoreError, ClientError) as exc:
             result.warnings.append(f"sts:GetCallerIdentity unavailable ({type(exc).__name__})")
+            self._skip(result, "sts:GetCallerIdentity", type(exc).__name__)
         # Display-only: without the permission the UI falls back to the account id.
         aliases = self._optional(result, "iam:ListAccountAliases", self.gw.account_aliases)
         account_alias = aliases[0] if aliases else ""
 
         self._step("ec2:DescribeVpcs")
-        vpcs = _paginate(ec2, "describe_vpcs", "Vpcs")
+        vpcs = self._required(
+            result, "ec2:DescribeVpcs", lambda: _paginate(ec2, "describe_vpcs", "Vpcs")
+        )
         self._step("ec2:DescribeSubnets")
-        subnets = _paginate(ec2, "describe_subnets", "Subnets")
+        subnets = self._required(
+            result, "ec2:DescribeSubnets", lambda: _paginate(ec2, "describe_subnets", "Subnets")
+        )
         self._step("ec2:DescribeNetworkInterfaces")
-        enis = _paginate(ec2, "describe_network_interfaces", "NetworkInterfaces")
+        enis = self._required(
+            result,
+            "ec2:DescribeNetworkInterfaces",
+            lambda: _paginate(ec2, "describe_network_interfaces", "NetworkInterfaces"),
+        )
         self._step("ec2:DescribeInstances")
         instances = instance_eni_index(
             self._optional(
@@ -424,7 +603,10 @@ class Collector:
         tag_rows += [("lb", name, *kv) for name, pairs in lb_tags.items() for kv in pairs]
         tag_rows += [("lambda", name, *kv) for name, pairs in lambda_tags.items() for kv in pairs]
 
-        with closing(self.db_path) as conn:
+        ip_count = 0
+
+        # One writer per resource type; each runs in its own savepoint (see _saving).
+        def write_vpcs(conn: sqlite3.Connection) -> None:
             for v in vpcs:
                 cidrs = [
                     a["CidrBlock"]
@@ -442,6 +624,8 @@ class Collector:
                         int(bool(v.get("IsDefault"))),
                     ),
                 )
+
+        def write_subnets(conn: sqlite3.Connection) -> None:
             for s in subnets:
                 conn.execute(
                     "INSERT INTO subnets(snapshot_id, subnet_id, vpc_id, name, cidr, az, "
@@ -456,7 +640,9 @@ class Collector:
                         s.get("AvailableIpAddressCount"),
                     ),
                 )
-            ip_count = 0
+
+        def write_enis(conn: sqlite3.Connection) -> None:
+            nonlocal ip_count
             for e in enis:
                 inst = instances.get(e["NetworkInterfaceId"])
                 attachment = e.get("Attachment") or {}
@@ -538,6 +724,8 @@ class Collector:
                             ),
                         )
                         ip_count += 1
+
+        def write_endpoints(conn: sqlite3.Connection) -> None:
             for ep in endpoints:
                 conn.execute(
                     "INSERT INTO endpoints(snapshot_id, endpoint_id, vpc_id, service_name, "
@@ -552,6 +740,8 @@ class Collector:
                         json.dumps(ep.get("NetworkInterfaceIds", [])),
                     ),
                 )
+
+        def write_lambdas(conn: sqlite3.Connection) -> None:
             subnet_vpc = {s["SubnetId"]: s["VpcId"] for s in subnets}
             for fn in lambdas:
                 vpc_cfg = fn.get("VpcConfig") or {}
@@ -576,6 +766,8 @@ class Collector:
                         json.dumps(sorted(vpc_cfg.get("SecurityGroupIds", []))),
                     ),
                 )
+
+        def write_load_balancers(conn: sqlite3.Connection) -> None:
             for lb in lbs:
                 conn.execute(
                     "INSERT INTO load_balancers(snapshot_id, name, lb_type, scheme, vpc_id) "
@@ -588,6 +780,16 @@ class Collector:
                         lb.get("VpcId"),
                     ),
                 )
+
+        def write_lb_targets(conn: sqlite3.Connection) -> None:
+            for row in lb_targets.targets:
+                conn.execute(
+                    "INSERT OR IGNORE INTO lb_targets(snapshot_id, lb_name, target_group, "
+                    "target_type, target_id, port) VALUES(?,?,?,?,?,?)",
+                    (snap_id, *row),
+                )
+
+        def write_ecs(conn: sqlite3.Connection) -> None:
             for svc in ecs.services:
                 conn.execute(
                     "INSERT OR IGNORE INTO ecs_services(snapshot_id, cluster, service, "
@@ -607,12 +809,6 @@ class Collector:
                     "task_id) VALUES(?,?,?,?,?)",
                     (snap_id, eni_id, task.cluster, task.service, task.task_id),
                 )
-            for row in lb_targets.targets:
-                conn.execute(
-                    "INSERT OR IGNORE INTO lb_targets(snapshot_id, lb_name, target_group, "
-                    "target_type, target_id, port) VALUES(?,?,?,?,?,?)",
-                    (snap_id, *row),
-                )
             for svc in ecs.services:
                 for tg_arn, classic_name in svc["load_balancers"]:
                     tg = lb_targets.groups.get(tg_arn)
@@ -625,6 +821,8 @@ class Collector:
                             "service, lb_name, target_group) VALUES(?,?,?,?,?)",
                             (snap_id, svc["cluster"], svc["service"], lb_name, tg_name),
                         )
+
+        def write_security_groups(conn: sqlite3.Connection) -> None:
             for row in sg_ref_rows(security_groups):
                 conn.execute(
                     "INSERT OR IGNORE INTO sg_refs(snapshot_id, group_id, direction, "
@@ -649,11 +847,15 @@ class Collector:
                         g.get("VpcId"),
                     ),
                 )
+
+        def write_tags(conn: sqlite3.Connection) -> None:
             conn.executemany(
                 "INSERT OR IGNORE INTO resource_tags(snapshot_id, resource_type, resource_id, "
                 "key, value) VALUES(?,?,?,?,?)",
                 [(snap_id, *row) for row in tag_rows],
             )
+
+        def write_ownership(conn: sqlite3.Connection) -> None:
             conn.executemany(
                 "INSERT OR IGNORE INTO own_resources(snapshot_id, kind, resource_id, cfn_stack) "
                 "VALUES(?,?,?,?)",
@@ -665,9 +867,32 @@ class Collector:
                 [(snap_id, *row) for row in own_tags],
             )
 
+        writers = (
+            ("ec2:DescribeVpcs", True, write_vpcs),
+            ("ec2:DescribeSubnets", True, write_subnets),
+            ("ec2:DescribeNetworkInterfaces", True, write_enis),
+            ("ec2:DescribeVpcEndpoints", False, write_endpoints),
+            ("lambda:ListFunctions", False, write_lambdas),
+            ("elasticloadbalancing:DescribeLoadBalancers", False, write_load_balancers),
+            ("elasticloadbalancing:DescribeTargetHealth", False, write_lb_targets),
+            ("ECS services and tasks", False, write_ecs),
+            ("ec2:DescribeSecurityGroups", False, write_security_groups),
+            ("resource tags", False, write_tags),
+            ("ownership (tag:GetResources, CloudFormation)", False, write_ownership),
+        )
+        with closing(self.db_path) as conn:
+            conn.execute("BEGIN")  # the savepoints below nest inside this one transaction
+            for what, required, write in writers:
+                with self._saving(conn, result, what, required=required):
+                    write(conn)
+
         self._step("cloudtrail:LookupEvents")
         if self.own.cloudtrail:
             self._collect_creators(result, snap_id)
+        # Planned resource types that had nothing to collect (e.g. no load balancers).
+        for what in self._planned:
+            if what not in self._touched:
+                self.progress.resource(what, RES_DONE, "nothing to collect")
         with closing(self.db_path) as conn:
             conn.execute(
                 "UPDATE snapshots SET status='ok', account_id=?, account_alias=?, warnings=? "
@@ -691,7 +916,7 @@ class Collector:
         client = self.gw.client("resourcegroupstaggingapi")
         out = []
         for page in client.get_paginator("get_resources").paginate(ResourcesPerPage=_TAG_PAGE):
-            self.progress.check()
+            self._tick()
             for item in page.get("ResourceTagMappingList", []):
                 key = ownership.arn_key(item.get("ResourceARN", ""))
                 if key:
@@ -706,7 +931,7 @@ class Collector:
         stacks = _paginate(cfn, "list_stacks", "StackSummaries")
         live = [s for s in stacks if s.get("StackStatus") != "DELETE_COMPLETE"]
         for stack in live:
-            self.progress.check()
+            self._tick()
             name = stack.get("StackName", "")
             for r in _paginate(
                 cfn, "list_stack_resources", "StackResourceSummaries", StackName=name
@@ -763,7 +988,7 @@ class Collector:
         def lookup() -> list[tuple[ownership.ResourceKey, ownership.Principal]]:
             found = []
             for key in unowned[:limit]:
-                self.progress.check()
+                self._tick()
                 principal = _creator(ct, key[1])
                 if principal:
                     found.append((key, principal))
@@ -807,6 +1032,7 @@ class Collector:
         def targets() -> list[tuple[str, str, str, str, int]]:
             rows = []
             for arn, tg in data.groups.items():
+                self._tick()
                 resp = elbv2.describe_target_health(TargetGroupArn=arn)
                 for desc in resp.get("TargetHealthDescriptions", []):
                     target = desc.get("Target") or {}
@@ -835,6 +1061,7 @@ class Collector:
         def fetch() -> list[tuple[str, list[tuple[str, str]]]]:
             out = []
             for batch in _chunks(sorted(names), _LB_TAG_BATCH):
+                self._tick()
                 for d in elbv2.describe_tags(ResourceArns=batch).get("TagDescriptions", []):
                     if d.get("ResourceArn") in names:
                         out.append((names[d["ResourceArn"]], tag_pairs(d.get("Tags"))))
@@ -858,6 +1085,7 @@ class Collector:
         def fetch() -> list[tuple[str, list[tuple[str, str]]]]:
             out = []
             for fn in in_vpc:
+                self._tick()
                 tags = lam.list_tags(Resource=fn["FunctionArn"]).get("Tags") or {}
                 pairs = tag_pairs({"Key": k, "Value": v} for k, v in tags.items())
                 out.append((fn["FunctionName"], pairs))
@@ -873,38 +1101,22 @@ class Collector:
         discards the partial ECS data, records a warning and lets the snapshot
         continue without the mapping.
         """
-        data = EcsData()
+        what = "ECS services and tasks"
         try:
-            ecs = self.gw.client("ecs")
-            for cluster_arn in _paginate(ecs, "list_clusters", "clusterArns"):
-                cluster = _arn_name(cluster_arn)
-                svc_arns = _paginate(ecs, "list_services", "serviceArns", cluster=cluster_arn)
-                for batch in _chunks(svc_arns, _ECS_SERVICE_BATCH):
-                    resp = ecs.describe_services(
-                        cluster=cluster_arn, services=batch, include=["TAGS"]
-                    )
-                    for svc in resp.get("services", []):
-                        data.services.append(_ecs_service_row(cluster, svc))
-                task_arns = _paginate(ecs, "list_tasks", "taskArns", cluster=cluster_arn)
-                for batch in _chunks(task_arns, _ECS_TASK_BATCH):
-                    resp = ecs.describe_tasks(cluster=cluster_arn, tasks=batch)
-                    for task in resp.get("tasks", []):
-                        for eni_id in _task_eni_ids(task):
-                            data.task_enis[eni_id] = EcsTaskEni(
-                                cluster=cluster,
-                                service=_task_service(task),
-                                task_id=_arn_name(task.get("taskArn", "")),
-                            )
+            data = self._timed(result, what, self._fetch_ecs)
+        except ResourceTimeout:
+            return EcsData()
         except (BotoCoreError, ClientError) as exc:
             if isinstance(exc, ClientError):
                 op = exc.operation_name
                 code = exc.response.get("Error", {}).get("Code", "")
-                what = f"ecs:{op} ({code or 'ClientError'})"
+                cause = f"ecs:{op} ({code or 'ClientError'})"
             else:
-                what = type(exc).__name__
-            msg = f"ECS enrichment skipped: {what}; ECS task ENIs are attributed heuristically"
+                cause = type(exc).__name__
+            msg = f"ECS enrichment skipped: {cause}; ECS task ENIs are attributed heuristically"
             log.warning(msg)
             result.warnings.append(msg)
+            self._skip(result, what, cause)
             return EcsData()
         log.info(
             "ECS enrichment: %d service(s), %d task ENI(s)",
@@ -913,14 +1125,63 @@ class Collector:
         )
         return data
 
-    @staticmethod
-    def _optional(result: CollectResult, what: str, fn: Any) -> list[Any]:
-        """Optional enrichment calls: missing permissions downgrade to a warning."""
+    def _fetch_ecs(self) -> EcsData:
+        """ListClusters / ListServices / DescribeServices / ListTasks / DescribeTasks."""
+        data = EcsData()
+        ecs = self.gw.client("ecs")
+        for cluster_arn in _paginate(ecs, "list_clusters", "clusterArns"):
+            cluster = _arn_name(cluster_arn)
+            svc_arns = _paginate(ecs, "list_services", "serviceArns", cluster=cluster_arn)
+            for batch in _chunks(svc_arns, _ECS_SERVICE_BATCH):
+                self._tick()
+                resp = ecs.describe_services(cluster=cluster_arn, services=batch, include=["TAGS"])
+                for svc in resp.get("services", []):
+                    data.services.append(_ecs_service_row(cluster, svc))
+            task_arns = _paginate(ecs, "list_tasks", "taskArns", cluster=cluster_arn)
+            for batch in _chunks(task_arns, _ECS_TASK_BATCH):
+                self._tick()
+                resp = ecs.describe_tasks(cluster=cluster_arn, tasks=batch)
+                for task in resp.get("tasks", []):
+                    for eni_id in _task_eni_ids(task):
+                        data.task_enis[eni_id] = EcsTaskEni(
+                            cluster=cluster,
+                            service=_task_service(task),
+                            task_id=_arn_name(task.get("taskArn", "")),
+                        )
+        return data
+
+    def _optional(self, result: CollectResult, what: str, fn: Any) -> list[Any]:
+        """Optional enrichment calls: missing permissions and timeouts downgrade to a
+        warning, and the collection continues without this resource type."""
         try:
-            return fn()
+            return self._timed(result, what, fn)
+        except ResourceTimeout:
+            return []
         except (BotoCoreError, ClientError) as exc:
             code = exc.response["Error"]["Code"] if isinstance(exc, ClientError) else ""
             msg = f"{what} skipped ({code or type(exc).__name__})"
             log.warning(msg)
             result.warnings.append(msg)
+            self._skip(result, what, code or type(exc).__name__)
             return []
+
+    @contextmanager
+    def _saving(
+        self, conn: sqlite3.Connection, result: CollectResult, what: str, *, required: bool = False
+    ) -> Iterator[None]:
+        """One resource type's rows, all or nothing (a savepoint of the snapshot's
+        transaction). A failed optional write is a warning; a required one re-raises."""
+        conn.execute("SAVEPOINT resource_write")
+        try:
+            yield
+        except Exception as exc:
+            conn.execute("ROLLBACK TO resource_write")
+            conn.execute("RELEASE resource_write")
+            if required:
+                raise
+            msg = f"{what} not saved ({type(exc).__name__})"
+            log.exception(msg)
+            result.warnings.append(msg)
+            self._skip(result, what, f"write failed ({type(exc).__name__})")
+        else:
+            conn.execute("RELEASE resource_write")
