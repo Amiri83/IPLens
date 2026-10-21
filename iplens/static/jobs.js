@@ -259,7 +259,8 @@
   });
 
   // "Retry skipped": a new Refresh of the active account that collects only the skipped
-  // resource types (plus VPCs, subnets and ENIs, which every snapshot needs).
+  // resource types (plus VPCs, subnets and ENIs, which every snapshot needs); the server
+  // copies the other resource types from the latest snapshot, so the new one is complete.
   retryBtn.addEventListener("click", () => {
     startJob(modal.dataset.refreshUrl, { only: skippedNames }, [retryBtn]);
   });

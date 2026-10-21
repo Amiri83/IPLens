@@ -253,7 +253,10 @@ def test_abandoned_thread_writes_nothing_to_the_job_after_its_skip(db_path, monk
 
 def test_retry_plan_adds_what_a_type_needs_and_unknown_names_mean_everything():
     base = {*collector_mod.IDENTITY_RESOURCES, *collector_mod.CORE_RESOURCES}
-    assert collector_mod.retry_plan(["tag:GetResources"]) == {*base, "tag:GetResources"}
+    # The ownership rows merge tags and stacks, so both are collected again together.
+    ownership_sources = {"tag:GetResources", "cloudformation:ListStacks"}
+    assert collector_mod.retry_plan(["tag:GetResources"]) == {*base, *ownership_sources}
+    assert collector_mod.retry_plan(["cloudformation:ListStacks"]) == {*base, *ownership_sources}
     assert collector_mod.retry_plan(["elasticloadbalancing:DescribeTargetHealth"]) == {
         *base,
         "elasticloadbalancing:DescribeLoadBalancers",
@@ -265,11 +268,7 @@ def test_retry_plan_adds_what_a_type_needs_and_unknown_names_mean_everything():
         "lambda:ListFunctions",
         "lambda:ListTags",
     }
-    assert collector_mod.retry_plan([collector_mod.OWNERSHIP_WRITE]) == {
-        *base,
-        "tag:GetResources",
-        "cloudformation:ListStacks",
-    }
+    assert collector_mod.retry_plan([collector_mod.OWNERSHIP_WRITE]) == {*base, *ownership_sources}
     assert collector_mod.retry_plan(["ec2:DescribeSubnets"]) == base
     # Not one resource type (the tags write spans all of them), or nothing: a full Refresh.
     assert collector_mod.retry_plan(["resource tags"]) is None
@@ -280,6 +279,7 @@ def test_retry_plan_adds_what_a_type_needs_and_unknown_names_mean_everything():
 @mock_aws
 def test_retry_collects_only_the_skipped_types(db_path, monkeypatch):
     _aws()
+    source = Collector(_gateway(), db_path).run().snapshot_id
     calls: list[str] = []
     real = collector_mod._paginate
 
@@ -295,7 +295,11 @@ def test_retry_collects_only_the_skipped_types(db_path, monkeypatch):
 
     def work(ctx):
         out["result"] = Collector(
-            _gateway(), db_path, progress=ctx, only=["tag:GetResources", "ec2:DescribeInstances"]
+            _gateway(),
+            db_path,
+            progress=ctx,
+            only=["tag:GetResources", "ec2:DescribeInstances"],
+            source_snapshot=source,
         ).run()
 
     job = mgr.start(1, "refresh", work, background=False)
@@ -306,6 +310,7 @@ def test_retry_collects_only_the_skipped_types(db_path, monkeypatch):
         "describe_network_interfaces",
         "describe_subnets",
         "describe_vpcs",
+        "list_stacks",
     ]
     assert fetched == [1]
     assert [r["name"] for r in job["items"]] == [
@@ -316,12 +321,14 @@ def test_retry_collects_only_the_skipped_types(db_path, monkeypatch):
         "ec2:DescribeNetworkInterfaces",
         "ec2:DescribeInstances",
         "tag:GetResources",
+        "cloudformation:ListStacks",
     ]
     assert {r["status"] for r in job["items"]} == {jobs.RES_DONE}
     assert (result.enis, result.ips) == (1, 1) and result.skipped == []
     assert (
-        "Retry of skipped resources: this snapshot has VPCs, subnets, ENIs and only "
-        "ec2:DescribeInstances, tag:GetResources"
+        "Retry of skipped resources: collected VPCs, subnets, ENIs and ec2:DescribeInstances, "
+        "tag:GetResources, cloudformation:ListStacks; the other resource types are copied "
+        f"from snapshot {source}"
     ) in result.warnings
     mgr.close()
 
@@ -486,16 +493,17 @@ def test_refresh_endpoint_passes_the_skipped_types_to_the_collector(app, client,
         assert manager.wait(body["job"]["id"], WAIT)
         return client.get(f"/jobs/{body['job']['id']}").get_json()["job"]
 
-    job = refresh({"only": ["tag:GetResources", "lambda:ListTags"]})
-    assert seen[-1] == ["tag:GetResources", "lambda:ListTags"]
-    assert job["state"] == jobs.DONE
-    names = {r["name"] for r in job["items"]}
-    assert {"tag:GetResources", "lambda:ListTags", "lambda:ListFunctions"} <= names
-    assert "ec2:DescribeInstances" not in names and "cloudformation:ListStacks" not in names
-    # A plain Refresh (no "only") still collects every resource type.
+    # A plain Refresh (no "only") collects every resource type.
     job = refresh({})
     assert seen[-1] is None
     assert "ec2:DescribeInstances" in {r["name"] for r in job["items"]}
+    # The retry copies the other resource types from that (latest) snapshot.
+    job = refresh({"only": ["elasticloadbalancing:DescribeTags", "lambda:ListTags"]})
+    assert seen[-1] == ["elasticloadbalancing:DescribeTags", "lambda:ListTags"]
+    assert job["state"] == jobs.DONE
+    names = {r["name"] for r in job["items"]}
+    assert {"lambda:ListTags", "lambda:ListFunctions", "elasticloadbalancing:DescribeTags"} <= names
+    assert "ec2:DescribeInstances" not in names and "tag:GetResources" not in names
 
 
 def test_progress_box_has_cancel_banner_and_retry(client):

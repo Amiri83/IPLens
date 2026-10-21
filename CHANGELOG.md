@@ -40,8 +40,14 @@
   resource type that is stuck in an AWS call.
 - **Retry skipped** collects only the skipped resource types (plus what they need, e.g. load
   balancers for target health), the account identity and VPCs / subnets / ENIs, instead of
-  re-running the whole Refresh; the new snapshot says which types it holds. A skipped write
-  that spans every type (resource tags) still retries everything.
+  re-running the whole Refresh. A skipped write that spans every type (resource tags) still
+  retries everything.
+- **Retry skipped** no longer saves a partial snapshot: in the same transaction the rows of
+  every resource type it does not collect are copied from the account's latest snapshot, the
+  retried ones are written fresh and the ENIs are attributed on the merged data. Overview and
+  attribution stay complete, Diff / Trends show no false removals and retention keeps a full
+  snapshot. tag:GetResources and CloudFormation are retried together (ownership merges both).
+  Without that source snapshot (e.g. deleted meanwhile) the retry runs a full Refresh.
 - Hide / reopen of the progress box is no longer lost when you navigate right after
   clicking (the request is sent with `keepalive`).
 - Refresh AWS calls use 2 retries (standard mode) with a read timeout sized so that all

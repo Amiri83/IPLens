@@ -629,17 +629,21 @@ def _register(app: Flask) -> None:
                 return jsonify({"ok": False, "error": "Add an AWS account in Settings first."}), 400
             flash("Add an AWS account in Settings first.", "error")
             return redirect(url_for("settings_page"))
-        # "Retry skipped": only the skipped resource types (unknown names: a full Refresh).
+        # "Retry skipped": only the skipped resource types (unknown names: a full Refresh);
+        # the others are copied from the account's latest successful snapshot, the one the
+        # skipped resources are missing from (none: a full Refresh).
         only = [name[:MAX_RESOURCE_NAME] for name in request.form.getlist("only")[:MAX_RETRY]]
-        work = _refresh_work(active.id, only or None)
+        source = queries.latest_snapshot(_db(), active.id) if only else None
+        work = _refresh_work(active.id, only or None, source["id"] if source else None)
         return _run_job(active.id, "refresh", work, url_for("overview"))
 
     def _refresh_work(
-        account_id: int, only: list[str] | None = None
+        account_id: int, only: list[str] | None = None, source_snapshot: int | None = None
     ) -> Callable[[JobContext], None]:
         """The Refresh job of an account (a manual Refresh or a scheduled one). Needs a
         request context; everything the job needs is resolved here, so the worker never
-        touches the request. ``only``: the resource types a "Retry skipped" collects."""
+        touches the request. ``only``: the resource types a "Retry skipped" collects;
+        ``source_snapshot``: the snapshot it copies the other resource types from."""
         account = _accounts().get(account_id, with_secret=True)
         if account is None:
             raise ValueError(f"unknown account {account_id}")
@@ -675,6 +679,7 @@ def _register(app: Flask) -> None:
                     resource_timeout=resource_timeout,
                     overall_timeout=overall_timeout,
                     only=only,
+                    source_snapshot=source_snapshot,
                 ).run()
                 with closing(db_path) as conn:
                     pruned = retention_mod.apply(conn, policy)
