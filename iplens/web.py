@@ -36,6 +36,7 @@ from . import (
     environment,
     extgraph,
     flowlogs,
+    headroom,
     ownership,
     queries,
     scheduler,
@@ -524,10 +525,12 @@ def _register(app: Flask) -> None:
     @app.get("/")
     def overview():
         snap = _snapshot_or_none()
-        tree, owners, envs = [], {}, []
+        tree, owners, envs, scale = [], {}, [], {}
         if snap:
             tree = queries.vpc_tree(_db(), snap["id"], _scope())
             owners = queries.owner_breakdown(_db(), snap["id"], _scope())
+            # Headroom column: free IPs vs. demand at max scale (see the Headroom page).
+            scale = headroom.for_snapshot(_db(), snap["id"], _scope()).by_id
             # Environment choices of the Report button.
             envs = environment.summary(
                 r["environment"]
@@ -548,6 +551,7 @@ def _register(app: Flask) -> None:
             env_not_set=environment.FILTER_NOT_SET,
             soon=soon,
             soon_days=trends.SOON_DAYS,
+            scale=scale,
             history=history,
             protected=queries.protected_snapshot_ids(_db()),
             confirm_word=DELETE_CONFIRMATION,
@@ -901,6 +905,22 @@ def _register(app: Flask) -> None:
             tf_secondary=cidrplan.tf_secondary,
         )
 
+    # -- scale headroom (free IPs vs. demand at max scale) --------------------------------
+
+    @app.get("/headroom")
+    def headroom_page():
+        snap = _snapshot_or_none()
+        if not snap:
+            return render_template("headroom.html", snap=None)
+        result = headroom.for_snapshot(_db(), snap["id"], _scope())
+        return render_template(
+            "headroom.html",
+            snap=snap,
+            h=result,
+            tight_pct=headroom.TIGHT_PCT,
+            alb_reserve=headroom.ALB_RESERVE,
+        )
+
     # -- report (one self-contained HTML document) ----------------------------------------
 
     @app.get("/report")
@@ -939,6 +959,8 @@ def _register(app: Flask) -> None:
             soon_days=trends.SOON_DAYS,
             at_risk_pct=report_mod.AT_RISK_FREE_PCT,
             low_pct=report_mod.LOW_HEADROOM_PCT,
+            tight_pct=headroom.TIGHT_PCT,
+            alb_reserve=headroom.ALB_RESERVE,
             max_unmanaged=report_mod.MAX_UNMANAGED_LISTED,
         )
         if redactor is not None:

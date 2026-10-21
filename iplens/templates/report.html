@@ -186,6 +186,55 @@ footer { margin-top: 2rem; color: var(--muted); font-size: 11px; border-top: 1px
   {% endfor %}
 </section>
 
+<section id="scale-headroom">
+  <h2>Scale headroom</h2>
+  {% set sc = r.scale %}{% set c = sc.counts %}
+  <p class="muted">Free IPs of each subnet against the worst case: Auto Scaling groups and ECS services at
+    their maximum (new instances / tasks spread evenly over their subnets), {{ alb_reserve }} free IPs kept per
+    ALB subnet and 1 IP per new Lambda subnet / security group combination. <b>tight</b>: less than
+    {{ tight_pct | int }}% of the subnet's usable IPs left at max scale; <b>over</b>: runs out before max.</p>
+  {% for n in sc.notes %}<div class="note">{{ n }}</div>{% endfor %}
+  <div class="tiles">
+    <div class="tile"><div class="k">Over</div><div class="v">{{ c.over }}</div></div>
+    <div class="tile"><div class="k">Tight</div><div class="v">{{ c.tight }}</div></div>
+    <div class="tile"><div class="k">OK</div><div class="v">{{ c.ok }}</div></div>
+  </div>
+  <table>
+    <thead><tr><th>Subnet</th><th>AZ</th><th class="num">Free</th><th class="num">Demand at max</th>
+      <th class="num">Left</th><th>Result</th><th>Contributors</th></tr></thead>
+    <tbody>
+    {% for s in sc.subnets if s.status != 'ok' %}
+      <tr>
+        <td class="mono">{{ s.subnet.subnet_id }}<div class="muted">{{ s.subnet.name }}</div></td>
+        <td>{{ s.subnet.az }}</td>
+        <td class="num">{{ s.free }}</td>
+        <td class="num">{{ s.demand }}</td>
+        <td class="num">{{ s.left }}</td>
+        <td><span class="badge {{ 'err' if s.status == 'over' else 'warn' }}">{{ s.status_label }}</span></td>
+        <td>{% for x in s.contributors %}<div>{{ x.text }}</div>{% else %}<span class="muted">no scaling demand</span>{% endfor %}
+          {% if s.suggestion %}<div class="note"><b>Suggestion:</b> {{ s.suggestion }}
+            CIDR Planner: VPC <span class="mono">{{ s.subnet.vpc_id }}</span>{% if s.needed_prefix %}, a /{{ s.needed_prefix }}{{ ' in ' ~ s.subnet.az if s.subnet.az }}{% endif %}.</div>{% endif %}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="7" class="muted">Every subnet has room at max scale.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% for v in sc.by_az if v.azs | length > 1 %}
+    <h3><span class="mono">{{ v.vpc_id }}</span> by AZ {% if v.imbalanced %}<span class="badge warn">AZ imbalance</span>{% endif %}</h3>
+    <table>
+      <thead><tr><th>AZ</th><th class="num">Subnets</th><th class="num">Free</th><th class="num">Demand at max</th><th class="num">Left</th><th>Worst result</th></tr></thead>
+      <tbody>
+      {% for a in v.azs %}
+        <tr><td>{{ a.az or '–' }}</td><td class="num">{{ a.subnets | length }}</td><td class="num">{{ a.free }}</td>
+          <td class="num">{{ a.demand }}</td><td class="num">{{ a.left }}</td>
+          <td><span class="badge {{ {'over': 'err', 'tight': 'warn', 'ok': 'ok'}[a.status] }}">{{ {'over': 'over', 'tight': 'tight', 'ok': 'OK'}[a.status] }}</span></td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endfor %}
+</section>
+
 <section id="headroom">
   <h2>CIDR headroom</h2>
   <p class="muted">Free space of each VPC CIDR (every subnet counts). Less than {{ low_pct | int }}% free is flagged.

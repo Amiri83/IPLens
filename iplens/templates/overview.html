@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import usage_bar, legend, no_data with context %}
+{% from "_macros.html" import usage_bar, legend, no_data, headroom_badge with context %}
 {% block title %}Discovery{% endblock %}
 {% block content %}
 <div class="row" style="justify-content: space-between">
@@ -57,7 +57,8 @@
       </summary>
       <table>
         <thead><tr><th>Subnet</th><th>Name</th><th>CIDR</th><th>AZ</th><th>Usage</th>
-          <th>Used</th><th>Idle</th><th>Free</th><th>Free %</th><th>AWS avail.</th></tr></thead>
+          <th>Used</th><th>Idle</th><th>Free</th><th>Free %</th><th>AWS avail.</th>
+          <th title="Free IPs left if every ASG, ECS service, ALB and Lambda scales to its maximum">Headroom</th></tr></thead>
         <tbody>
         {% for s in v.subnets %}
           <tr>
@@ -72,9 +73,10 @@
             <td>{{ s.used }}</td><td>{{ s.idle }}</td><td>{{ s.free }}</td>
             <td>{{ s.free_pct | pct }}</td>
             <td class="muted">{{ s.aws_available if s.aws_available is not none else '–' }}</td>
+            <td>{{ headroom_badge(scale.get(s.subnet_id)) }}</td>
           </tr>
         {% else %}
-          <tr><td colspan="10" class="muted">No subnets</td></tr>
+          <tr><td colspan="11" class="muted">No subnets</td></tr>
         {% endfor %}
         </tbody>
       </table>

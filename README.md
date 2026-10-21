@@ -18,6 +18,8 @@ Local web app for private IPv4 usage visibility &amp; optimization across one or
   a "full in ~N days" forecast per subnet and VPC.
 - **Diff** – compare two snapshots: ENIs / IPs added, removed and changed, net delta per subnet,
   top consumers.
+- **Scale headroom** – free IPs per subnet vs. the worst-case demand if every Auto Scaling group,
+  ECS service, ALB and Lambda scales to its maximum; subnets that run out before max are flagged.
 - **CIDR planner** – free blocks and fragmentation per VPC CIDR, a Fit tool for new subnets and
   secondary-CIDR proposals checked for overlaps.
 - **Report** – one self-contained, printable HTML report per account, optionally with identifiers
@@ -193,6 +195,28 @@ one before). It lists ENIs and IPs added, removed and changed, grouped by resour
 environment, with the net IP delta per subnet and the top consumers – the resources whose IP count
 grew the most.
 
+## Scale headroom
+
+**Headroom** sets each subnet's free IPs against the demand if everything scales to its maximum,
+and lists each contributor with its assumption, e.g. "ASG web: +6 (max 20, now 8: 6 instances
+here of 12 more over 2 subnets, 1 ENI per instance)":
+
+- **Auto Scaling group**: `max - current` instances spread evenly over its subnets (the remainder
+  to the subnets with the fewest instances now), times the ENIs per instance of its current
+  instances (1 when none is in the snapshot).
+- **ECS service** (awsvpc): `max - running` tasks spread the same way, 1 IP each. The maximum is
+  the service's Application Auto Scaling target; without one it is the desired count.
+- **ALB**: AWS needs at least 8 free IPs per ALB subnet to scale, so 8 are reserved per subnet.
+- **Lambda**: invocations take no IPs; only a subnet / security group combination without an ENI
+  yet costs 1 IP.
+
+A subnet is **over** when it runs out before max and **tight** when less than 20% of its usable
+IPs are left; the page sorts them worst first, sums them per AZ to show imbalance and, for a
+subnet that is over, suggests a bigger subnet or a secondary CIDR with a link to the CIDR Planner.
+Discovery shows the result in a Headroom column and the report has a Scale headroom section. A
+source that was skipped (missing permission, timeout) is named on the page and the demand uses
+what is known.
+
 ## CIDR planner
 
 **CIDR Planner** shows, per VPC CIDR, the subnets, the free blocks between them, how many aligned
@@ -266,6 +290,9 @@ Managed-service names: `rds:DescribeDBInstances`, `rds:DescribeDBClusters`,
 `kafka:ListClustersV2` name the ENIs of RDS / Aurora, Redshift, ElastiCache, OpenSearch and MSK
 after their cluster or domain ("Aurora cluster db-a" instead of "RDS"); each one missing is a
 Refresh warning and those ENIs keep the generic attribution.
+Scale headroom: `autoscaling:DescribeAutoScalingGroups` (group sizes and subnets) and
+`application-autoscaling:DescribeScalableTargets` (ECS service maximums); each one missing is a
+Refresh warning and the headroom uses what is known.
 Ownership: `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources`
 and, when enabled in Settings, `cloudtrail:LookupEvents` (all read-only and listed explicitly in
 the guard's allowlist); a missing permission becomes a Refresh warning and that source is skipped.
@@ -299,6 +326,7 @@ sources, simply not enabled).
 | EC2 instance names and attachment IPs | `ec2:DescribeInstances` | optional (skipped with warning) |
 | Visual: LB → target and security group connections | `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth`, `ec2:DescribeSecurityGroups` | optional (connections left out) |
 | Managed-service ENI names (RDS / Aurora, Redshift, ElastiCache, OpenSearch, MSK) | `rds:DescribeDBInstances`, `rds:DescribeDBClusters`, `redshift:DescribeClusters`, `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups`, `es:ListDomainNames`, `es:DescribeDomains`, `kafka:ListClustersV2` | optional (missing permission = warning + skip; ENIs keep the generic name) |
+| Scale headroom (ASG and ECS service maximums) | `autoscaling:DescribeAutoScalingGroups`, `application-autoscaling:DescribeScalableTargets` | optional (missing permission = warning; headroom uses what is known) |
 | Ownership: tags, CloudFormation | `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources` | optional (skipped with warning) |
 | Ownership: CloudTrail creator | `cloudtrail:LookupEvents` | optional, **opt-in** in Settings |
 | Extended view: services | `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:ListTables`, `dynamodb:DescribeTable`, `events:List*`, `s3:ListAllMyBuckets`, `s3:GetBucketNotification`, `apigateway:GET`, `states:List*`, `states:DescribeStateMachine`, `secretsmanager:ListSecrets`, `lambda:ListEventSourceMappings`, `ecs:List*`, `ecs:Describe*`, `kafka:ListClustersV2` | optional, each source skipped with warning |
