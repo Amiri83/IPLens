@@ -149,6 +149,53 @@
   <p><button type="submit">Save</button></p>
 </form>
 
+<section class="card" id="alerts">
+  <h2 style="margin-top: 0">Alerts</h2>
+  <p class="muted">After each Refresh, every subnet of the account is checked against the thresholds below,
+    and subnets whose alert state changed are posted to a webhook as one Slack / Teams-compatible JSON message
+    (<span class="mono">{"text": "..."}</span>). A subnet is only sent again when its state changes (including
+    one "resolved" line when it clears), so repeated Refreshes do not repeat an alert. A failed send is logged,
+    never fails the Refresh, and is retried after the next one. This webhook POST is the only outbound call
+    IPLens makes besides AWS.</p>
+  <form method="post" action="{{ url_for('alerts_save') }}" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="webhook_url">Webhook URL</label>
+    {% if alert.configured %}
+      <p class="small">Set: <span class="mono">{{ alert.webhook_display }}</span> <span class="badge">encrypted</span>
+        <span class="muted">— leave the box empty to keep it</span>
+        <label class="check"><input type="checkbox" name="clear_webhook" value="1"> remove it</label></p>
+    {% elif alert.undecryptable %}
+      <div class="flash warn">The stored webhook URL cannot be decrypted with the current secret key: set it again.</div>
+    {% endif %}
+    <input id="webhook_url" name="webhook_url" type="password" size="60" class="mono"
+           placeholder="https://hooks.slack.com/services/…" maxlength="2048">
+    <p class="muted small">Encrypted at rest like the account credentials, never logged and never shown again
+      (only its host). https only.</p>
+    <label class="check"><input type="checkbox" name="on_over" value="1" {{ 'checked' if alert.on_over }}>
+      Alert when a subnet's <a href="{{ url_for('headroom_page') }}">scale headroom</a> becomes <b>over</b></label>
+    <div class="row">
+      <div><label for="forecast_days">Forecast: demand stops fitting within (days)</label>
+        <input id="forecast_days" name="forecast_days" type="number" value="{{ alert.forecast_days }}"
+               min="{{ alert_limits.days[0] }}" max="{{ alert_limits.days[1] }}" size="6"></div>
+      <div><label for="free_pct">Free IPs below (% of usable)</label>
+        <input id="free_pct" name="free_pct" type="number" value="{{ '%g' % alert.free_pct }}" step="0.1"
+               min="{{ alert_limits.pct[0] }}" max="{{ alert_limits.pct[1] | int }}" size="6"></div>
+    </div>
+    <p class="muted small">The forecast is a linear trend of the subnet's used IPs over the last
+      {{ forecast_window }} days of snapshots (at least 5); it alerts when free IPs minus the demand at max
+      scale reach 0 sooner than this. 0 turns a threshold off. Defaults 30 days and 10%.</p>
+    <label class="check"><input type="checkbox" name="include_ids" value="1" {{ 'checked' if alert.include_ids }}>
+      Include AWS identifiers (account id, subnet id) in the alert text</label>
+    <p class="muted small">Off by default: alerts name the account by its display name and each subnet by its
+      Name tag and AZ.</p>
+    <p><button type="submit">Save alerts</button></p>
+  </form>
+  <form method="post" action="{{ url_for('alerts_test') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="secondary"{% if not alert.configured %} disabled title="Save a webhook URL first"{% endif %}>Send test</button>
+  </form>
+</section>
+
 <section class="card" id="terraform">
   <h2 style="margin-top: 0">Terraform state</h2>
   <p class="muted">Load one or more <span class="mono">.tfstate</span> files or

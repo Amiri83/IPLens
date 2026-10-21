@@ -220,6 +220,28 @@ footer { margin-top: 2rem; color: var(--muted); font-size: 11px; border-top: 1px
     {% endfor %}
     </tbody>
   </table>
+  <h3 id="forecast">IP exhaustion forecast</h3>
+  <p class="muted">Subnets whose used IPs grow (linear trend over the last {{ r.trend_window }} days of
+    snapshots, at least {{ min_points }}), soonest first: when free IPs reach 0 and when the demand at max scale
+    no longer fits (free − demand = 0).</p>
+  <table>
+    <thead><tr><th>Subnet</th><th>AZ</th><th>Used IPs</th><th>Trend</th><th>Free = 0</th>
+      <th>Demand no longer fits</th></tr></thead>
+    <tbody>
+    {% for f in r.forecasts %}
+      <tr>
+        <td class="mono">{{ f.headroom.subnet.subnet_id }}<div class="muted">{{ f.headroom.subnet.name }}</div></td>
+        <td>{{ f.headroom.subnet.az }}</td>
+        <td>{% if f.series %}{{ chart(f.series, width=120, height=28, compact=True) }}{% endif %}</td>
+        <td>{{ f.forecast.trend_text }}</td>
+        <td>{{ f.forecast.exhaustion_text }}</td>
+        <td>{{ f.forecast.headroom_text }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">No subnet has a growing trend (stable, or not enough data).</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
   {% for v in sc.by_az if v.azs | length > 1 %}
     <h3><span class="mono">{{ v.vpc_id }}</span> by AZ {% if v.imbalanced %}<span class="badge warn">AZ imbalance</span>{% endif %}</h3>
     <table>

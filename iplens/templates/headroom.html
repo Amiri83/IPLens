@@ -14,7 +14,10 @@
   and 1 IP for each Lambda subnet / security group combination that has no ENI yet. ASG instances and ECS
   tasks still to launch are spread evenly over their subnets (the remainder to the subnets with the fewest
   now). <b>tight</b>: less than {{ tight_pct | int }}% of the subnet's usable IPs left at max scale;
-  <b>over</b>: the subnet runs out before max. Read-only estimate from the latest snapshot.</p>
+  <b>over</b>: the subnet runs out before max. Read-only estimate from the latest snapshot.
+  <b>Forecast</b>: a linear trend of the subnet's used IPs over the last {{ forecast_window }} days of
+  snapshots (at least {{ min_points }}): when its free IPs reach 0, and when the demand at max scale no
+  longer fits (free − demand = 0).</p>
 <form method="get" class="row">
   <input type="hidden" name="surge" value="0">
   <label class="check" title="A rolling ECS deployment starts new tasks before stopping the old ones, up to maximumPercent (default 200) of the service's maximum; blue/green and external deployments, and maximumPercent ≤ 100, add none.">
@@ -35,7 +38,7 @@
 <h2>Subnets, worst first</h2>
 <table class="headroom">
   <thead><tr><th>Subnet</th><th>Name</th><th>AZ</th><th>CIDR</th><th>Free</th><th>Demand at max</th>
-    <th>Left</th><th>Result</th><th>Contributors</th></tr></thead>
+    <th>Left</th><th>Result</th><th>Forecast</th><th>Contributors</th></tr></thead>
   <tbody>
   {% for r in h.subnets %}
     <tr id="{{ r.subnet.subnet_id }}">
@@ -47,6 +50,14 @@
       <td>{{ r.demand }}</td>
       <td>{{ r.left }} <span class="muted small">({{ r.left_pct | pct }})</span></td>
       <td>{{ status_badge(r.status, r.status_label) }}</td>
+      {% set fc = forecasts.get(r.subnet.subnet_id) %}
+      <td class="small forecast">
+        {% if fc %}
+          <div>{{ fc.trend_text }}</div>
+          {% if fc.days_to_exhaustion is not none %}<div>free = 0: {{ fc.exhaustion_text }}</div>{% endif %}
+          {% if fc.days_to_headroom is not none %}<div>demand no longer fits: {{ fc.headroom_text }}</div>{% endif %}
+        {% else %}<span class="muted">not enough data</span>{% endif %}
+      </td>
       <td class="small">
         {% for c in r.contributors %}<div>{{ c.text }}</div>{% else %}<span class="muted">no scaling demand</span>{% endfor %}
         {% if r.suggestion %}
@@ -60,7 +71,7 @@
       </td>
     </tr>
   {% else %}
-    <tr><td colspan="9" class="muted">No subnets{{ ' in scope' if scope_count }}.</td></tr>
+    <tr><td colspan="10" class="muted">No subnets{{ ' in scope' if scope_count }}.</td></tr>
   {% endfor %}
   </tbody>
 </table>

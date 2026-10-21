@@ -19,7 +19,10 @@ Local web app for private IPv4 usage visibility &amp; optimization across one or
 - **Diff** – compare two snapshots: ENIs / IPs added, removed and changed, net delta per subnet,
   top consumers.
 - **Scale headroom** – free IPs per subnet vs. the worst-case demand if every Auto Scaling group,
-  ECS service, ALB and Lambda scales to its maximum; subnets that run out before max are flagged.
+  ECS service, ALB and Lambda scales to its maximum; subnets that run out before max are flagged,
+  with an exhaustion forecast (days until free = 0 and until the demand no longer fits).
+- **Alerts** (optional) – a Slack / Teams webhook notified after each Refresh when a subnet's
+  state changes (over at max scale, forecast to run out soon, low free IPs).
 - **CIDR planner** – free blocks and fragmentation per VPC CIDR, a Fit tool for new subnets and
   secondary-CIDR proposals checked for overlaps.
 - **Report** – one self-contained, printable HTML report per account, optionally with identifiers
@@ -83,6 +86,8 @@ mode `0700`). Delete it to reset IPLens completely.
   login, so only do that on a trusted network.
 - **Read-only AWS access.** Every AWS call goes through an allowlist guard (see
   [Read-only by construction](#read-only-by-construction)); IPLens never changes your account.
+- **Outbound calls.** Besides AWS, the only outbound call is the optional [alert](#alerts)
+  webhook POST (https only, off until a URL is set).
 - **Secrets.** Access keys and session tokens are Fernet-encrypted in SQLite (or kept in memory
   only), never logged and never rendered back. Environment variable values, policy documents and
   secret values seen while crawling are matched in memory and never stored.
@@ -223,6 +228,27 @@ Discovery shows the result in a Headroom column and the report has a Scale headr
 source that was skipped (missing permission, timeout) is named on the page and the demand uses
 what is known.
 
+**Exhaustion forecast.** A linear fit of each subnet's used IPs over the last 30 days of snapshots
+(at least 5) gives its trend in IPs/day, the days until its free IPs reach 0 and the days until
+the demand at max scale no longer fits (free − demand = 0). A flat or shrinking trend is
+"stable", fewer points "not enough data". It is shown in a Forecast column on Headroom, next to a
+used-IP sparkline on the subnet page, and in the report.
+
+## Alerts
+
+**Settings → Alerts** posts subnet alerts to a webhook as Slack / Teams-compatible JSON
+(`{"text": "..."}`). After each Refresh (manual or scheduled) every subnet of the account is
+checked: its scale headroom becomes **over**, the [forecast](#scale-headroom) says the demand stops
+fitting within *X* days (default 30), or less than *Y*% of its usable IPs are free (default 10); 0
+turns a threshold off. Only state changes are sent – the last state sent is stored per subnet, so
+repeated Refreshes do not repeat an alert, and a subnet that clears gets one "resolved" line. All
+changes of one Refresh go out as one message. **Send test** posts a test message.
+
+The webhook URL is Fernet-encrypted like the account credentials, never logged and never shown
+again (only its host). Alerts name subnets by Name tag and AZ and the account by its display name;
+account and subnet ids are only included when **Include AWS identifiers** is ticked. A failed send
+is logged and shown as a warning, never fails the Refresh, and is retried after the next one.
+
 ## CIDR planner
 
 **CIDR Planner** shows, per VPC CIDR, the subnets, the free blocks between them, how many aligned
@@ -237,7 +263,8 @@ copy.
 
 **Report** renders one self-contained HTML document per account (inline CSS and SVG, no scripts
 or external assets) to print to PDF or share: summary and at-risk subnets, top IP consumers, the
-used-IP trend, suggestions allowed / blocked by rules, CIDR headroom with a secondary-CIDR
+used-IP trend, suggestions allowed / blocked by rules, scale headroom with the exhaustion
+forecast, CIDR headroom with a secondary-CIDR
 recommendation and ownership coverage. It can be limited to one environment. The **redact
 identifiers** option replaces account ids, ARNs, IPs / CIDRs and resource ids with stable
 keyed-hash placeholders (e.g. `[ip:3fa2c1d0e4]/24`), so relations inside the report survive
