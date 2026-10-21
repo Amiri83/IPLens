@@ -10,7 +10,11 @@ them times out the Refresh fails instead of saving an empty snapshot. Once aband
 resource's thread no longer writes to the job's log or progress.
 
 "Retry skipped" runs a Collector with ``only``: just the skipped resource types (plus what
-they need, see :func:`retry_plan`), the account identity and VPCs/subnets/ENIs.
+they need, see :func:`retry_plan`), the account identity and VPCs/subnets/ENIs, and a
+``source_snapshot``: the latest successful snapshot it derives from. In the snapshot's
+transaction the rows of every other resource type are copied from the source, the retried
+ones are written fresh and the ENIs are attributed on the merged data, so the new snapshot
+is complete. Without the source snapshot (deleted meanwhile) it is a full Refresh.
 
 The snapshot is written in one transaction with a savepoint per resource type, so a
 failed write never leaves a resource half-saved.
@@ -90,7 +94,45 @@ _NEEDS: dict[str, tuple[str, ...]] = {
     # Creators are only looked up for resources the other ownership sources left unowned.
     CLOUDTRAIL_RESOURCE: ("tag:GetResources", "cloudformation:ListStacks"),
     OWNERSHIP_WRITE: ("tag:GetResources", "cloudformation:ListStacks"),
+    # The ownership rows merge both sources (stacks first), so they are collected together.
+    "tag:GetResources": ("cloudformation:ListStacks",),
+    "cloudformation:ListStacks": ("tag:GetResources",),
 }
+# Retry skipped: the snapshot rows of each optional write, by the resource types they come
+# from: (resource types, tables, resource_tags types). A write whose resource types the
+# retry does not collect is copied from the source snapshot instead.
+_MERGED: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
+    (frozenset({"ec2:DescribeVpcEndpoints"}), ("endpoints",), ("endpoint",)),
+    (frozenset({"lambda:ListFunctions"}), ("lambdas",), ()),
+    (frozenset({"lambda:ListTags"}), (), ("lambda",)),
+    (frozenset({"elasticloadbalancing:DescribeLoadBalancers"}), ("load_balancers",), ()),
+    (frozenset({"elasticloadbalancing:DescribeTags"}), (), ("lb",)),
+    (
+        frozenset(
+            {
+                "elasticloadbalancing:DescribeTargetGroups",
+                "elasticloadbalancing:DescribeTargetHealth",
+            }
+        ),
+        ("lb_targets",),
+        (),
+    ),
+    (
+        frozenset({"ECS services and tasks"}),
+        ("ecs_services", "ecs_task_enis", "ecs_service_lbs"),
+        ("ecs_service",),
+    ),
+    (
+        frozenset({"ec2:DescribeSecurityGroups"}),
+        ("sg_refs", "sg_cidr_rules", "security_groups"),
+        ("sg",),
+    ),
+    (
+        frozenset({"tag:GetResources", "cloudformation:ListStacks"}),
+        ("own_resources", "own_tags"),
+        (),
+    ),
+)
 
 
 def retry_plan(names: Iterable[str]) -> frozenset[str] | None:
@@ -118,6 +160,10 @@ class ResourceTimeout(Exception):  # noqa: N818 - named like JobCancelled
     def __init__(self, resource: str, reason: str):
         self.resource, self.reason = resource, reason
         super().__init__(f"{resource} skipped ({reason})")
+
+
+class SourceSnapshotGone(Exception):  # noqa: N818 - named like JobCancelled
+    """The snapshot a "Retry skipped" copies the other resource types from is gone."""
 
 
 # The abandon flag of the resource running in this helper thread and its job context,
@@ -393,6 +439,7 @@ class Collector:
         resource_timeout: float = DEFAULT_RESOURCE_TIMEOUT,
         overall_timeout: float = DEFAULT_DISCOVERY_TIMEOUT_MIN * 60,
         only: Iterable[str] | None = None,
+        source_snapshot: int | None = None,
     ):
         self.gw = gateway
         # Which tag values are kept, the CI role patterns and the optional sources.
@@ -410,8 +457,15 @@ class Collector:
         self._deadline = math.inf
         self._touched: set[str] = set()
         self._planned: list[str] = []
+        # Warnings of the run itself (a retry that fell back to a full Refresh).
+        self._notes: list[str] = []
         # Retry skipped: the resource types to collect (see retry_plan); None = all.
         self.only = retry_plan(only) if only is not None else None
+        # Retry skipped: the snapshot the other resource types are copied from (none: the
+        # retry is a full Refresh).
+        self.source_snapshot = source_snapshot if self.only is not None else None
+        if self.source_snapshot is None:
+            self.only = None
         if isinstance(gateway, AwsGateway):
             gateway.call_config = call_timeouts(self.resource_timeout)
 
@@ -507,13 +561,41 @@ class Collector:
             self._skip(result, what, code or type(exc).__name__)
             raise
 
-    def run(self) -> CollectResult:
+    def _source_ok(self, conn: sqlite3.Connection) -> bool:
+        """The retry's source snapshot still exists (a successful one of this account)."""
+        return bool(
+            conn.execute(
+                "SELECT 1 FROM snapshots WHERE id=? AND status='ok' AND account_ref IS ?",
+                (self.source_snapshot, self.account_ref),
+            ).fetchone()
+        )
+
+    def _full_refresh_instead(self) -> None:
+        """Retry skipped without its source snapshot: collect every resource type."""
+        msg = (
+            f"Retry of skipped resources: snapshot {self.source_snapshot} (the source of the "
+            "other resource types) no longer exists; ran a full Refresh instead"
+        )
+        log.warning(msg)
+        self._notes.append(msg)
+        self.only = self.source_snapshot = None
+
+    def _plan(self) -> None:
         self._deadline = time.monotonic() + self.overall_timeout
+        self._done = 0
+        self._touched = set()
         planned = [*RESOURCES, *([CLOUDTRAIL_RESOURCE] if self.own.cloudtrail else [])]
         self._planned = [what for what in planned if self._wants(what)]
         self.progress.plan_resources(
             self._planned, math.ceil(self.resource_timeout), math.ceil(self.overall_timeout)
         )
+
+    def run(self) -> CollectResult:
+        if self.only is not None:
+            with closing(self.db_path) as conn:
+                if not self._source_ok(conn):
+                    self._full_refresh_instead()
+        self._plan()
         region = self.gw.region or ""
         started = datetime.now(UTC).isoformat(timespec="seconds")
         with closing(self.db_path) as conn:
@@ -527,9 +609,19 @@ class Collector:
             "collection started snapshot=%s account=%s region=%s", snap_id, self.account_ref, region
         )
         if self.only is not None:
-            log.info("retry of skipped resources: collecting only %s", ", ".join(self._planned))
+            log.info(
+                "retry of skipped resources: collecting only %s, the rest from snapshot %s",
+                ", ".join(self._planned),
+                self.source_snapshot,
+            )
         try:
-            result = self._collect(snap_id)
+            try:
+                result = self._collect(snap_id)
+            except SourceSnapshotGone:
+                # Deleted while the retry collected: nothing was written, start over in full.
+                self._full_refresh_instead()
+                self._plan()
+                result = self._collect(snap_id)
         except Exception as exc:
             if isinstance(exc, JobCancelled):
                 log.info("collection cancelled snapshot=%s", snap_id)
@@ -565,12 +657,13 @@ class Collector:
 
     def _collect(self, snap_id: int) -> CollectResult:
         ec2 = self.gw.client("ec2")
-        result = CollectResult(snapshot_id=snap_id)
+        result = CollectResult(snapshot_id=snap_id, warnings=list(self._notes))
         if self.only is not None:
             retried = [w for w in self._planned if w not in (*IDENTITY_RESOURCES, *CORE_RESOURCES)]
             result.warnings.append(
-                "Retry of skipped resources: this snapshot has VPCs, subnets, ENIs and only "
+                "Retry of skipped resources: collected VPCs, subnets, ENIs and "
                 + (", ".join(retried) or "no other resource types")
+                + f"; the other resource types are copied from snapshot {self.source_snapshot}"
             )
 
         account_id = ""
@@ -648,6 +741,8 @@ class Collector:
         self._step("writing the snapshot")
 
         lambda_index = lambda_eni_index(lambdas)
+        # ENI attribution inputs; a retry replaces those it did not collect (see _merge).
+        task_enis = ecs.task_enis
         # (resource_type, resource_id, key, value) for every tagged ENI-owning resource,
         # plus VPC and subnet tags (environment fallback, "managed elsewhere" tag markers).
         tag_rows: list[tuple[str, str, str, str]] = []
@@ -714,7 +809,7 @@ class Collector:
                     # Map the ENI to its instance even when the ENI view lacks the attachment.
                     e = {**e, "Attachment": {**attachment, "InstanceId": inst.instance_id}}
                 attr = attribute_eni(e)
-                task = ecs.task_enis.get(e["NetworkInterfaceId"])
+                task = task_enis.get(e["NetworkInterfaceId"])
                 if task:
                     attr = Attribution("ecs", task.owner_ref)
                 groups = [g["GroupId"] for g in e.get("Groups", [])]
@@ -945,10 +1040,30 @@ class Collector:
             (OWNERSHIP_WRITE, False, write_ownership),
         )
         with closing(self.db_path) as conn:
-            conn.execute("BEGIN")  # the savepoints below nest inside this one transaction
+            # The savepoints below nest inside this one transaction. A retry takes the
+            # write lock first, so its source snapshot cannot go away before the copy.
+            conn.execute("BEGIN" if self.only is None else "BEGIN IMMEDIATE")
+            if self.only is not None:
+                # Copy what the retry did not collect, then attribute the fresh ENIs on
+                # the merged rows (ECS tasks, Lambda functions, instance names).
+                ecs_enis, lambda_rows, instance_names = self._merge(conn, snap_id)
+                task_enis = ecs_enis if ecs_enis is not None else task_enis
+                if lambda_rows is not None:
+                    lambda_index = lambda_eni_index(lambda_rows)
+                if instance_names is not None:
+                    instances = {
+                        e["NetworkInterfaceId"]: InstanceEni(
+                            iid, instance_names[(e["NetworkInterfaceId"], iid)], ()
+                        )
+                        for e in enis
+                        if (iid := (e.get("Attachment") or {}).get("InstanceId"))
+                        and (e["NetworkInterfaceId"], iid) in instance_names
+                    }
             for what, required, write in writers:
                 with self._saving(conn, result, what, required=required):
                     write(conn)
+            if self.only is not None and not self._wants(CLOUDTRAIL_RESOURCE):
+                self._copy_creators(conn, snap_id)
 
         self._step("cloudtrail:LookupEvents")
         if self.own.cloudtrail and self._wants(CLOUDTRAIL_RESOURCE):
@@ -972,6 +1087,104 @@ class Collector:
             ip_count,
         )
         return result
+
+    # -- Retry skipped: the merge with the source snapshot -------------------------------
+
+    def _merge(
+        self, conn: sqlite3.Connection, snap_id: int
+    ) -> tuple[
+        dict[str, EcsTaskEni] | None, list[dict[str, Any]] | None, dict[tuple[str, str], str] | None
+    ]:
+        """Copy the rows of every write the retry does not collect (:data:`_MERGED`) from
+        the source snapshot into ``snap_id``. Returns what ENI attribution takes from the
+        copied data instead: ECS task ENIs, Lambda functions and ``(eni, instance) ->
+        instance name`` (None for what the retry collected). Raises
+        :class:`SourceSnapshotGone` when the source snapshot no longer exists."""
+        src = self.source_snapshot
+        if not self._source_ok(conn):
+            raise SourceSnapshotGone(src)
+        tag_types: list[str] = []
+        copied: list[str] = []
+        for sources, tables, tags in _MERGED:
+            if any(self._wants(what) for what in sources):
+                continue
+            for table in tables:
+                cols = ", ".join(
+                    r["name"]
+                    for r in conn.execute(f"PRAGMA table_info({table})")
+                    if r["name"] != "snapshot_id"
+                )
+                conn.execute(
+                    f"INSERT INTO {table}(snapshot_id, {cols}) "  # noqa: S608 - constants
+                    f"SELECT ?, {cols} FROM {table} WHERE snapshot_id=?",
+                    (snap_id, src),
+                )
+            tag_types += tags
+            copied += tables
+        if tag_types:
+            marks = ",".join("?" * len(tag_types))
+            conn.execute(
+                "INSERT INTO resource_tags(snapshot_id, resource_type, resource_id, key, "  # noqa: S608
+                "value) SELECT ?, resource_type, resource_id, key, value FROM resource_tags "
+                f"WHERE snapshot_id=? AND resource_type IN ({marks})",
+                (snap_id, src, *tag_types),
+            )
+        log.info(
+            "retry of skipped resources: copied %s and tags of %s from snapshot %s",
+            ", ".join(copied) or "no tables",
+            ", ".join(tag_types) or "no resource types",
+            src,
+        )
+        task_enis = None
+        if not self._wants("ECS services and tasks"):
+            task_enis = {
+                r["eni_id"]: EcsTaskEni(r["cluster"], r["service"], r["task_id"])
+                for r in conn.execute(
+                    "SELECT eni_id, cluster, service, task_id FROM ecs_task_enis "
+                    "WHERE snapshot_id=?",
+                    (snap_id,),
+                )
+            }
+        functions = None
+        if not self._wants("lambda:ListFunctions"):
+            functions = [
+                {
+                    "FunctionName": r["name"],
+                    "VpcConfig": {
+                        "SubnetIds": json.loads(r["subnet_ids"] or "[]"),
+                        "SecurityGroupIds": json.loads(r["security_groups"] or "[]"),
+                    },
+                }
+                for r in conn.execute(
+                    "SELECT name, subnet_ids, security_groups FROM lambdas WHERE snapshot_id=?",
+                    (snap_id,),
+                )
+            ]
+        instance_names = None
+        if not self._wants("ec2:DescribeInstances"):
+            instance_names = {
+                (r["eni_id"], r["instance_id"]): r["instance_name"] or ""
+                for r in conn.execute(
+                    "SELECT eni_id, instance_id, instance_name FROM enis "
+                    "WHERE snapshot_id=? AND COALESCE(instance_id, '') != ''",
+                    (src,),
+                )
+            }
+        return task_enis, functions, instance_names
+
+    def _copy_creators(self, conn: sqlite3.Connection, snap_id: int) -> None:
+        """A retry that collected the ownership sources again but not CloudTrail keeps
+        the source snapshot's creators (when not collected, own_resources is copied whole)."""
+        if not any(self._wants(w) for w in ("tag:GetResources", "cloudformation:ListStacks")):
+            return
+        conn.execute(
+            "INSERT INTO own_resources(snapshot_id, kind, resource_id, creator, creator_kind) "
+            "SELECT ?, kind, resource_id, creator, creator_kind FROM own_resources "
+            "WHERE snapshot_id=? AND creator != '' "
+            "ON CONFLICT(snapshot_id, kind, resource_id) DO UPDATE SET "
+            "creator=excluded.creator, creator_kind=excluded.creator_kind",
+            (snap_id, self.source_snapshot),
+        )
 
     # -- ownership sources (see iplens.ownership) ---------------------------------------
 
