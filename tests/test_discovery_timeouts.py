@@ -1,0 +1,391 @@
+"""Refresh (discovery) timeouts, per-resource transactions and the hidden progress box.
+
+A resource type running past the per-resource timeout is skipped and the others still
+complete; the timeouts come from Settings at every start (no restart); a failed write of
+one resource type leaves none of its rows; Cancel stops a hanging resource; and a hidden
+progress box stays hidden on other pages (tabs). Placeholders only: 192.0.2.N addresses,
+example names, moto (no real AWS)."""
+
+from __future__ import annotations
+
+import threading
+import time
+
+import boto3
+import pytest
+from moto import mock_aws
+
+from iplens import collector as collector_mod
+from iplens import jobs
+from iplens import settings as settings_mod
+from iplens.aws import AwsGateway
+from iplens.collector import Collector
+from iplens.db import closing
+from iplens.settings import SettingsStore
+from iplens.web import create_app
+
+REGION = "us-east-1"
+WAIT = 30  # seconds a test waits for a background job at most
+
+
+@pytest.fixture
+def release():
+    """Lets every mocked hanging collector return at the end of the test."""
+    event = threading.Event()
+    yield event
+    event.set()
+
+
+def _aws() -> None:
+    ec2 = boto3.client("ec2", region_name=REGION)
+    vpc_id = ec2.create_vpc(CidrBlock="192.0.2.0/24")["Vpc"]["VpcId"]
+    subnet_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="192.0.2.0/26")["Subnet"]["SubnetId"]
+    ec2.create_network_interface(SubnetId=subnet_id, PrivateIpAddress="192.0.2.10")
+
+
+def _gateway() -> AwsGateway:
+    return AwsGateway(boto3.session.Session(region_name=REGION))
+
+
+def _warm_up(db_path) -> None:
+    """One untimed Refresh first: moto's first call of a service can take a second."""
+    Collector(_gateway(), db_path).run()
+
+
+def _hang(release: threading.Event):
+    """A collector that never answers on its own (until the test ends)."""
+
+    def fetch(self):
+        release.wait(WAIT)
+        return []
+
+    return fetch
+
+
+def _count(db_path, table: str, snap_id: int) -> int:
+    with closing(db_path) as conn:
+        return conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE snapshot_id=?",  # noqa: S608 - test constants
+            (snap_id,),
+        ).fetchone()[0]
+
+
+# -- the collector ----------------------------------------------------------------------
+
+
+@mock_aws
+def test_hanging_collector_is_skipped_and_the_others_complete(db_path, monkeypatch, release):
+    _aws()
+    _warm_up(db_path)
+    monkeypatch.setattr(Collector, "_fetch_tagged_resources", _hang(release))
+    mgr = jobs.JobManager(db_path)
+    out = {}
+
+    def work(ctx):
+        out["result"] = Collector(
+            _gateway(), db_path, progress=ctx, resource_timeout=1, overall_timeout=60
+        ).run()
+
+    t0 = time.monotonic()
+    job = mgr.start(1, "refresh", work, background=False)
+    assert time.monotonic() - t0 < WAIT / 2  # did not wait for the hanging call
+    result = out["result"]
+
+    assert job["state"] == jobs.DONE
+    assert result.skipped == [("tag:GetResources", "timeout after 1s")]
+    assert "tag:GetResources skipped (timeout after 1s)" in result.warnings
+    # Every other resource type still ran and the snapshot was saved.
+    assert (result.enis, result.ips) == (1, 1) and result.vpcs >= 1 and result.subnets >= 1
+    with closing(db_path) as conn:
+        status = conn.execute(
+            "SELECT status FROM snapshots WHERE id=?", (result.snapshot_id,)
+        ).fetchone()[0]
+    assert status == "ok"
+    rows = {r["name"]: r for r in job["items"]}
+    assert rows["tag:GetResources"]["status"] == jobs.SKIPPED
+    assert rows["tag:GetResources"]["reason"] == "timeout after 1s"
+    assert rows["tag:GetResources"]["timeout"] == 1
+    for name in ("ec2:DescribeVpcs", "ec2:DescribeNetworkInterfaces", "cloudformation:ListStacks"):
+        assert rows[name]["status"] == jobs.RES_DONE
+    assert not [r for r in job["items"] if r["status"] in (jobs.PENDING, jobs.RES_RUNNING)]
+    assert job["limits"] == {"resource": 1, "overall": 60}
+    # Persisted with the job: a reload still shows the rows.
+    stored = jobs.JobManager(db_path).current(1)
+    assert stored["items"] == job["items"] and stored["limits"] == job["limits"]
+    mgr.close()
+
+
+@mock_aws
+def test_abandoned_resource_stops_at_its_next_page(db_path, monkeypatch, release):
+    """A slow paginated call is abandoned at the timeout and does not fetch more pages."""
+    _aws()
+    pages = []
+
+    def slow_paginate(client, op, key, **kwargs):
+        if op != "describe_vpc_endpoints":
+            return real(client, op, key, **kwargs)
+        for i in range(50):
+            collector_mod._check_abandoned()
+            pages.append(i)
+            release.wait(0.2)
+        return []
+
+    real = collector_mod._paginate
+    monkeypatch.setattr(collector_mod, "_paginate", slow_paginate)
+    result = Collector(_gateway(), db_path, resource_timeout=0.5).run()
+    assert ("ec2:DescribeVpcEndpoints", "timeout after 1s") in result.skipped
+    seen = len(pages)
+    time.sleep(0.6)
+    assert len(pages) <= seen + 1  # the helper thread gave up instead of finishing
+    assert len(pages) < 50
+
+
+@mock_aws
+def test_overall_limit_skips_the_remaining_resources(db_path, monkeypatch, release):
+    _aws()
+    monkeypatch.setattr(Collector, "_fetch_tagged_resources", _hang(release))
+    result = Collector(_gateway(), db_path, resource_timeout=30, overall_timeout=1).run()
+    reason = "overall time limit of 1 min reached"
+    assert ("tag:GetResources", reason) in result.skipped
+    assert ("cloudformation:ListStacks", reason) in result.skipped  # never started
+    assert result.enis == 1
+
+
+@mock_aws
+def test_required_resource_timeout_fails_the_refresh(db_path, monkeypatch, release):
+    _aws()
+    real = collector_mod._paginate
+
+    def paginate(client, op, key, **kwargs):
+        if op == "describe_subnets":
+            release.wait(WAIT)
+        return real(client, op, key, **kwargs)
+
+    monkeypatch.setattr(collector_mod, "_paginate", paginate)
+    with pytest.raises(collector_mod.ResourceTimeout, match="ec2:DescribeSubnets"):
+        Collector(_gateway(), db_path, resource_timeout=0.5).run()
+    with closing(db_path) as conn:
+        snap = conn.execute("SELECT id, status, error FROM snapshots").fetchone()
+    assert snap["status"] == "failed"
+    assert snap["error"] == "ec2:DescribeSubnets skipped (timeout after 1s)"
+    assert _count(db_path, "vpcs", snap["id"]) == 0
+
+
+@mock_aws
+def test_cancel_stops_a_hanging_resource(db_path, monkeypatch, release):
+    _aws()
+    monkeypatch.setattr(Collector, "_fetch_tagged_resources", _hang(release))
+    mgr = jobs.JobManager(db_path)
+    job = mgr.start(1, "refresh", lambda ctx: Collector(_gateway(), db_path, progress=ctx).run())
+    deadline = time.monotonic() + WAIT
+    while time.monotonic() < deadline:
+        rows = {r["name"]: r["status"] for r in mgr.status(job["id"])["items"]}
+        if rows.get("tag:GetResources") == jobs.RES_RUNNING:
+            break
+        time.sleep(0.05)
+    assert mgr.cancel(job["id"])
+    assert mgr.wait(job["id"], 5)  # well before the 120s default timeout
+    assert mgr.status(job["id"])["state"] == jobs.CANCELLED
+    mgr.close()
+
+
+def test_collection_clients_get_botocore_timeouts():
+    gw = _gateway()
+    Collector(gw, "unused.db", resource_timeout=120)
+    cfg = gw.client("ec2", region=REGION).meta.config
+    assert (cfg.connect_timeout, cfg.read_timeout) == (10, 60)
+    Collector(gw, "unused.db", resource_timeout=5)
+    cfg = gw.client("ec2", region=REGION).meta.config
+    assert (cfg.connect_timeout, cfg.read_timeout) == (5, 5)
+
+
+@mock_aws
+def test_failed_optional_write_leaves_no_partial_rows(db_path, monkeypatch):
+    _aws()
+    ec2 = boto3.client("ec2", region_name=REGION)
+    vpc_id = ec2.describe_vpcs(Filters=[{"Name": "cidr", "Values": ["192.0.2.0/24"]}])["Vpcs"][0][
+        "VpcId"
+    ]
+    sg_a = ec2.create_security_group(GroupName="sg-a", Description="example", VpcId=vpc_id)
+    sg_b = ec2.create_security_group(GroupName="sg-b", Description="example", VpcId=vpc_id)
+    ec2.authorize_security_group_ingress(
+        GroupId=sg_a["GroupId"],
+        IpPermissions=[
+            {
+                "IpProtocol": "tcp",
+                "FromPort": 443,
+                "ToPort": 443,
+                "UserIdGroupPairs": [{"GroupId": sg_b["GroupId"]}],
+            }
+        ],
+    )
+
+    def broken(_groups):
+        raise RuntimeError("example write failure")
+
+    # sg_refs rows are written first, then this fails inside the same resource type.
+    monkeypatch.setattr(collector_mod, "sg_cidr_rows", broken)
+    result = Collector(_gateway(), db_path).run()
+    snap = result.snapshot_id
+    assert _count(db_path, "sg_refs", snap) == 0
+    assert _count(db_path, "security_groups", snap) == 0
+    assert "ec2:DescribeSecurityGroups not saved (RuntimeError)" in result.warnings
+    assert ("ec2:DescribeSecurityGroups", "write failed (RuntimeError)") in result.skipped
+    # The other resource types were saved.
+    assert _count(db_path, "vpcs", snap) >= 1 and _count(db_path, "enis", snap) == 1
+
+
+@mock_aws
+def test_failed_required_write_saves_nothing(db_path, monkeypatch):
+    _aws()
+    monkeypatch.setattr(
+        collector_mod, "eni_private_ips", lambda *_a: (_ for _ in ()).throw(KeyError("x"))
+    )
+    with pytest.raises(KeyError):
+        Collector(_gateway(), db_path).run()
+    with closing(db_path) as conn:
+        snap = conn.execute("SELECT id, status FROM snapshots").fetchone()
+    assert snap["status"] == "failed"
+    assert _count(db_path, "vpcs", snap["id"]) == 0
+    assert _count(db_path, "subnets", snap["id"]) == 0
+
+
+# -- settings -----------------------------------------------------------------------------
+
+
+def test_timeout_settings_defaults_bounds_and_persistence(db_path):
+    store = SettingsStore(db_path)
+    s = store.load()
+    assert (s.resource_timeout, s.discovery_timeout_min) == (120, 15)
+    store.save(resource_timeout=45, discovery_timeout_min=5)
+    s = store.load()
+    assert (s.resource_timeout, s.discovery_timeout_min) == (45, 5)
+    for bad in ("5", "3601", "abc", ""):
+        with pytest.raises(ValueError, match="per-resource timeout"):
+            settings_mod.parse_resource_timeout(bad)
+    for bad in ("0", "241", "1.5"):
+        with pytest.raises(ValueError, match="overall discovery timeout"):
+            settings_mod.parse_discovery_timeout(bad)
+    # An out-of-range stored value falls back to the default.
+    with closing(db_path) as conn:
+        conn.execute("UPDATE settings SET value='1' WHERE key='resource_timeout'")
+    assert store.load().resource_timeout == 120
+
+
+def _post(client, url, data=None, **kw):
+    with client.session_transaction() as s:
+        token = s["csrf"]
+    return client.post(url, data={**(data or {}), "csrf_token": token}, **kw)
+
+
+@pytest.fixture
+def app(home):
+    app = create_app(home, testing=True)
+    yield app
+    app.extensions["iplens"]["jobs"].shutdown(5)
+
+
+@pytest.fixture
+def client(app):
+    c = app.test_client()
+    c.get("/")
+    return c
+
+
+def test_settings_form_validates_the_timeouts(app, client):
+    page = client.get("/settings").data.decode()
+    assert 'id="resource_timeout"' in page and 'id="discovery_timeout_min"' in page
+    assert 'id="discovery"' in page
+    resp = _post(client, "/settings", {"resource_timeout": "5"}, follow_redirects=True)
+    assert "Settings not saved" in resp.data.decode()
+    resp = _post(client, "/settings", {"discovery_timeout_min": "999"}, follow_redirects=True)
+    assert "Settings not saved" in resp.data.decode()
+    db = app.extensions["iplens"]["paths"].db_path
+    s = SettingsStore(db).load()
+    assert (s.resource_timeout, s.discovery_timeout_min) == (120, 15)
+    _post(client, "/settings", {"resource_timeout": "300", "discovery_timeout_min": "30"})
+    s = SettingsStore(db).load()
+    assert (s.resource_timeout, s.discovery_timeout_min) == (300, 30)
+
+
+@mock_aws
+def test_changed_resource_timeout_is_honoured_without_restart(app, client, monkeypatch, release):
+    _aws()
+    _warm_up(app.extensions["iplens"]["paths"].db_path)
+    monkeypatch.setattr(Collector, "_fetch_tagged_resources", _hang(release))
+    monkeypatch.setattr(settings_mod, "MIN_RESOURCE_TIMEOUT", 1)  # keep the test fast
+    manager = app.extensions["iplens"]["jobs"]
+
+    def refresh() -> dict:
+        body = _post(client, "/refresh", {"background": "1"}).get_json()
+        assert body["ok"], body
+        assert manager.wait(body["job"]["id"], WAIT)
+        return client.get(f"/jobs/{body['job']['id']}").get_json()["job"]
+
+    _post(client, "/settings", {"resource_timeout": "1", "discovery_timeout_min": "2"})
+    job = refresh()
+    assert job["state"] == jobs.DONE
+    assert job["limits"] == {"resource": 1, "overall": 120}
+    rows = {r["name"]: r for r in job["items"]}
+    assert rows["tag:GetResources"]["status"] == jobs.SKIPPED
+    assert rows["tag:GetResources"]["reason"] == "timeout after 1s"
+    assert any(m["text"] == "tag:GetResources skipped (timeout after 1s)" for m in job["messages"])
+
+    # Same process, new value: the next Refresh uses it.
+    _post(client, "/settings", {"resource_timeout": "2"})
+    job = refresh()
+    assert job["limits"]["resource"] == 2
+    rows = {r["name"]: r for r in job["items"]}
+    assert rows["tag:GetResources"]["reason"] == "timeout after 2s"
+    assert rows["tag:GetResources"]["elapsed"] >= 1
+
+
+def test_progress_box_has_cancel_banner_and_retry(client):
+    page = client.get("/").data.decode()
+    for marker in ('id="job-cancel"', 'id="job-limits"', 'id="job-resources"', 'id="job-retry"'):
+        assert marker in page
+    assert 'data-settings-url="/settings#discovery"' in page
+    assert 'data-refresh-url="/refresh"' in page
+
+
+# -- hide state ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def running_job(app, client):
+    """A Refresh-kind job of the active account that runs until the test releases it."""
+    gate = threading.Event()
+    db = app.extensions["iplens"]["paths"].db_path
+    with closing(db) as conn:
+        ref = int(
+            conn.execute("SELECT value FROM settings WHERE key='active_account'").fetchone()[0]
+        )
+    manager = app.extensions["iplens"]["jobs"]
+    job = manager.start(ref, "refresh", lambda ctx: gate.wait(WAIT))
+    yield job
+    gate.set()
+    manager.wait(job["id"], WAIT)
+
+
+def test_hidden_progress_box_survives_a_tab_switch(client, running_job):
+    job_id = running_job["id"]
+    current = client.get("/jobs/current").get_json()
+    assert current["job"]["id"] == job_id and current["job"]["running"]
+    assert current["hidden"] is False  # shown until the user hides it
+
+    assert _post(client, f"/jobs/{job_id}/hide").get_json() == {"ok": True, "hidden": True}
+    # Switch tabs: other pages re-attach to the job and keep the box hidden.
+    for page in ("/ips", "/settings", "/"):
+        html = client.get(page).data.decode()
+        assert 'id="job-badge"' in html
+        assert client.get("/jobs/current").get_json()["hidden"] is True
+
+    # Reopened from the badge: shown again everywhere.
+    assert _post(client, f"/jobs/{job_id}/show").get_json()["hidden"] is False
+    client.get("/ips")
+    assert client.get("/jobs/current").get_json()["hidden"] is False
+
+
+def test_hide_needs_csrf_and_a_known_job(client, running_job):
+    assert client.post(f"/jobs/{running_job['id']}/hide").status_code == 400
+    assert _post(client, "/jobs/does-not-exist/hide").status_code == 404

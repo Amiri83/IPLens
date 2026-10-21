@@ -23,6 +23,21 @@
 - IP List search is a live filter: results update as you type (and when a filter changes)
   without a submit, with one clear (×) control (also Esc); the Filter button is only a
   no-JavaScript fallback.
+- A hidden progress box no longer pops back up when switching tabs: Hide is remembered
+  server-side (session) until the box is reopened, and a small "Discovery running…" badge
+  shows on every page meanwhile.
+- Refresh no longer runs unbounded when one resource type is slow. Settings → **Discovery
+  timeouts**: a per-resource timeout (default 120 s, 10–3600) and an overall limit (default
+  15 min, 1–240), applied from the next Refresh without a restart. A resource type past its
+  timeout is skipped ("skipped (timeout after 120s)") and the others still run; VPCs,
+  subnets and ENIs are required, so their timeout fails the Refresh. Collection clients get
+  botocore connect / read timeouts so an abandoned call stops. Each resource type's rows are
+  written in their own savepoint: a failed write never leaves part of a resource type behind.
+- The Refresh progress box shows the timeouts in force (with a link to Settings), a row per
+  resource type (pending / running / done / skipped, elapsed vs. timeout), the overall elapsed
+  time vs. the limit and, at the end, the skipped resource types with their reason and a
+  **Retry skipped** button (a new Refresh); the same summary goes to the app log. Cancel now
+  also stops a resource type that is stuck in an AWS call.
 
 ### Security
 

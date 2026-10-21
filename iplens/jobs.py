@@ -102,6 +102,36 @@ class Message:
         }
 
 
+# Per-resource rows of a Refresh (see iplens.collector).
+PENDING, RES_RUNNING, RES_DONE, SKIPPED = "pending", "running", "done", "skipped"
+
+
+@dataclass
+class Resource:
+    """One resource type of a Refresh: its state, timing and why it was skipped."""
+
+    name: str
+    status: str = PENDING
+    reason: str = ""
+    timeout: int = 0
+    started: float | None = None
+    finished: float | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        if self.started is None:
+            elapsed = 0
+        else:
+            end = self.finished if self.finished is not None else time.monotonic()
+            elapsed = int(end - self.started)
+        return {
+            "name": self.name,
+            "status": self.status,
+            "reason": self.reason,
+            "elapsed": elapsed,
+            "timeout": self.timeout,
+        }
+
+
 @dataclass
 class Job:
     id: str
@@ -120,6 +150,12 @@ class Job:
     messages: list[Message] = field(default_factory=list)
     log: deque[str] = field(default_factory=lambda: deque(maxlen=LOG_TAIL))
     cancel_requested: threading.Event = field(default_factory=threading.Event)
+    # Refresh only: {"resource": seconds, "overall": seconds} and the resource rows.
+    limits: dict[str, int] = field(default_factory=dict)
+    resources: list[Resource] = field(default_factory=list)
+
+    def resources_dict(self) -> dict[str, Any]:
+        return {"limits": self.limits, "items": [r.as_dict() for r in self.resources]}
 
     def as_dict(self) -> dict[str, Any]:
         end = self.finished if self.finished is not None else time.monotonic()
@@ -140,6 +176,7 @@ class Job:
             "error": self.error,
             "messages": [m.as_dict() for m in self.messages],
             "log": list(self.log),
+            **self.resources_dict(),
         }
 
 
@@ -207,6 +244,32 @@ class JobContext:
             if len(self._job.messages) < MAX_MESSAGES:
                 self._job.messages.append(Message(category, text, link_url, link_text))
 
+    def plan_resources(self, names: list[str], resource_timeout: int, overall_timeout: int) -> None:
+        """Announce a Refresh's resource types (all pending) and its timeouts."""
+        with self._manager._lock:
+            self._job.limits = {"resource": int(resource_timeout), "overall": int(overall_timeout)}
+            self._job.resources = [Resource(n, timeout=int(resource_timeout)) for n in names]
+
+    def resource(
+        self, name: str, status: str, reason: str = "", timeout: int | None = None
+    ) -> None:
+        """Move a resource row to ``status`` (an unplanned name is appended)."""
+        now = time.monotonic()
+        with self._manager._lock:
+            row = next((r for r in self._job.resources if r.name == name), None)
+            if row is None:
+                row = Resource(name, timeout=self._job.limits.get("resource", 0))
+                self._job.resources.append(row)
+            row.status, row.reason = status, _clip(reason, MAX_STEP)
+            if timeout is not None:
+                row.timeout = int(timeout)
+            if status == RES_RUNNING:
+                row.started, row.finished = now, None
+            elif status in (RES_DONE, SKIPPED):
+                if row.started is None:
+                    row.started = now
+                row.finished = now
+
     @contextmanager
     def bind(self) -> Iterator[JobContext]:
         """Route this thread's ``iplens`` log records into the job's log tail."""
@@ -262,6 +325,12 @@ class NullProgress:
     def message(self, *args: Any, **kwargs: Any) -> None:
         return None
 
+    def plan_resources(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def resource(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
     @contextmanager
     def bind(self) -> Iterator[NullProgress]:
         yield self
@@ -300,12 +369,13 @@ class JobManager:
             with closing(self.db_path) as conn:
                 conn.execute(
                     "INSERT INTO jobs(id, account_ref, kind, label, state, step, done, total, "
-                    "started_at, finished_at, elapsed, error, messages, log) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+                    "started_at, finished_at, elapsed, error, messages, log, resources) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
                     "state=excluded.state, step=excluded.step, done=excluded.done, "
                     "total=excluded.total, finished_at=excluded.finished_at, "
                     "elapsed=excluded.elapsed, error=excluded.error, "
-                    "messages=excluded.messages, log=excluded.log",
+                    "messages=excluded.messages, log=excluded.log, "
+                    "resources=excluded.resources",
                     (
                         d["id"],
                         d["account_ref"],
@@ -321,6 +391,7 @@ class JobManager:
                         d["error"],
                         json.dumps(d["messages"]),
                         json.dumps(d["log"][-LOG_TAIL:]),
+                        json.dumps({"limits": d["limits"], "items": d["items"]}),
                     ),
                 )
                 # Keep the newest few jobs per account.
@@ -334,6 +405,7 @@ class JobManager:
 
     @staticmethod
     def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
+        resources = json.loads(row["resources"] or "{}")
         return {
             "id": row["id"],
             "account_ref": row["account_ref"],
@@ -351,6 +423,8 @@ class JobManager:
             "error": row["error"],
             "messages": json.loads(row["messages"] or "[]"),
             "log": json.loads(row["log"] or "[]"),
+            "limits": resources.get("limits") or {},
+            "items": resources.get("items") or [],
         }
 
     # -- queries -----------------------------------------------------------------------

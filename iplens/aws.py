@@ -130,9 +130,18 @@ def build_session(account: Account) -> boto3.session.Session:
     return boto3.session.Session(region_name=region)
 
 
+def call_timeouts(resource_timeout: float) -> Config:
+    """Refresh clients: no single HTTP call may outlive the per-resource timeout, so a
+    resource abandoned at its timeout stops instead of hanging on a dead connection."""
+    seconds = max(float(resource_timeout), 1.0)
+    return Config(connect_timeout=min(10.0, seconds), read_timeout=min(60.0, seconds))
+
+
 class AwsGateway:
     def __init__(self, session: boto3.session.Session):
         self.session = session
+        # Merged into every client this gateway creates (see call_timeouts).
+        self.call_config: Config | None = None
 
     @classmethod
     def from_account(cls, account: Account) -> AwsGateway:
@@ -145,7 +154,10 @@ class AwsGateway:
     def client(
         self, service: str, *, region: str | None = None, config: Config | None = None
     ) -> Any:
-        merged = _BOTO_CONFIG.merge(config) if config is not None else _BOTO_CONFIG
+        merged = _BOTO_CONFIG
+        for extra in (self.call_config, config):
+            if extra is not None:
+                merged = merged.merge(extra)
         client = self.session.client(service, region_name=region or None, config=merged)
         # "before-call" is hierarchical: it fires for every operation of this client.
         client.meta.events.register("before-call", _guard_read_only)

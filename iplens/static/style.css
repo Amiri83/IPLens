@@ -214,6 +214,17 @@ pre.job-log { background: var(--bg); color: var(--fg); border: 1px solid var(--l
 .job-actions { gap: .5rem; justify-content: flex-end; }
 .job-badge { position: fixed; right: 1rem; bottom: 1rem; z-index: 40; max-width: 60vw;
              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-limits { background: var(--bg); border: 1px solid var(--line); border-radius: 5px;
+              padding: .3rem .5rem; margin: 0 0 .4rem; }
+.job-resources-box { margin: .3rem 0; }
+.job-resources-box table { max-height: 240px; }
+table.job-resources td { padding: .15rem .5rem; }
+.job-resources tr.res-running td { font-weight: 600; }
+.job-resources tr.res-skipped td { background: var(--warn-bg); color: var(--warn-fg); }
+.job-resources tr.res-pending td { color: var(--muted); }
+.job-skipped { background: var(--warn-bg); color: var(--warn-fg); border-radius: 5px;
+               padding: .3rem .6rem .5rem; margin: .4rem 0; }
+.job-skipped ul { margin: .2rem 0 .4rem; }
 
 /* Visual: environment filter and the "not linked" side panel of the Extended view. */
 .env-filters label { white-space: nowrap; }

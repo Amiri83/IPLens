@@ -487,6 +487,7 @@ _ADDED_COLUMNS = (
     ("tf_repo_envs", "state_account", "TEXT NOT NULL DEFAULT ''"),
     ("tf_repo_envs", "backend_extra_enc", "TEXT NOT NULL DEFAULT ''"),
     ("tf_repo_envs", "backend_extra_keys", "TEXT NOT NULL DEFAULT ''"),
+    ("jobs", "resources", "TEXT NOT NULL DEFAULT '{}'"),
 )
 
 # Single-account settings rows from before multi-account support.

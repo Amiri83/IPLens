@@ -75,17 +75,36 @@
   {% endfor %}
   {% block content %}{% endblock %}
 </main>
-{# Background jobs (Refresh, service crawl, Terraform sync): progress modal, see jobs.js. #}
+{# Background jobs (Refresh, service crawl, Terraform sync): progress modal, see jobs.js.
+   Hidden by the user, it stays hidden on every page (server session) and the badge shows instead. #}
 <div id="job-modal" class="job-modal" role="dialog" aria-modal="true" aria-labelledby="job-title" hidden
      data-csrf="{{ csrf_token }}"
      data-current-url="{{ url_for('job_current') }}"
      data-status-url="{{ url_for('job_status', job_id='__ID__') }}"
-     data-cancel-url="{{ url_for('job_cancel', job_id='__ID__') }}">
+     data-cancel-url="{{ url_for('job_cancel', job_id='__ID__') }}"
+     data-hide-url="{{ url_for('job_hide', job_id='__ID__') }}"
+     data-show-url="{{ url_for('job_show', job_id='__ID__') }}"
+     data-refresh-url="{{ url_for('refresh') }}"
+     data-settings-url="{{ url_for('settings_page') }}#discovery">
   <div class="job-box card">
     <h2 id="job-title">Working…</h2>
+    {# Refresh only: the timeouts in force, per-resource rows and the skipped summary. #}
+    <p class="job-limits small" id="job-limits" hidden></p>
     <p class="job-step" id="job-step" aria-live="polite"></p>
     <progress id="job-progress" max="1" value="0"></progress>
     <p class="muted small"><span id="job-counts"></span> · elapsed <span id="job-elapsed">0s</span> · <span id="job-state"></span></p>
+    <details class="job-resources-box" id="job-resources-box" open hidden>
+      <summary>Resources</summary>
+      <table class="job-resources small">
+        <thead><tr><th>Resource</th><th>Status</th><th>Time</th></tr></thead>
+        <tbody id="job-resources"></tbody>
+      </table>
+    </details>
+    <div id="job-skipped" class="job-skipped" hidden>
+      <p class="small"><b>Skipped resources</b></p>
+      <ul id="job-skipped-list" class="small"></ul>
+      <button type="button" class="secondary" id="job-retry" title="Run Refresh again: a new snapshot in which the skipped resources are collected again">Retry skipped</button>
+    </div>
     <ul id="job-messages" class="job-messages"></ul>
     <details class="job-log-box" open>
       <summary>Log (live)</summary>
