@@ -5,8 +5,8 @@ no external assets) to print to PDF or share.
 summary and at-risk subnets (:mod:`iplens.queries`, :mod:`iplens.trends`), the top IP
 consumers (:func:`iplens.queries.ip_list`), the used-IP trend, the suggestions split into
 allowed / blocked by a rule (:mod:`iplens.suggestions`), the scale headroom of each subnet
-(:mod:`iplens.headroom`), CIDR headroom with a secondary
-CIDR recommendation (:mod:`iplens.cidrplan`) and ownership coverage
+(:mod:`iplens.headroom`) with its exhaustion forecast (:mod:`iplens.forecast`), CIDR headroom
+with a secondary CIDR recommendation (:mod:`iplens.cidrplan`) and ownership coverage
 (:mod:`iplens.ownership`). The web route renders ``templates/report.html``.
 
 An environment filter limits the report to the subnets holding IPs of that environment;
@@ -36,6 +36,7 @@ from typing import Any
 from markupsafe import Markup
 
 from . import cidrplan, environment, ownership, queries, trends
+from . import forecast as forecast_mod
 from . import headroom as scale_mod
 from . import suggestions as sugg_mod
 from .attribution import OWNER_LABELS
@@ -192,6 +193,15 @@ class VpcHeadroom:
 
 
 @dataclass
+class ForecastRow:
+    """A subnet with a growing used-IP trend (forecast.py) and its Trends series."""
+
+    headroom: scale_mod.SubnetHeadroom
+    forecast: forecast_mod.SubnetForecast
+    series: trends.Series | None = None
+
+
+@dataclass
 class Report:
     account: str
     region: str
@@ -216,6 +226,8 @@ class Report:
     ownership: ownership.OwnershipReport | None
     # Free IPs vs. demand at max scale per subnet (headroom.py).
     scale: scale_mod.Headroom = field(default_factory=lambda: scale_mod.Headroom([]))
+    # Growing subnets, soonest to run out of headroom first.
+    forecasts: list[ForecastRow] = field(default_factory=list)
     secondary_prefix: int = cidrplan.DEFAULT_SECONDARY_PREFIX
     notes: list[str] = field(default_factory=list)
 
@@ -350,6 +362,18 @@ def build(
         pick, tf = _recommend(v, known, secondary_prefix, redactor is not None)
         headroom.append(VpcHeadroom(v, cidrplan.cidr_maps(v), pick, tf))
 
+    scale = scale_mod.for_snapshot(conn, snap_id, scope)
+    projected = forecast_mod.for_subnets(scale, tr, now=now)
+    series = {s.key: s for ss in tr.subnets.values() for s in ss}
+    forecast_rows = sorted(
+        (
+            ForecastRow(r, projected[r.subnet.subnet_id], series.get(r.subnet.subnet_id))
+            for r in scale.subnets
+            if projected[r.subnet.subnet_id].growing
+        ),
+        key=lambda f: (f.forecast.days_to_headroom or 0.0, f.headroom.subnet.subnet_id),
+    )
+
     notes = []
     if scope.active and not env:
         notes.append("Limited to the account's active scope.")
@@ -380,7 +404,8 @@ def build(
         totals=sugg_mod.totals(items),
         headroom=headroom,
         ownership=ownership.report(conn, snap_id, own),
-        scale=scale_mod.for_snapshot(conn, snap_id, scope),
+        scale=scale,
+        forecasts=forecast_rows,
         secondary_prefix=secondary_prefix,
         notes=notes,
     )

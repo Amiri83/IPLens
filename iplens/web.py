@@ -31,6 +31,7 @@ from flask import (
 from markupsafe import Markup
 
 from . import (
+    alerts,
     cidrplan,
     diagram,
     environment,
@@ -46,6 +47,7 @@ from . import (
     viewstate,
 )
 from . import diff as diff_mod
+from . import forecast as forecast_mod
 from . import report as report_mod
 from . import retention as retention_mod
 from . import rules as rules_mod
@@ -275,6 +277,8 @@ def create_app(
         "box": box,
         # Background jobs (Refresh, service crawl, Terraform sync): one per account.
         "jobs": JobManager(paths.db_path),
+        # Settings -> Alerts (the webhook URL is encrypted with the credentials' key).
+        "alerts": alerts.AlertStore(paths.db_path, box),
     }
     apply_log_dir(app, store.load())
     log.info("IPLens started (data dir %s)", paths.home)
@@ -326,6 +330,10 @@ def _jobs() -> JobManager:
     return _ext()["jobs"]
 
 
+def _alerts() -> alerts.AlertStore:
+    return _ext()["alerts"]
+
+
 def flash_job_messages(job: dict[str, Any]) -> None:
     """Flash a finished job's result lines (forms submitted without JavaScript)."""
     for m in job.get("messages", []):
@@ -356,6 +364,44 @@ def sync_messages(ctx: Progress, results: list[tfrepo.SyncResult], seconds: floa
     wrong = [r for r in results if r.status == tfrepo.WRONG_ACCOUNT]
     for r in wrong:
         ctx.message("warn", f"{r.label}: {r.detail}; it is left out of drift.")
+
+
+def run_alerts(
+    ctx: Progress, db_path: Path, account_ref: int, cfg: alerts.AlertSettings, settings_url: str
+) -> None:
+    """Send the account's subnet alert changes after a Refresh. Never raises: a failure is
+    logged and shown as a warning, and the Refresh still succeeds."""
+    ctx.step("alerts")
+    try:
+        with closing(db_path) as conn:
+            sent = alerts.evaluate(conn, account_ref, cfg)
+    except alerts.WebhookError as exc:
+        # The message never holds the webhook URL (nor does it chain a traceback here).
+        log.warning("alerts after refresh (account=%s): %s", account_ref, exc)
+        ctx.message(
+            "warn",
+            f"Alert not sent: {exc}; it is retried after the next Refresh. Check the webhook in",
+            settings_url,
+            "Settings → Alerts",
+        )
+        return
+    except Exception:
+        log.exception("alerts after refresh failed (account=%s)", account_ref)
+        ctx.message("warn", "Alerts failed. See the log for details.")
+        return
+    if sent:
+        resolved = sum(1 for a in sent if a.resolved)
+        log.info(
+            "alerts: sent %d subnet change(s) of account=%s (%d resolved)",
+            len(sent),
+            account_ref,
+            resolved,
+        )
+        ctx.message(
+            "ok",
+            f"Alerts: sent {len(sent) - resolved} alerting and {resolved} resolved subnet(s) "
+            "to the webhook",
+        )
 
 
 def log_dir_for(paths: AppPaths, settings: Settings) -> Path:
@@ -664,6 +710,8 @@ def _register(app: Flask) -> None:
         resource_timeout = saved.resource_timeout
         overall_timeout = saved.discovery_timeout_min * 60
         settings_url = url_for("settings_page") + "#discovery"
+        alert_cfg = _alerts().load()
+        alerts_url = url_for("settings_page") + "#alerts"
         # Terraform is an optional ownership enrichment: mapped repos are only re-synced
         # with every refresh when it is enabled (the Sync buttons always work).
         tf_sync = (
@@ -740,6 +788,9 @@ def _register(app: Flask) -> None:
                 except Exception:
                     log.exception("terraform sync after refresh failed (account=%s)", account.id)
                     ctx.message("warn", "Terraform sync failed. See the log for details.")
+            # Last: an alert failure is only a warning, the snapshot is already saved.
+            if alert_cfg.configured:
+                run_alerts(ctx, db_path, account.id, alert_cfg, alerts_url)
             ctx.step("finished")
 
         return work
@@ -916,10 +967,16 @@ def _register(app: Flask) -> None:
         flags = request.args.getlist("surge")
         include_surge = not flags or "1" in flags
         result = headroom.for_snapshot(_db(), snap["id"], _scope(), include_surge)
+        history = trends.load(
+            _db(), snap["account_ref"], forecast_mod.DEFAULT_WINDOW_DAYS, _scope()
+        )
         return render_template(
             "headroom.html",
             snap=snap,
             h=result,
+            forecasts=forecast_mod.for_subnets(result, history),
+            forecast_window=forecast_mod.DEFAULT_WINDOW_DAYS,
+            min_points=forecast_mod.DEFAULT_MIN_POINTS,
             include_surge=include_surge,
             tight_pct=headroom.TIGHT_PCT,
             alb_reserve=headroom.ALB_RESERVE,
@@ -966,6 +1023,7 @@ def _register(app: Flask) -> None:
             tight_pct=headroom.TIGHT_PCT,
             alb_reserve=headroom.ALB_RESERVE,
             max_unmanaged=report_mod.MAX_UNMANAGED_LISTED,
+            min_points=forecast_mod.DEFAULT_MIN_POINTS,
         )
         if redactor is not None:
             # Pattern pass over the whole document: summary, charts, tables, suggestions.
@@ -994,7 +1052,31 @@ def _register(app: Flask) -> None:
         page = request.args.get("page", 0, type=int)
         grid = queries.subnet_grid(_db(), snap["id"], st, page)
         enis = queries.subnet_enis(_db(), snap["id"], subnet_id)
-        return render_template("subnet.html", snap=snap, s=st, grid=grid, enis=enis)
+        # Used-IP sparkline (Trends data) and the exhaustion forecast against the headroom.
+        window = forecast_mod.DEFAULT_WINDOW_DAYS
+        history = trends.load(_db(), snap["account_ref"], window, _scope())
+        series = next(
+            (s for ss in history.subnets.values() for s in ss if s.key == subnet_id), None
+        )
+        row = headroom.for_snapshot(_db(), snap["id"], _scope()).by_id.get(subnet_id)
+        fc = (
+            forecast_mod.project(series.points, row.free, row.demand, window_days=window)
+            if series is not None and row is not None
+            else None
+        )
+        return render_template(
+            "subnet.html",
+            snap=snap,
+            s=st,
+            grid=grid,
+            enis=enis,
+            series=series,
+            fc=fc,
+            hr=row,
+            chart=trends.svg_chart,
+            forecast_window=window,
+            min_points=forecast_mod.DEFAULT_MIN_POINTS,
+        )
 
     @app.get("/enis/<eni_id>")
     def eni(eni_id: str):
@@ -1707,7 +1789,48 @@ def _register(app: Flask) -> None:
             tf_roots=terraform.list_roots(_db()),
             tf_types=sorted(terraform.MANAGED_TYPES),
             tf_repos=tfrepo.list_repos(_db()),
+            alert=_alerts().load(),
+            alert_limits={
+                "days": (alerts.MIN_FORECAST_DAYS, alerts.MAX_FORECAST_DAYS),
+                "pct": (alerts.MIN_FREE_PCT, alerts.MAX_FREE_PCT),
+            },
+            alert_formats=alerts.FORMAT_LABELS,
+            forecast_window=forecast_mod.DEFAULT_WINDOW_DAYS,
         )
+
+    # -- alerts (webhook) -------------------------------------------------------------
+
+    @app.post("/settings/alerts")
+    def alerts_save():
+        f = request.form
+        try:
+            _alerts().save(
+                webhook_url=f.get("webhook_url", ""),
+                clear_url=f.get("clear_webhook") == "1",
+                on_over=f.get("on_over") == "1",
+                forecast_days=f.get("forecast_days", alerts.DEFAULT_FORECAST_DAYS),
+                free_pct=f.get("free_pct", alerts.DEFAULT_FREE_PCT),
+                include_ids=f.get("include_ids") == "1",
+                webhook_format=f.get("webhook_format", alerts.DEFAULT_FORMAT),
+            )
+        except ValueError as exc:
+            flash(f"Alerts not saved: {exc}", "error")
+            return redirect(url_for("settings_page") + "#alerts")
+        log.info("alert settings saved: %r", _alerts().load())
+        flash("Alert settings saved", "ok")
+        return redirect(url_for("settings_page") + "#alerts")
+
+    @app.post("/settings/alerts/test")
+    def alerts_test():
+        try:
+            alerts.send_test(_alerts().load())
+        except alerts.WebhookError as exc:
+            log.warning("alert test failed: %s", exc)
+            flash(f"Test alert not sent: {exc}.", "error")
+        else:
+            log.info("alert test sent")
+            flash("Test alert sent: check the channel.", "ok")
+        return redirect(url_for("settings_page") + "#alerts")
 
     # -- Terraform state (read-only; only ids / addresses / types are kept) ----------
 

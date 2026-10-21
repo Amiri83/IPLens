@@ -4,6 +4,21 @@
 
 ### Added
 
+- IP exhaustion forecast: per subnet, a linear fit of used IPs over the last 30 days of snapshots
+  (at least 5 points) – the trend in IPs/day, days until free = 0 and days until the scale
+  headroom demand no longer fits (free − demand = 0); "stable" for a flat or shrinking trend,
+  "not enough data" below 5 points. A Forecast column on **Headroom**, a used-IP sparkline with
+  the forecast on the subnet page and an "IP exhaustion forecast" table in the report.
+
+- Alerts (**Settings → Alerts**): a webhook notified after each Refresh, in the chosen webhook
+  format – Slack (`{"text": ...}`, default) or Microsoft Teams Workflows (Adaptive Card) – when a subnet's state changes – headroom over, forecast to stop fitting
+  within X days (default 30), free below Y% (default 10). The last state sent is stored per
+  subnet, so repeated Refreshes do not re-send; cleared subnets get one "resolved" line. A
+  **Send test** button. The webhook URL is encrypted like the credentials and never logged or
+  shown again; alert text uses subnet name + AZ, with account / subnet ids only when enabled.
+  The webhook is the only outbound call besides AWS; a failure is logged, shown as a warning and
+  never fails the Refresh.
+
 - Scale headroom: per subnet, free IPs vs. the worst-case demand if everything scales to its
   maximum – Auto Scaling groups (`max - current` instances spread evenly over their subnets ×
   ENIs per instance), awsvpc ECS services (`max - running` tasks, 1 IP each), 8 free IPs per ALB

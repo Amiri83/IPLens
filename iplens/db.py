@@ -490,6 +490,16 @@ CREATE TABLE IF NOT EXISTS refresh_schedules (
     interval_hours INTEGER NOT NULL DEFAULT 0,
     last_run_at    TEXT NOT NULL DEFAULT ''
 );
+
+-- Alerts (alerts.py): the last alert state sent per subnet (its conditions, comma-separated),
+-- so repeated Refreshes only notify on a change. No row: clear.
+CREATE TABLE IF NOT EXISTS alert_state (
+    account_ref INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    subnet_id   TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    sent_at     TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_ref, subnet_id)
+);
 """
 
 # The table of one managed service's resources (managed.ManagedResource) per snapshot.

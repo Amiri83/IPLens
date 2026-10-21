@@ -13,6 +13,19 @@
       CIDR reservations or prefix delegations not visible on ENIs).</div>
   {% endif %}
   <div style="margin-top: .5rem">{{ usage_bar(s) }}</div>
+  <div class="row subnet-forecast" style="margin-top: .5rem">
+    {% if series %}<a href="{{ url_for('trends_page', vpc=s.vpc_id) }}" title="Used IPs, last {{ forecast_window }} days (Trends)">{{ chart(series, width=160, height=36, compact=True) }}</a>{% endif %}
+    <span>
+      {% if fc and fc.status != 'insufficient' %}
+        <b>Trend</b> ({{ forecast_window }} days): {{ fc.trend_text }}
+        {% if fc.days_to_exhaustion is not none %} · free = 0 in {{ fc.exhaustion_text }}{% endif %}
+        {% if fc.days_to_headroom is not none %} · demand at max scale ({{ hr.demand }} IPs) no longer fits in {{ fc.headroom_text }}{% endif %}
+      {% else %}
+        <b>Trend</b>: <span class="muted">not enough data (fewer than {{ min_points }} snapshots in the last {{ forecast_window }} days)</span>
+      {% endif %}
+      · <a href="{{ url_for('headroom_page') }}#{{ s.subnet_id }}">Headroom</a>
+    </span>
+  </div>
 </div>
 
 <h2>Address grid {% if grid.pages > 1 %}<span class="muted">({{ grid.start }} – {{ grid.end }}, page {{ grid.page + 1 }} / {{ grid.pages }})</span>{% endif %}</h2>
