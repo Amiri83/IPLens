@@ -112,6 +112,18 @@ def test_growth_beyond_the_horizon_is_stable():
     assert fc.status == forecast.STABLE and fc.days_to_exhaustion is None
 
 
+def test_headroom_within_the_horizon_is_growing_even_if_free_zero_is_not():
+    # +1 IP/day: free = 0 in 4000 days (beyond the 3650-day horizon), but the demand at max
+    # scale stops fitting in 20 days. The far-off date must not hide the near one.
+    fc = forecast.project(_series([100 + i for i in range(10)]), free=4000, demand=3980)
+    assert fc.status == forecast.GROWING
+    assert fc.slope_per_day == pytest.approx(1.0)
+    assert fc.days_to_headroom == pytest.approx(20.0)
+    assert fc.days_to_exhaustion is None  # beyond the horizon
+    assert fc.headroom_text == "~20 days" and fc.exhaustion_text == "–"
+    assert fc.within(30)
+
+
 def test_unsorted_points():
     pts = _series([100 + 2 * i for i in range(10)])
     assert forecast.project(list(reversed(pts)), free=50).days_to_exhaustion == pytest.approx(25)

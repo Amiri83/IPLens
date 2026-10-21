@@ -21,7 +21,7 @@ Local web app for private IPv4 usage visibility &amp; optimization across one or
 - **Scale headroom** – free IPs per subnet vs. the worst-case demand if every Auto Scaling group,
   ECS service, ALB and Lambda scales to its maximum; subnets that run out before max are flagged,
   with an exhaustion forecast (days until free = 0 and until the demand no longer fits).
-- **Alerts** (optional) – a Slack / Teams webhook notified after each Refresh when a subnet's
+- **Alerts** (optional) – a Slack or Teams (Workflows) webhook notified after each Refresh when a subnet's
   state changes (over at max scale, forecast to run out soon, low free IPs).
 - **CIDR planner** – free blocks and fragmentation per VPC CIDR, a Fit tool for new subnets and
   secondary-CIDR proposals checked for overlaps.
@@ -236,8 +236,16 @@ used-IP sparkline on the subnet page, and in the report.
 
 ## Alerts
 
-**Settings → Alerts** posts subnet alerts to a webhook as Slack / Teams-compatible JSON
-(`{"text": "..."}`). After each Refresh (manual or scheduled) every subnet of the account is
+**Settings → Alerts** posts subnet alerts to a webhook. The **Webhook format** setting picks the
+JSON body:
+
+- **Slack** (default): `{"text": "..."}`, for a Slack incoming webhook.
+- **Microsoft Teams (Workflows)**: a message with an Adaptive Card 1.4 attachment, one TextBlock
+  per line, for a Teams Workflows webhook ("When a Teams webhook request is received"):
+  `{"type": "message", "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive",
+  "content": {"type": "AdaptiveCard", "version": "1.4", "body": [{"type": "TextBlock", ...}]}}]}`.
+
+After each Refresh (manual or scheduled) every subnet of the account is
 checked: its scale headroom becomes **over**, the [forecast](#scale-headroom) says the demand stops
 fitting within *X* days (default 30), or less than *Y*% of its usable IPs are free (default 10); 0
 turns a threshold off. Only state changes are sent – the last state sent is stored per subnet, so

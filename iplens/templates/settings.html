@@ -152,8 +152,8 @@
 <section class="card" id="alerts">
   <h2 style="margin-top: 0">Alerts</h2>
   <p class="muted">After each Refresh, every subnet of the account is checked against the thresholds below,
-    and subnets whose alert state changed are posted to a webhook as one Slack / Teams-compatible JSON message
-    (<span class="mono">{"text": "..."}</span>). A subnet is only sent again when its state changes (including
+    and subnets whose alert state changed are posted to a webhook as one JSON message in the chosen webhook
+    format. A subnet is only sent again when its state changes (including
     one "resolved" line when it clears), so repeated Refreshes do not repeat an alert. A failed send is logged,
     never fails the Refresh, and is retried after the next one. This webhook POST is the only outbound call
     IPLens makes besides AWS.</p>
@@ -171,6 +171,15 @@
            placeholder="https://hooks.slack.com/services/…" maxlength="2048">
     <p class="muted small">Encrypted at rest like the account credentials, never logged and never shown again
       (only its host). https only.</p>
+    <label for="webhook_format">Webhook format</label>
+    <select id="webhook_format" name="webhook_format">
+      {% for value, label in alert_formats.items() %}
+        <option value="{{ value }}" {{ 'selected' if alert.webhook_format == value }}>{{ label }}</option>
+      {% endfor %}
+    </select>
+    <p class="muted small">Slack: <span class="mono">{"text": "..."}</span> for a Slack incoming webhook.
+      Microsoft Teams: an Adaptive Card message for a Teams Workflows webhook ("When a Teams webhook request
+      is received").</p>
     <label class="check"><input type="checkbox" name="on_over" value="1" {{ 'checked' if alert.on_over }}>
       Alert when a subnet's <a href="{{ url_for('headroom_page') }}">scale headroom</a> becomes <b>over</b></label>
     <div class="row">

@@ -1794,6 +1794,7 @@ def _register(app: Flask) -> None:
                 "days": (alerts.MIN_FORECAST_DAYS, alerts.MAX_FORECAST_DAYS),
                 "pct": (alerts.MIN_FREE_PCT, alerts.MAX_FREE_PCT),
             },
+            alert_formats=alerts.FORMAT_LABELS,
             forecast_window=forecast_mod.DEFAULT_WINDOW_DAYS,
         )
 
@@ -1810,6 +1811,7 @@ def _register(app: Flask) -> None:
                 forecast_days=f.get("forecast_days", alerts.DEFAULT_FORECAST_DAYS),
                 free_pct=f.get("free_pct", alerts.DEFAULT_FREE_PCT),
                 include_ids=f.get("include_ids") == "1",
+                webhook_format=f.get("webhook_format", alerts.DEFAULT_FORMAT),
             )
         except ValueError as exc:
             flash(f"Alerts not saved: {exc}", "error")

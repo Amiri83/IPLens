@@ -1,4 +1,8 @@
-"""Subnet alerts to a webhook (Slack / Teams incoming-webhook JSON: ``{"text": ...}``).
+"""Subnet alerts to a webhook, in the Settings -> Alerts *webhook format*:
+
+- ``slack`` (default): ``{"text": ...}``, as Slack incoming webhooks expect;
+- ``teams``: a message with one Adaptive Card 1.4 attachment (a TextBlock per line), as
+  Microsoft Teams Workflows ("when a Teams webhook request is received") expect.
 
 After each successful Refresh, :func:`evaluate` checks every subnet of the account's latest
 snapshot against the thresholds of Settings -> Alerts:
@@ -54,6 +58,9 @@ WEBHOOK_TIMEOUT = 10.0
 # Subnet lines per message; the rest are counted.
 MAX_LINES = 25
 TEST_TEXT = "IPLens test alert: this webhook will receive IPLens subnet alerts."
+SLACK, TEAMS = "slack", "teams"
+FORMAT_LABELS = {SLACK: "Slack", TEAMS: "Microsoft Teams (Workflows)"}
+DEFAULT_FORMAT = SLACK
 
 # Settings rows.
 _URL_KEY = "alert_webhook_enc"
@@ -61,6 +68,7 @@ _ON_OVER_KEY = "alert_on_over"
 _DAYS_KEY = "alert_forecast_days"
 _PCT_KEY = "alert_free_pct"
 _IDS_KEY = "alert_include_ids"
+_FORMAT_KEY = "alert_webhook_format"
 
 Sender = Callable[[str, dict[str, Any]], None]
 
@@ -79,6 +87,7 @@ class AlertSettings:
     forecast_days: int = DEFAULT_FORECAST_DAYS  # 0: off
     free_pct: float = DEFAULT_FREE_PCT  # 0: off
     include_ids: bool = False  # account / subnet ids in the alert text
+    webhook_format: str = DEFAULT_FORMAT  # slack | teams
     # A stored URL that the current secret key cannot decrypt.
     undecryptable: bool = False
 
@@ -98,7 +107,7 @@ class AlertSettings:
         return (
             f"AlertSettings(configured={self.configured}, on_over={self.on_over}, "
             f"forecast_days={self.forecast_days}, free_pct={self.free_pct}, "
-            f"include_ids={self.include_ids})"
+            f"include_ids={self.include_ids}, webhook_format={self.webhook_format})"
         )
 
 
@@ -113,6 +122,13 @@ def parse_webhook_url(value: str) -> str:
     if parts.scheme != "https" or not parts.hostname:
         raise ValueError("the webhook URL must be an https:// URL")
     return url
+
+
+def parse_webhook_format(value: str | None) -> str:
+    fmt = (value or "").strip().lower() or DEFAULT_FORMAT
+    if fmt not in FORMAT_LABELS:
+        raise ValueError(f"the webhook format must be one of: {', '.join(FORMAT_LABELS)}")
+    return fmt
 
 
 def parse_forecast_days(value: str | int | None) -> int:
@@ -152,6 +168,7 @@ class AlertStore:
         with closing(self.db_path) as conn:
             raw = {k: self._get(conn, k) for k in (_URL_KEY, _ON_OVER_KEY, _DAYS_KEY, _PCT_KEY)}
             include_ids = self._get(conn, _IDS_KEY) == "1"
+            raw_format = self._get(conn, _FORMAT_KEY)
         url, undecryptable = "", False
         if raw[_URL_KEY]:
             try:
@@ -167,12 +184,17 @@ class AlertStore:
             pct = parse_free_pct(raw[_PCT_KEY] or DEFAULT_FREE_PCT)
         except ValueError:
             pct = DEFAULT_FREE_PCT
+        try:
+            fmt = parse_webhook_format(raw_format)
+        except ValueError:
+            fmt = DEFAULT_FORMAT
         return AlertSettings(
             webhook_url=url,
             on_over=raw[_ON_OVER_KEY] != "0",
             forecast_days=days,
             free_pct=pct,
             include_ids=include_ids,
+            webhook_format=fmt,
             undecryptable=undecryptable,
         )
 
@@ -185,17 +207,20 @@ class AlertStore:
         forecast_days: str | int = DEFAULT_FORECAST_DAYS,
         free_pct: str | float = DEFAULT_FREE_PCT,
         include_ids: bool = False,
+        webhook_format: str = DEFAULT_FORMAT,
     ) -> None:
         """Store the settings; an empty ``webhook_url`` keeps the stored one (``clear_url``
         removes it). ValueError (nothing stored) if a value is invalid."""
         days = parse_forecast_days(forecast_days)
         pct = parse_free_pct(free_pct)
+        fmt = parse_webhook_format(webhook_format)
         url = parse_webhook_url(webhook_url) if webhook_url.strip() else ""
         values = {
             _ON_OVER_KEY: "1" if on_over else "0",
             _DAYS_KEY: str(days),
             _PCT_KEY: f"{pct:g}",
             _IDS_KEY: "1" if include_ids else "0",
+            _FORMAT_KEY: fmt,
         }
         if clear_url:
             values[_URL_KEY] = ""
@@ -246,9 +271,12 @@ def conditions(
             f"({row.free} free, {row.demand} demand at max)"
         )
     if cfg.forecast_days > 0 and fc is not None and fc.growing and fc.within(cfg.forecast_days):
+        free_zero = (
+            f", free = 0 in {fc.exhaustion_text}" if fc.days_to_exhaustion is not None else ""
+        )
         found[FORECAST] = (
-            f"forecast: demand at max scale stops fitting in {fc.headroom_text}, "
-            f"free = 0 in {fc.exhaustion_text} ({fc.trend_text})"
+            f"forecast: demand at max scale stops fitting in {fc.headroom_text}"
+            f"{free_zero} ({fc.trend_text})"
         )
     usable = row.subnet.usable
     if cfg.free_pct > 0 and usable > 0:
@@ -323,8 +351,25 @@ def message(
     return "\n".join(lines)
 
 
-def payload(text: str) -> dict[str, Any]:
-    """Slack and Teams incoming webhooks both accept ``{"text": ...}``."""
+def payload(text: str, fmt: str = DEFAULT_FORMAT) -> dict[str, Any]:
+    """The webhook body of ``text`` in the webhook format ``fmt`` (slack | teams)."""
+    if fmt == TEAMS:
+        body = [{"type": "TextBlock", "text": line, "wrap": True} for line in text.split("\n")]
+        body[0]["weight"] = "Bolder"
+        return {
+            "type": "message",
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.card.adaptive",
+                    "content": {
+                        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                        "type": "AdaptiveCard",
+                        "version": "1.4",
+                        "body": body,
+                    },
+                }
+            ],
+        }
     return {"text": text}
 
 
@@ -367,7 +412,7 @@ def send_test(cfg: AlertSettings, sender: Sender | None = None) -> None:
     """Send :data:`TEST_TEXT`; WebhookError when it fails or no URL is set."""
     if not cfg.configured:
         raise WebhookError("no webhook URL is set")
-    (sender or post_json)(cfg.webhook_url, payload(TEST_TEXT))
+    (sender or post_json)(cfg.webhook_url, payload(TEST_TEXT, cfg.webhook_format))
 
 
 # -- state and the post-Refresh run ---------------------------------------------------------
@@ -441,7 +486,7 @@ def evaluate(
         include_ids=cfg.include_ids,
     )
     try:
-        (sender or post_json)(cfg.webhook_url, payload(text))
+        (sender or post_json)(cfg.webhook_url, payload(text, cfg.webhook_format))
     except Exception as exc:
         conn.commit()  # the pruning above still stands
         if isinstance(exc, WebhookError):

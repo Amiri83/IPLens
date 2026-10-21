@@ -9,8 +9,9 @@ positive slope of ``s`` IPs/day and ``free`` IPs free now:
 - days until the demand at max scale no longer fits (free - demand = 0):
   ``(free - demand) / s``.
 
-Either is 0 when already reached. A slope <= 0, or a date further away than
-:data:`iplens.trends.HORIZON_DAYS`, is "stable"; fewer than ``min_points`` points in the
+Either is 0 when already reached. A slope <= 0, or both dates further away than
+:data:`iplens.trends.HORIZON_DAYS`, is "stable" (a single date beyond the horizon is
+reported as None); fewer than ``min_points`` points in the
 window is "not enough data". Every function here is pure: the callers load the series
 (:func:`iplens.trends.load`) and the headroom (:func:`iplens.headroom.for_snapshot`).
 """
@@ -109,9 +110,18 @@ def project(
             STABLE, n, slope, 0.0 if free <= 0 else None, 0.0 if left <= 0 else None
         )
     to_free = max(free / slope, 0.0)
-    if to_free > HORIZON_DAYS:
-        return SubnetForecast(STABLE, n, slope, None, 0.0 if left <= 0 else None)
-    return SubnetForecast(GROWING, n, slope, to_free, max(left / slope, 0.0))
+    to_headroom = max(left / slope, 0.0)
+    # Growing when either date is within the horizon: a far-off free = 0 must not hide a
+    # near headroom date. A date beyond the horizon is reported as None.
+    if to_free > HORIZON_DAYS and to_headroom > HORIZON_DAYS:
+        return SubnetForecast(STABLE, n, slope, None, None)
+    return SubnetForecast(
+        GROWING,
+        n,
+        slope,
+        to_free if to_free <= HORIZON_DAYS else None,
+        to_headroom,
+    )
 
 
 def for_subnets(

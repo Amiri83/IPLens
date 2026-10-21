@@ -74,6 +74,20 @@ def test_forecast_condition_uses_the_headroom_days():
     assert alerts.conditions(_row(), GROWING_LATE, CFG) == {}  # 60 days > 30
 
 
+def test_forecast_alert_fires_when_only_the_headroom_is_within_the_horizon():
+    # free 4000, demand 3980, +1 IP/day: free = 0 is beyond the horizon, the headroom is ~20 days.
+    end = datetime(2026, 1, 31, tzinfo=UTC)
+    pts = [(end - timedelta(days=9 - i), 100 + i) for i in range(10)]
+    fc = forecast.project(pts, free=4000, demand=3980)
+    row = _row(free=4000, usable=4091, demand=3980)
+    found = alerts.conditions(row, fc, CFG)
+    assert set(found) == {alerts.FORECAST}
+    assert "stops fitting in ~20 days" in found[alerts.FORECAST]
+    assert "free = 0" not in found[alerts.FORECAST]
+    sent = alerts.changes(headroom.Headroom([row]), {SA: fc}, CFG, {})
+    assert [(a.subnet_id, a.conditions) for a in sent] == [(SA, (alerts.FORECAST,))]
+
+
 def test_low_free_condition():
     found = alerts.conditions(_row(free=5), None, CFG)  # 5 / 59 = 8.5%
     assert set(found) == {alerts.LOW_FREE}
@@ -155,6 +169,17 @@ def test_defaults(store):
     assert not cfg.configured
     assert cfg.on_over and cfg.forecast_days == 30 and cfg.free_pct == 10.0
     assert not cfg.include_ids
+    assert cfg.webhook_format == alerts.SLACK
+
+
+def test_webhook_format_is_stored_and_validated(store):
+    store.save(webhook_url=URL, webhook_format="teams")
+    assert store.load().webhook_format == alerts.TEAMS
+    with pytest.raises(ValueError, match="webhook format"):
+        store.save(webhook_format="discord")
+    assert store.load().webhook_format == alerts.TEAMS  # nothing stored
+    store.save(webhook_format="")
+    assert store.load().webhook_format == alerts.SLACK
 
 
 def test_webhook_url_is_encrypted_at_rest(store, db_path):
@@ -273,6 +298,35 @@ def test_send_test():
         alerts.send_test(alerts.AlertSettings(), rec)
 
 
+def _card_lines(body):
+    """The TextBlock texts of a Teams Workflows Adaptive Card message (checking its shape)."""
+    assert set(body) == {"type", "attachments"} and body["type"] == "message"
+    [att] = body["attachments"]
+    assert att["contentType"] == "application/vnd.microsoft.card.adaptive"
+    card = att["content"]
+    assert card["type"] == "AdaptiveCard" and card["version"] == "1.4"
+    assert all(b["type"] == "TextBlock" and b["wrap"] is True for b in card["body"])
+    return [b["text"] for b in card["body"]]
+
+
+def test_payload_formats():
+    text = "IPLens alert · a\n1 subnet(s) alerting, 0 resolved\n• app-a (us-east-1a): over"
+    assert alerts.payload(text) == {"text": text}
+    assert alerts.payload(text, alerts.SLACK) == {"text": text}
+    teams = alerts.payload(text, alerts.TEAMS)
+    assert _card_lines(teams) == text.split("\n")
+    assert "text" not in teams
+
+
+def test_send_test_slack_and_teams_targets():
+    slack, teams = Recorder(), Recorder()
+    alerts.send_test(alerts.AlertSettings(webhook_url=URL, webhook_format=alerts.SLACK), slack)
+    alerts.send_test(alerts.AlertSettings(webhook_url=URL, webhook_format=alerts.TEAMS), teams)
+    assert slack.calls == [(URL, {"text": alerts.TEST_TEXT})]
+    [(url, body)] = teams.calls
+    assert url == URL and _card_lines(body) == [alerts.TEST_TEXT]
+
+
 # -- evaluate against the database ----------------------------------------------------------
 
 
@@ -310,6 +364,17 @@ def test_evaluate_sends_once_per_state_change(db_path, snapshot_builder, ips):
     assert "resolved (was: low free)" in rec.texts[1]
     assert _evaluate(db_path, rec) == []
     assert len(rec.calls) == 2
+
+
+def test_evaluate_teams_target_receives_an_adaptive_card(db_path, snapshot_builder, ips):
+    rec = Recorder()
+    _snapshot(db_path, snapshot_builder, ips, 55)
+    cfg = alerts.AlertSettings(webhook_url=URL, webhook_format=alerts.TEAMS)
+    assert [a.subnet_id for a in _evaluate(db_path, rec, cfg)] == [SA]
+    [(url, body)] = rec.calls
+    lines = _card_lines(body)
+    assert url == URL and lines[0].startswith("IPLens alert")
+    assert "• app-a (us-east-1a): free 6.8% (< 10%): 4 of 59 usable IPs" in lines
 
 
 def test_evaluate_forecast_condition_from_history(db_path, snapshot_builder, ips):
@@ -397,6 +462,27 @@ def test_settings_save_test_button_and_url_never_shown(client, monkeypatch):
     page = _post(client, "/settings/alerts/test", follow_redirects=True).data.decode()
     assert "Test alert sent" in page
     assert rec.calls == [(URL, {"text": alerts.TEST_TEXT})]
+
+
+def test_settings_webhook_format_select(client, monkeypatch):
+    rec = Recorder()
+    monkeypatch.setattr(alerts, "post_json", rec)
+    page = client.get("/settings").data.decode()
+    assert 'name="webhook_format"' in page and '<option value="slack" selected>' in page
+    page = _post(
+        client,
+        "/settings/alerts",
+        {"webhook_url": URL, "webhook_format": "teams"},
+        follow_redirects=True,
+    ).data.decode()
+    assert '<option value="teams" selected>' in page
+    _post(client, "/settings/alerts/test")
+    [(_, body)] = rec.calls
+    assert _card_lines(body) == [alerts.TEST_TEXT]
+    page = _post(
+        client, "/settings/alerts", {"webhook_format": "xml"}, follow_redirects=True
+    ).data.decode()
+    assert "Alerts not saved" in page and "webhook format" in page
 
 
 def test_settings_rejects_a_bad_url(client):

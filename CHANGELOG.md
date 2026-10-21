@@ -10,8 +10,8 @@
   "not enough data" below 5 points. A Forecast column on **Headroom**, a used-IP sparkline with
   the forecast on the subnet page and an "IP exhaustion forecast" table in the report.
 
-- Alerts (**Settings → Alerts**): a Slack / Teams-compatible webhook (`{"text": ...}`) notified
-  after each Refresh when a subnet's state changes – headroom over, forecast to stop fitting
+- Alerts (**Settings → Alerts**): a webhook notified after each Refresh, in the chosen webhook
+  format – Slack (`{"text": ...}`, default) or Microsoft Teams Workflows (Adaptive Card) – when a subnet's state changes – headroom over, forecast to stop fitting
   within X days (default 30), free below Y% (default 10). The last state sent is stored per
   subnet, so repeated Refreshes do not re-send; cleared subnets get one "resolved" line. A
   **Send test** button. The webhook URL is encrypted like the credentials and never logged or
