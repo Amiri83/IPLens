@@ -267,13 +267,25 @@ class JobContext:
             if len(self._job.messages) < MAX_MESSAGES:
                 self._job.messages.append(Message(category, text, link_url, link_text))
 
-    def plan_resources(self, names: list[str], resource_timeout: int, overall_timeout: int) -> None:
-        """Announce a Refresh's resource types (all pending) and its timeouts."""
+    def plan_resources(
+        self,
+        names: list[str],
+        resource_timeout: int,
+        overall_timeout: int,
+        timeouts: dict[str, int] | None = None,
+    ) -> None:
+        """Announce a Refresh's resource types (all pending) and its timeouts
+        (``timeouts``: the resource types with another one, e.g. the required ones)."""
+        timeouts = timeouts or {}
         with self._manager._lock:
             if self._muted():
                 return
             self._job.limits = {"resource": int(resource_timeout), "overall": int(overall_timeout)}
-            self._job.resources = [Resource(n, timeout=int(resource_timeout)) for n in names]
+            if timeouts:
+                self._job.limits["required"] = max(int(t) for t in timeouts.values())
+            self._job.resources = [
+                Resource(n, timeout=int(timeouts.get(n, resource_timeout))) for n in names
+            ]
 
     def resource(
         self, name: str, status: str, reason: str = "", timeout: int | None = None

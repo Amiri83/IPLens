@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Owner names of managed-service ENIs: optional, read-only `rds:DescribeDBInstances`,
+  `rds:DescribeDBClusters`, `redshift:DescribeClusters`, `elasticache:DescribeCacheClusters`,
+  `elasticache:DescribeReplicationGroups`, `es:ListDomainNames` + `es:DescribeDomains` and
+  `kafka:ListClustersV2` map each cluster / domain to its ENIs (by ENI id / node IP, the ENI
+  description's reference, or subnet + security groups), so they read e.g. "Aurora cluster
+  db-a" or "ElastiCache replication group cache-a" instead of the generic "RDS" /
+  "ElastiCache". Unmatched or ambiguous ENIs keep today's attribution; a missing permission is
+  a Refresh warning. The rows are stored per snapshot and copied by "Retry skipped" like the
+  other resource types it does not collect.
+
+### Changed
+
+- The per-resource discovery timeout defaults to 30 s (was 120 s) and applies to the optional
+  resource types; VPCs, subnets and ENIs always get at least 120 s (or the setting, if longer),
+  with botocore read timeouts split to fit each (3 attempts × read timeout ≤ the timeout,
+  connect timeout ≤ 10 s).
+
 ## 1.0.1 – unreleased
 
 ### Changed

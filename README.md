@@ -260,6 +260,12 @@ the instance attachment's secondary private IPs; without it ENIs keep their own 
 `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth` and
 `ec2:DescribeSecurityGroups` add load balancer → target and security group reference
 connections to the Visual page; without them those connections are left out.
+Managed-service names: `rds:DescribeDBInstances`, `rds:DescribeDBClusters`,
+`redshift:DescribeClusters`, `elasticache:DescribeCacheClusters`,
+`elasticache:DescribeReplicationGroups`, `es:ListDomainNames`, `es:DescribeDomains` and
+`kafka:ListClustersV2` name the ENIs of RDS / Aurora, Redshift, ElastiCache, OpenSearch and MSK
+after their cluster or domain ("Aurora cluster db-a" instead of "RDS"); each one missing is a
+Refresh warning and those ENIs keep the generic attribution.
 Ownership: `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources`
 and, when enabled in Settings, `cloudtrail:LookupEvents` (all read-only and listed explicitly in
 the guard's allowlist); a missing permission becomes a Refresh warning and that source is skipped.
@@ -292,6 +298,7 @@ sources, simply not enabled).
 | Account alias in the header | `iam:ListAccountAliases` | optional (falls back to account id / display name) |
 | EC2 instance names and attachment IPs | `ec2:DescribeInstances` | optional (skipped with warning) |
 | Visual: LB → target and security group connections | `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth`, `ec2:DescribeSecurityGroups` | optional (connections left out) |
+| Managed-service ENI names (RDS / Aurora, Redshift, ElastiCache, OpenSearch, MSK) | `rds:DescribeDBInstances`, `rds:DescribeDBClusters`, `redshift:DescribeClusters`, `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups`, `es:ListDomainNames`, `es:DescribeDomains`, `kafka:ListClustersV2` | optional (missing permission = warning + skip; ENIs keep the generic name) |
 | Ownership: tags, CloudFormation | `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources` | optional (skipped with warning) |
 | Ownership: CloudTrail creator | `cloudtrail:LookupEvents` | optional, **opt-in** in Settings |
 | Extended view: services | `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:ListTables`, `dynamodb:DescribeTable`, `events:List*`, `s3:ListAllMyBuckets`, `s3:GetBucketNotification`, `apigateway:GET`, `states:List*`, `states:DescribeStateMachine`, `secretsmanager:ListSecrets`, `lambda:ListEventSourceMappings`, `ecs:List*`, `ecs:Describe*`, `kafka:ListClustersV2` | optional, each source skipped with warning |

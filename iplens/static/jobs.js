@@ -81,8 +81,10 @@
     const a = document.createElement("a");
     a.href = modal.dataset.settingsUrl;
     a.textContent = "change in Settings";
+    const required = limits.required && limits.required !== limits.resource
+      ? ` (VPCs, subnets, ENIs: ${limits.required}s)` : "";
     limitsEl.replaceChildren(
-      `Each resource times out after ${limits.resource}s; total limit ${fmtMinutes(limits.overall)} — `,
+      `Each resource times out after ${limits.resource}s${required}; total limit ${fmtMinutes(limits.overall)} — `,
       a,
     );
   }

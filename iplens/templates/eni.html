@@ -9,7 +9,7 @@
       {% if e.owner_names | length > 1 %}
         — shared by {{ e.owner_names | length }} functions (same subnet and security groups):
         <ul class="owner-list">{% for n in e.owner_names %}<li class="mono">{{ n }}</li>{% endfor %}</ul>
-      {% elif e.owner_ref %}<span class="mono">{{ e.owner_ref }}</span>{% endif %}</td></tr>
+      {% else %}{% if e.owner_name %}— {{ e.owner_name }} {% endif %}{% if e.owner_ref %}<span class="mono">{{ e.owner_ref }}</span>{% endif %}{% endif %}</td></tr>
     <tr><th>Ownership</th><td class="ownership">{% if e.owner.source %}<b>{{ e.owner.label }}</b>: {{ e.owner.value }}
         {% if e.owner.detail %}<span class="muted small">({{ 'Terraform address' if e.owner.source == 'terraform' else 'created by' }} <span class="mono">{{ e.owner.detail }}</span>)</span>{% endif %}
       {% else %}<span class="muted">unmanaged — no CloudFormation stack, project / repo tag{% if own.tf_enabled %}, Terraform root{% endif %}{% if own.cloudtrail %} or CloudTrail creator{% endif %}</span>{% endif %}

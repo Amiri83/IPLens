@@ -74,12 +74,14 @@ from .jobs import JobBusy, JobCancelled, JobContext, JobFailed, JobManager, Prog
 from .logging_setup import LEVELS, configure_logging, read_log
 from .queries import LB_ICONS, TYPE_ICONS
 from .settings import (
+    DEFAULT_RESOURCE_TIMEOUT,
     MAX_DISCOVERY_TIMEOUT_MIN,
     MAX_DISPLAY_NAME,
     MAX_RESOURCE_TIMEOUT,
     MIN_DISCOVERY_TIMEOUT_MIN,
     MIN_RESOURCE_TIMEOUT,
     REGIONS,
+    REQUIRED_RESOURCE_TIMEOUT,
     Settings,
     SettingsStore,
     parse_discovery_timeout,
@@ -1673,6 +1675,8 @@ def _register(app: Flask) -> None:
                 "resource": (MIN_RESOURCE_TIMEOUT, MAX_RESOURCE_TIMEOUT),
                 "overall": (MIN_DISCOVERY_TIMEOUT_MIN, MAX_DISCOVERY_TIMEOUT_MIN),
             },
+            default_resource_timeout=DEFAULT_RESOURCE_TIMEOUT,
+            required_timeout=REQUIRED_RESOURCE_TIMEOUT,
             default_log_dir=_paths().default_log_dir,
             tf_roots=terraform.list_roots(_db()),
             tf_types=sorted(terraform.MANAGED_TYPES),
