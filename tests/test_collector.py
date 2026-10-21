@@ -184,12 +184,12 @@ def test_optional_permissions_become_warnings(aws_env, db_path, monkeypatch):
     gw = _gateway()
     real_client = gw.client
 
-    def client(service):
+    def client(service, **kw):
         if service == "lambda":
             raise ClientError(
                 {"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "ListFunctions"
             )
-        return real_client(service)
+        return real_client(service, **kw)
 
     monkeypatch.setattr(gw, "client", client)
     result = Collector(gw, db_path).run()
@@ -218,8 +218,8 @@ def test_account_alias_permission_denied_falls_back_to_account_id(
     gw = _gateway()
     real_client = gw.client
 
-    def client(service):
-        c = real_client(service)
+    def client(service, **kw):
+        c = real_client(service, **kw)
         if service == "iam":
 
             def deny(**_):
@@ -342,8 +342,8 @@ def test_ecs_permission_denied_is_a_warning(
     gw = _gateway()
     real_client = gw.client
 
-    def client(service):
-        c = real_client(service)
+    def client(service, **kw):
+        c = real_client(service, **kw)
         if service == "ecs":
 
             def deny(event_name=None, **_):
@@ -551,8 +551,8 @@ def test_lb_target_permission_denied_is_a_warning(aws_env, db_path, monkeypatch)
     gw = _gateway()
     real_client = gw.client
 
-    def client(service):
-        c = real_client(service)
+    def client(service, **kw):
+        c = real_client(service, **kw)
         if service == "elbv2":
 
             def deny(event_name=None, **_):
@@ -652,8 +652,8 @@ def test_failed_collection_is_recorded(aws_env, db_path, monkeypatch):
     gw = _gateway()
     real_client = gw.client
 
-    def client(service):
-        c = real_client(service)
+    def client(service, **kw):
+        c = real_client(service, **kw)
         if service == "ec2":
 
             def denied(*_a, **_k):
@@ -753,8 +753,8 @@ def test_tag_permissions_denied_are_warnings(aws_env, db_path, monkeypatch):
 
         return call
 
-    def client(service):
-        c = real_client(service)
+    def client(service, **kw):
+        c = real_client(service, **kw)
         if service == "elbv2":
             monkeypatch.setattr(c, "describe_tags", denied("DescribeTags"))
         if service == "lambda":

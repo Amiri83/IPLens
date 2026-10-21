@@ -5,9 +5,13 @@ thread bounded by the per-resource timeout and by what is left of the overall li
 (Settings → Discovery). A resource past its timeout is abandoned: it is reported as
 skipped, its pagination loop stops at the next page, and the botocore connect / read
 timeouts (:func:`iplens.aws.call_timeouts`) end a call stuck on the network. The other
-resource types still run. VPCs, subnets and ENIs are the snapshot itself: when one of
-them times out the Refresh fails instead of saving an empty snapshot. Once abandoned, a
-resource's thread no longer writes to the job's log or progress.
+resource types still run. VPCs, subnets and ENIs are the snapshot itself: they get at
+least REQUIRED_RESOURCE_TIMEOUT seconds, and when one of them times out the Refresh fails
+instead of saving an empty snapshot. Once abandoned, a resource's thread no longer writes
+to the job's log or progress.
+
+The clusters / domains of RDS, Redshift, ElastiCache, OpenSearch and MSK (each optional)
+give their ENIs an owner name such as "Aurora cluster db-a" (see :mod:`iplens.managed`).
 
 "Retry skipped" runs a Collector with ``only``: just the skipped resource types (plus what
 they need, see :func:`retry_plan`), the account identity and VPCs/subnets/ENIs, and a
@@ -38,19 +42,23 @@ from typing import Any, TypeVar
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-from . import ownership
+from . import managed, ownership
 from .attribution import Attribution, attribute_eni, lambda_eni_index, lambda_owners
 from .aws import AwsGateway, call_timeouts
 from .db import closing
 from .jobs import RES_DONE, RES_RUNNING, SKIPPED, JobCancelled, NullProgress, Progress
-from .settings import DEFAULT_DISCOVERY_TIMEOUT_MIN, DEFAULT_RESOURCE_TIMEOUT
+from .settings import (
+    DEFAULT_DISCOVERY_TIMEOUT_MIN,
+    DEFAULT_RESOURCE_TIMEOUT,
+    REQUIRED_RESOURCE_TIMEOUT,
+)
 
 log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
 # Progress steps of one collection (see Collector._step).
-COLLECT_STEPS = 15
+COLLECT_STEPS = 20
 # tag:GetResources page size (the API maximum).
 _TAG_PAGE = 100
 # CloudTrail events read per looked-up resource.
@@ -60,6 +68,17 @@ _POLL = 0.1
 
 # The resource types of a Refresh, in collection order (rows of the progress box).
 CORE_RESOURCES = ("ec2:DescribeVpcs", "ec2:DescribeSubnets", "ec2:DescribeNetworkInterfaces")
+# Owner names of managed-service ENIs (iplens.managed): the resource types of each service.
+MANAGED_SOURCES: dict[str, tuple[str, ...]] = {
+    "rds": ("rds:DescribeDBInstances", "rds:DescribeDBClusters"),
+    "redshift": ("redshift:DescribeClusters",),
+    "elasticache": (
+        "elasticache:DescribeCacheClusters",
+        "elasticache:DescribeReplicationGroups",
+    ),
+    "opensearch": ("es:DescribeDomains",),  # es:ListDomainNames + es:DescribeDomains
+    "msk": ("kafka:ListClustersV2",),
+}
 RESOURCES = (
     "sts:GetCallerIdentity",
     "iam:ListAccountAliases",
@@ -72,6 +91,7 @@ RESOURCES = (
     "elasticloadbalancing:DescribeTargetHealth",
     "ec2:DescribeSecurityGroups",
     "ECS services and tasks",
+    *(what for sources in MANAGED_SOURCES.values() for what in sources),
     "elasticloadbalancing:DescribeTags",
     "lambda:ListTags",
     "tag:GetResources",
@@ -97,6 +117,12 @@ _NEEDS: dict[str, tuple[str, ...]] = {
     # The ownership rows merge both sources (stacks first), so they are collected together.
     "tag:GetResources": ("cloudformation:ListStacks",),
     "cloudformation:ListStacks": ("tag:GetResources",),
+    # A service's rows are derived from both of its calls (e.g. Aurora instances are named
+    # after their cluster), so they are collected together.
+    "rds:DescribeDBInstances": ("rds:DescribeDBClusters",),
+    "rds:DescribeDBClusters": ("rds:DescribeDBInstances",),
+    "elasticache:DescribeCacheClusters": ("elasticache:DescribeReplicationGroups",),
+    "elasticache:DescribeReplicationGroups": ("elasticache:DescribeCacheClusters",),
 }
 # Retry skipped: the snapshot rows of each optional write, by the resource types they come
 # from: (resource types, tables, resource_tags types). A write whose resource types the
@@ -131,6 +157,10 @@ _MERGED: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
         frozenset({"tag:GetResources", "cloudformation:ListStacks"}),
         ("own_resources", "own_tags"),
         (),
+    ),
+    *(
+        (frozenset(sources), (managed.TABLES[service],), ())
+        for service, sources in MANAGED_SOURCES.items()
     ),
 )
 
@@ -297,6 +327,8 @@ _ECS_SERVICE_BATCH = 10
 _ECS_TASK_BATCH = 100
 # elbv2 DescribeTags limit.
 _LB_TAG_BATCH = 20
+# OpenSearch DescribeDomains limit.
+_OPENSEARCH_BATCH = 5
 
 
 @dataclass
@@ -451,8 +483,10 @@ class Collector:
         # Background job reporting; cancellation is checked between API calls.
         self._progress: Progress = progress or NullProgress()
         self._done = 0
-        # Seconds one resource type may run, and the whole collection.
+        # Seconds one optional resource type may run, a required one (never less than
+        # REQUIRED_RESOURCE_TIMEOUT) and the whole collection.
         self.resource_timeout = float(resource_timeout)
+        self.required_timeout = max(self.resource_timeout, float(REQUIRED_RESOURCE_TIMEOUT))
         self.overall_timeout = float(overall_timeout)
         self._deadline = math.inf
         self._touched: set[str] = set()
@@ -495,14 +529,27 @@ class Collector:
         self._mark(what, SKIPPED, reason)
         result.skipped.append((what, reason))
 
+    def _limit(self, what: str) -> float:
+        """Seconds resource type ``what`` may run: VPCs, subnets and ENIs get the longer
+        required timeout, every other type the per-resource one."""
+        return self.required_timeout if what in CORE_RESOURCES else self.resource_timeout
+
+    def _client(self, service: str, timeout: float) -> Any:
+        """A client whose botocore timeouts fit ``timeout`` instead of the per-resource
+        timeout every other client is configured for (see call_timeouts)."""
+        if not isinstance(self.gw, AwsGateway):
+            return self.gw.client(service)
+        return self.gw.client(service, config=call_timeouts(timeout))
+
     def _timed(self, result: CollectResult, what: str, fn: Callable[[], T]) -> T:
-        """Run one resource type in a helper thread, bounded by the per-resource timeout
+        """Run one resource type in a helper thread, bounded by its timeout (see _limit)
         and what is left of the overall limit. Past it the resource is abandoned (its
         thread stops at the next page; botocore timeouts end a stuck call), recorded as
         skipped and :class:`ResourceTimeout` is raised. Errors of ``fn`` are re-raised."""
+        limit = self._limit(what)
         left = self._deadline - time.monotonic()
-        overall = left < self.resource_timeout  # the overall limit is the tighter one
-        budget = min(self.resource_timeout, left)
+        overall = left < limit  # the overall limit is the tighter one
+        budget = min(limit, left)
         if budget <= 0:
             return self._timed_out(result, what, overall=True)
         self._mark(what, RES_RUNNING, timeout=math.ceil(budget))
@@ -543,7 +590,7 @@ class Collector:
             minutes = math.ceil(self.overall_timeout / 60)
             reason = f"overall time limit of {minutes} min reached"
         else:
-            reason = f"timeout after {math.ceil(self.resource_timeout)}s"
+            reason = f"timeout after {math.ceil(self._limit(what))}s"
         msg = f"{what} skipped ({reason})"
         log.warning(msg)
         result.warnings.append(msg)
@@ -587,7 +634,10 @@ class Collector:
         planned = [*RESOURCES, *([CLOUDTRAIL_RESOURCE] if self.own.cloudtrail else [])]
         self._planned = [what for what in planned if self._wants(what)]
         self.progress.plan_resources(
-            self._planned, math.ceil(self.resource_timeout), math.ceil(self.overall_timeout)
+            self._planned,
+            math.ceil(self.resource_timeout),
+            math.ceil(self.overall_timeout),
+            timeouts={what: math.ceil(self.required_timeout) for what in CORE_RESOURCES},
         )
 
     def run(self) -> CollectResult:
@@ -681,19 +731,21 @@ class Collector:
         aliases = self._optional(result, "iam:ListAccountAliases", self.gw.account_aliases)
         account_alias = aliases[0] if aliases else ""
 
+        # VPCs, subnets and ENIs: botocore timeouts of their longer timeout (see _limit).
+        core = self._client("ec2", self.required_timeout)
         self._step("ec2:DescribeVpcs")
         vpcs = self._required(
-            result, "ec2:DescribeVpcs", lambda: _paginate(ec2, "describe_vpcs", "Vpcs")
+            result, "ec2:DescribeVpcs", lambda: _paginate(core, "describe_vpcs", "Vpcs")
         )
         self._step("ec2:DescribeSubnets")
         subnets = self._required(
-            result, "ec2:DescribeSubnets", lambda: _paginate(ec2, "describe_subnets", "Subnets")
+            result, "ec2:DescribeSubnets", lambda: _paginate(core, "describe_subnets", "Subnets")
         )
         self._step("ec2:DescribeNetworkInterfaces")
         enis = self._required(
             result,
             "ec2:DescribeNetworkInterfaces",
-            lambda: _paginate(ec2, "describe_network_interfaces", "NetworkInterfaces"),
+            lambda: _paginate(core, "describe_network_interfaces", "NetworkInterfaces"),
         )
         self._step("ec2:DescribeInstances")
         instances = instance_eni_index(
@@ -730,6 +782,7 @@ class Collector:
         )
         self._step("ECS services and tasks")
         ecs = self._collect_ecs(result)
+        managed_rows = self._collect_managed(result)
         self._step("tags")
         lb_tags = self._collect_lb_tags(result, lbs)
         lambda_tags = self._collect_lambda_tags(result, lambdas)
@@ -743,6 +796,7 @@ class Collector:
         lambda_index = lambda_eni_index(lambdas)
         # ENI attribution inputs; a retry replaces those it did not collect (see _merge).
         task_enis = ecs.task_enis
+        managed_index = managed.ManagedIndex(r for rows in managed_rows.values() for r in rows)
         # (resource_type, resource_id, key, value) for every tagged ENI-owning resource,
         # plus VPC and subnet tags (environment fallback, "managed elsewhere" tag markers).
         tag_rows: list[tuple[str, str, str, str]] = []
@@ -812,6 +866,12 @@ class Collector:
                 task = task_enis.get(e["NetworkInterfaceId"])
                 if task:
                     attr = Attribution("ecs", task.owner_ref)
+                private_ips = eni_private_ips(e, inst)
+                owner_name = ""
+                found = managed_index.match(e, attr, [p["PrivateIpAddress"] for p in private_ips])
+                if found:  # e.g. "Aurora cluster db-a" instead of the generic "RDS"
+                    owner_name = found.name
+                    attr = Attribution(attr.owner_type, found.ref or attr.owner_ref)
                 groups = [g["GroupId"] for g in e.get("Groups", [])]
                 owner_names = [attr.owner_ref] if attr.owner_ref else []
                 if attr.owner_type == "lambda":
@@ -822,8 +882,8 @@ class Collector:
                 conn.execute(
                     "INSERT INTO enis(snapshot_id, eni_id, subnet_id, vpc_id, az, status, "
                     "interface_type, requester_id, requester_managed, description, instance_id, "
-                    "security_groups, owner_type, owner_ref, name, owner_names, instance_name) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "security_groups, owner_type, owner_ref, name, owner_names, instance_name, "
+                    "owner_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         snap_id,
                         e["NetworkInterfaceId"],
@@ -842,9 +902,10 @@ class Collector:
                         _name_tag(e.get("TagSet")),
                         json.dumps(owner_names),
                         inst.name if inst else "",
+                        owner_name,
                     ),
                 )
-                for p in eni_private_ips(e, inst):
+                for p in private_ips:
                     ip = p.get("PrivateIpAddress")
                     if not ip:
                         continue
@@ -1026,6 +1087,9 @@ class Collector:
                 [(snap_id, *row) for row in own_tags],
             )
 
+        def write_managed(service: str) -> Callable[[sqlite3.Connection], None]:
+            return lambda conn: managed.write(conn, snap_id, managed_rows[service])
+
         writers = (
             ("ec2:DescribeVpcs", True, write_vpcs),
             ("ec2:DescribeSubnets", True, write_subnets),
@@ -1036,6 +1100,7 @@ class Collector:
             ("elasticloadbalancing:DescribeTargetHealth", False, write_lb_targets),
             ("ECS services and tasks", False, write_ecs),
             ("ec2:DescribeSecurityGroups", False, write_security_groups),
+            *((MANAGED_SOURCES[s][0], False, write_managed(s)) for s in MANAGED_SOURCES),
             ("resource tags", False, write_tags),
             (OWNERSHIP_WRITE, False, write_ownership),
         )
@@ -1045,11 +1110,18 @@ class Collector:
             conn.execute("BEGIN" if self.only is None else "BEGIN IMMEDIATE")
             if self.only is not None:
                 # Copy what the retry did not collect, then attribute the fresh ENIs on
-                # the merged rows (ECS tasks, Lambda functions, instance names).
-                ecs_enis, lambda_rows, instance_names = self._merge(conn, snap_id)
+                # the merged rows (ECS tasks, Lambda functions, instance names and the
+                # managed-service resources).
+                ecs_enis, lambda_rows, instance_names, copied_managed = self._merge(conn, snap_id)
                 task_enis = ecs_enis if ecs_enis is not None else task_enis
                 if lambda_rows is not None:
                     lambda_index = lambda_eni_index(lambda_rows)
+                if copied_managed:
+                    managed_index = managed.ManagedIndex(
+                        r
+                        for service, rows in managed_rows.items()
+                        for r in copied_managed.get(service, rows)
+                    )
                 if instance_names is not None:
                     instances = {
                         e["NetworkInterfaceId"]: InstanceEni(
@@ -1093,12 +1165,16 @@ class Collector:
     def _merge(
         self, conn: sqlite3.Connection, snap_id: int
     ) -> tuple[
-        dict[str, EcsTaskEni] | None, list[dict[str, Any]] | None, dict[tuple[str, str], str] | None
+        dict[str, EcsTaskEni] | None,
+        list[dict[str, Any]] | None,
+        dict[tuple[str, str], str] | None,
+        dict[str, list[managed.ManagedResource]],
     ]:
         """Copy the rows of every write the retry does not collect (:data:`_MERGED`) from
         the source snapshot into ``snap_id``. Returns what ENI attribution takes from the
         copied data instead: ECS task ENIs, Lambda functions and ``(eni, instance) ->
-        instance name`` (None for what the retry collected). Raises
+        instance name`` (None for what the retry collected), and the managed-service
+        resources of each service it did not collect. Raises
         :class:`SourceSnapshotGone` when the source snapshot no longer exists."""
         src = self.source_snapshot
         if not self._source_ok(conn):
@@ -1170,7 +1246,12 @@ class Collector:
                     (src,),
                 )
             }
-        return task_enis, functions, instance_names
+        copied_managed = {
+            service: managed.load(conn, snap_id, service)
+            for service, sources in MANAGED_SOURCES.items()
+            if not any(self._wants(what) for what in sources)
+        }
+        return task_enis, functions, instance_names, copied_managed
 
     def _copy_creators(self, conn: sqlite3.Connection, snap_id: int) -> None:
         """A retry that collected the ownership sources again but not CloudTrail keeps
@@ -1428,6 +1509,83 @@ class Collector:
                             task_id=_arn_name(task.get("taskArn", "")),
                         )
         return data
+
+    def _collect_managed(self, result: CollectResult) -> dict[str, list[managed.ManagedResource]]:
+        """Optional: the clusters / domains of managed services whose names their ENIs get
+        (see iplens.managed), by service. Each call is a resource type of its own: a
+        missing permission or a timeout is a warning and leaves those ENIs generic."""
+
+        def pages(service: str, op: str, key: str) -> Callable[[], list[Any]]:
+            return lambda: _paginate(self.gw.client(service), op, key)
+
+        self._step("RDS / Aurora")
+        rds = managed.rds_resources(
+            self._optional(
+                result,
+                "rds:DescribeDBInstances",
+                pages("rds", "describe_db_instances", "DBInstances"),
+            ),
+            self._optional(
+                result,
+                "rds:DescribeDBClusters",
+                pages("rds", "describe_db_clusters", "DBClusters"),
+            ),
+        )
+        self._step("Redshift")
+        redshift = managed.redshift_resources(
+            self._optional(
+                result,
+                "redshift:DescribeClusters",
+                pages("redshift", "describe_clusters", "Clusters"),
+            )
+        )
+        self._step("ElastiCache")
+        elasticache = managed.elasticache_resources(
+            self._optional(
+                result,
+                "elasticache:DescribeCacheClusters",
+                pages("elasticache", "describe_cache_clusters", "CacheClusters"),
+            ),
+            self._optional(
+                result,
+                "elasticache:DescribeReplicationGroups",
+                pages("elasticache", "describe_replication_groups", "ReplicationGroups"),
+            ),
+        )
+        self._step("OpenSearch")
+        opensearch = managed.opensearch_resources(
+            self._optional(result, "es:DescribeDomains", self._fetch_opensearch_domains)
+        )
+        self._step("MSK")
+        msk = managed.msk_resources(
+            self._optional(
+                result,
+                "kafka:ListClustersV2",
+                pages("kafka", "list_clusters_v2", "ClusterInfoList"),
+            )
+        )
+        out = {
+            "rds": rds,
+            "redshift": redshift,
+            "elasticache": elasticache,
+            "opensearch": opensearch,
+            "msk": msk,
+        }
+        log.info(
+            "managed services: %s",
+            ", ".join(f"{len(rows)} {service}" for service, rows in out.items()),
+        )
+        return out
+
+    def _fetch_opensearch_domains(self) -> list[dict[str, Any]]:
+        """es:ListDomainNames, then es:DescribeDomains (at most 5 domains per call)."""
+        client = self.gw.client("opensearch")
+        names = [d["DomainName"] for d in client.list_domain_names().get("DomainNames", [])]
+        out = []
+        for batch in _chunks(names, _OPENSEARCH_BATCH):
+            self._tick()
+            out += client.describe_domains(DomainNames=batch).get("DomainStatusList", [])
+        return out
 
     def _optional(self, result: CollectResult, what: str, fn: Any) -> list[Any]:
         """Optional enrichment calls: missing permissions and timeouts downgrade to a

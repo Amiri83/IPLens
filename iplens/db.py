@@ -7,6 +7,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from .managed import TABLES as MANAGED_TABLES
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
@@ -82,6 +84,7 @@ CREATE TABLE IF NOT EXISTS enis (
     name              TEXT,
     owner_names       TEXT,          -- JSON list of every owning resource (shared Lambda ENIs)
     instance_name     TEXT,          -- Name tag of the attached EC2 instance
+    owner_name        TEXT,          -- managed service, e.g. "Aurora cluster db-a" (managed.py)
     PRIMARY KEY (snapshot_id, eni_id)
 );
 
@@ -199,6 +202,10 @@ CREATE TABLE IF NOT EXISTS security_groups (
     vpc_id      TEXT,
     PRIMARY KEY (snapshot_id, group_id)
 );
+
+-- Managed-service resources (managed.py), one table per service: rds_resources,
+-- redshift_clusters, elasticache_resources, opensearch_domains, msk_clusters (see
+-- MANAGED_TABLE below).
 
 -- Tags of ENI-owning resources. resource_type: eni | lb | lambda | ecs_service | endpoint | sg;
 -- resource_id: ENI id, LB name, function name, "cluster/service", vpce id or SG id.
@@ -457,6 +464,25 @@ CREATE TABLE IF NOT EXISTS refresh_schedules (
 );
 """
 
+# The table of one managed service's resources (managed.ManagedResource) per snapshot.
+MANAGED_TABLE = """
+CREATE TABLE IF NOT EXISTS {table} (
+    snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,     -- instance | cluster | cache_cluster | domain | serverless
+    resource_id     TEXT NOT NULL,
+    name            TEXT NOT NULL,     -- owner name of its ENIs, e.g. "Aurora cluster db-a"
+    ref             TEXT NOT NULL DEFAULT '',  -- owner_ref of its ENIs
+    vpc_id          TEXT,
+    subnet_ids      TEXT,              -- JSON lists from here on
+    security_groups TEXT,
+    eni_ids         TEXT,
+    ips             TEXT,
+    refs            TEXT,              -- references ENI descriptions name
+    PRIMARY KEY (snapshot_id, kind, resource_id)
+);
+"""
+SCHEMA += "".join(MANAGED_TABLE.format(table=t) for t in MANAGED_TABLES.values())
+
 # Seconds a connection waits for another thread's write lock before failing.
 BUSY_TIMEOUT = 30.0
 
@@ -480,6 +506,7 @@ _ADDED_COLUMNS = (
     ("accounts", "last_seen_account_id", "TEXT"),
     ("enis", "owner_names", "TEXT"),
     ("enis", "instance_name", "TEXT"),
+    ("enis", "owner_name", "TEXT"),
     ("visual_prefs", "shorten_names", "INTEGER NOT NULL DEFAULT 0"),
     ("visual_prefs", "evidence", "TEXT"),
     ("visual_prefs", "show_legend", "INTEGER NOT NULL DEFAULT 1"),

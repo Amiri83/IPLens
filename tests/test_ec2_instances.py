@@ -102,8 +102,8 @@ def test_describe_instances_denied_is_a_warning(db_path, monkeypatch):
         gw = _gateway()
         real_client = gw.client
 
-        def client(service):
-            c = real_client(service)
+        def client(service, **kw):
+            c = real_client(service, **kw)
             if service == "ec2":
 
                 def deny(**_):

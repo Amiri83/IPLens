@@ -111,7 +111,10 @@ def test_hanging_collector_is_skipped_and_the_others_complete(db_path, monkeypat
     for name in ("ec2:DescribeVpcs", "ec2:DescribeNetworkInterfaces", "cloudformation:ListStacks"):
         assert rows[name]["status"] == jobs.RES_DONE
     assert not [r for r in job["items"] if r["status"] in (jobs.PENDING, jobs.RES_RUNNING)]
-    assert job["limits"] == {"resource": 1, "overall": 60}
+    # The required resource types keep their own, longer timeout.
+    assert job["limits"] == {"resource": 1, "overall": 60, "required": 120}
+    # Bounded by what was left of the 60s overall limit, not by the 1s setting.
+    assert rows["ec2:DescribeSubnets"]["timeout"] >= 50
     # Persisted with the job: a reload still shows the rows.
     stored = jobs.JobManager(db_path).current(1)
     assert stored["items"] == job["items"] and stored["limits"] == job["limits"]
@@ -167,6 +170,8 @@ def test_required_resource_timeout_fails_the_refresh(db_path, monkeypatch, relea
         return real(client, op, key, **kwargs)
 
     monkeypatch.setattr(collector_mod, "_paginate", paginate)
+    # Keep the test fast: the required resources' minimum is 120s by default.
+    monkeypatch.setattr(collector_mod, "REQUIRED_RESOURCE_TIMEOUT", 0.5)
     with pytest.raises(collector_mod.ResourceTimeout, match="ec2:DescribeSubnets"):
         Collector(_gateway(), db_path, resource_timeout=0.5).run()
     with closing(db_path) as conn:
@@ -174,6 +179,45 @@ def test_required_resource_timeout_fails_the_refresh(db_path, monkeypatch, relea
     assert snap["status"] == "failed"
     assert snap["error"] == "ec2:DescribeSubnets skipped (timeout after 1s)"
     assert _count(db_path, "vpcs", snap["id"]) == 0
+
+
+@mock_aws
+def test_required_resources_get_at_least_120s(db_path, monkeypatch, release):
+    """With the 30s default per-resource setting VPCs, subnets and ENIs still get 120s:
+    a subnet listing slower than the optional timeout completes, an optional resource as
+    slow is skipped."""
+    _aws()
+    _warm_up(db_path)
+    real = collector_mod._paginate
+
+    def paginate(client, op, key, **kwargs):
+        if op in ("describe_subnets", "describe_vpc_endpoints"):
+            release.wait(1.5)  # longer than the 1s optional timeout below
+        return real(client, op, key, **kwargs)
+
+    monkeypatch.setattr(collector_mod, "_paginate", paginate)
+    assert Collector(_gateway(), db_path).required_timeout == 120  # 30s default setting
+    assert Collector(_gateway(), db_path, resource_timeout=30).required_timeout == 120
+    assert Collector(_gateway(), db_path, resource_timeout=300).required_timeout == 300
+    collector = Collector(_gateway(), db_path, resource_timeout=1)
+    assert collector._limit("ec2:DescribeSubnets") == 120
+    assert collector._limit("ec2:DescribeVpcEndpoints") == 1
+    result = collector.run()
+    assert ("ec2:DescribeVpcEndpoints", "timeout after 1s") in result.skipped
+    assert not [what for what, _reason in result.skipped if what in collector_mod.CORE_RESOURCES]
+    assert result.subnets >= 1 and result.enis == 1
+
+
+def test_required_resource_clients_get_their_longer_botocore_timeouts():
+    gw = _gateway()
+    collector = Collector(gw, "unused.db", resource_timeout=30)
+    optional = gw.client("ec2", region=REGION).meta.config
+    assert (optional.connect_timeout, optional.read_timeout) == (10, 10)
+    required = collector._client("ec2", collector.required_timeout).meta.config
+    assert (required.connect_timeout, required.read_timeout) == (10, 40)
+    for cfg, timeout in ((optional, 30), (required, 120)):
+        assert cfg.retries == {"mode": "standard", "total_max_attempts": 3}
+        assert 3 * cfg.read_timeout <= timeout and cfg.connect_timeout <= 10
 
 
 @mock_aws
@@ -189,7 +233,7 @@ def test_cancel_stops_a_hanging_resource(db_path, monkeypatch, release):
             break
         time.sleep(0.05)
     assert mgr.cancel(job["id"])
-    assert mgr.wait(job["id"], 5)  # well before the 120s default timeout
+    assert mgr.wait(job["id"], 5)  # well before the 30s default timeout
     assert mgr.status(job["id"])["state"] == jobs.CANCELLED
     mgr.close()
 
@@ -390,7 +434,7 @@ def test_failed_required_write_saves_nothing(db_path, monkeypatch):
 def test_timeout_settings_defaults_bounds_and_persistence(db_path):
     store = SettingsStore(db_path)
     s = store.load()
-    assert (s.resource_timeout, s.discovery_timeout_min) == (120, 15)
+    assert (s.resource_timeout, s.discovery_timeout_min) == (30, 15)
     store.save(resource_timeout=45, discovery_timeout_min=5)
     s = store.load()
     assert (s.resource_timeout, s.discovery_timeout_min) == (45, 5)
@@ -403,7 +447,7 @@ def test_timeout_settings_defaults_bounds_and_persistence(db_path):
     # An out-of-range stored value falls back to the default.
     with closing(db_path) as conn:
         conn.execute("UPDATE settings SET value='1' WHERE key='resource_timeout'")
-    assert store.load().resource_timeout == 120
+    assert store.load().resource_timeout == 30
 
 
 def _post(client, url, data=None, **kw):
@@ -436,7 +480,8 @@ def test_settings_form_validates_the_timeouts(app, client):
     assert "Settings not saved" in resp.data.decode()
     db = app.extensions["iplens"]["paths"].db_path
     s = SettingsStore(db).load()
-    assert (s.resource_timeout, s.discovery_timeout_min) == (120, 15)
+    assert (s.resource_timeout, s.discovery_timeout_min) == (30, 15)
+    assert "Defaults 30 seconds" in page and "at least 120 seconds" in page
     _post(client, "/settings", {"resource_timeout": "300", "discovery_timeout_min": "30"})
     s = SettingsStore(db).load()
     assert (s.resource_timeout, s.discovery_timeout_min) == (300, 30)
@@ -459,7 +504,7 @@ def test_changed_resource_timeout_is_honoured_without_restart(app, client, monke
     _post(client, "/settings", {"resource_timeout": "1", "discovery_timeout_min": "2"})
     job = refresh()
     assert job["state"] == jobs.DONE
-    assert job["limits"] == {"resource": 1, "overall": 120}
+    assert job["limits"] == {"resource": 1, "overall": 120, "required": 120}
     rows = {r["name"]: r for r in job["items"]}
     assert rows["tag:GetResources"]["status"] == jobs.SKIPPED
     assert rows["tag:GetResources"]["reason"] == "timeout after 1s"

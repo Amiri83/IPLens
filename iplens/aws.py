@@ -136,9 +136,12 @@ CALL_RETRIES = 2
 
 
 def call_timeouts(resource_timeout: float) -> Config:
-    """Refresh clients: a call and all of its retries fit in the per-resource timeout
-    (attempts x read timeout <= timeout), so a resource abandoned at its timeout stops
-    instead of hanging on a dead connection or retrying in the background."""
+    """Refresh clients: a call and all of its retries fit in the resource type's timeout
+    (attempts x read timeout <= timeout, connect timeout <= 10s), so a resource abandoned
+    at its timeout stops instead of hanging on a dead connection or retrying in the
+    background. The collector passes the optional resources' timeout for every client and
+    the longer required one (VPCs, subnets, ENIs) for theirs; e.g. 30s -> 10s read
+    timeout, 120s -> 40s."""
     seconds = max(float(resource_timeout), 1.0)
     read = min(60.0, seconds / (CALL_RETRIES + 1))
     return Config(

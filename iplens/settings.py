@@ -47,8 +47,11 @@ MAX_DISPLAY_NAME = 64
 # Terraform repo sync: seconds each allowlisted terraform command may run.
 DEFAULT_TF_TIMEOUT = 120
 MIN_TF_TIMEOUT, MAX_TF_TIMEOUT = 10, 3600
-# Refresh (discovery): seconds one resource type may take, and minutes for the whole run.
-DEFAULT_RESOURCE_TIMEOUT = 120
+# Refresh (discovery): seconds one optional resource type may take, and minutes for the
+# whole run. The required ones (VPCs, subnets, ENIs) always get at least
+# REQUIRED_RESOURCE_TIMEOUT seconds.
+DEFAULT_RESOURCE_TIMEOUT = 30
+REQUIRED_RESOURCE_TIMEOUT = 120
 MIN_RESOURCE_TIMEOUT, MAX_RESOURCE_TIMEOUT = 10, 3600
 DEFAULT_DISCOVERY_TIMEOUT_MIN = 15
 MIN_DISCOVERY_TIMEOUT_MIN, MAX_DISCOVERY_TIMEOUT_MIN = 1, 240

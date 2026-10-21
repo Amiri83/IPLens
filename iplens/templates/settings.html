@@ -94,8 +94,10 @@
   </div>
   <p class="muted small">A Refresh collects one resource type at a time (e.g. <span class="mono">ec2:DescribeInstances</span>).
     One that runs past its timeout is skipped and the others still run; once the overall limit is reached the
-    remaining ones are skipped. VPCs, subnets and ENIs are required: if one of them times out the Refresh fails.
-    Defaults 120 seconds and 15 minutes; a change applies from the next Refresh.</p>
+    remaining ones are skipped. The per-resource timeout applies to the optional resource types (instances,
+    load balancers, managed-service names, tags, ...). VPCs, subnets and ENIs are required: they always get
+    at least {{ required_timeout }} seconds (or the per-resource timeout if it is longer), and if one of them times
+    out the Refresh fails. Defaults {{ default_resource_timeout }} seconds and 15 minutes; a change applies from the next Refresh.</p>
   <h2>Environments</h2>
   <label for="env_tag_keys">Environment tag keys</label>
   <input id="env_tag_keys" name="env_tag_keys" value="{{ s.env_tag_keys_text }}" size="40" class="mono" placeholder="Environment, env, stage">
