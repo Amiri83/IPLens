@@ -195,9 +195,20 @@ class JobContext:
     threads it starts (e.g. the Terraform sync pool), as long as they :meth:`bind`.
     """
 
-    def __init__(self, manager: JobManager, job: Job):
+    def __init__(self, manager: JobManager, job: Job, mute: threading.Event | None = None):
         self._manager = manager
         self._job = job
+        # Once set, this context drops every write (see muted_when).
+        self._mute = mute
+
+    def muted_when(self, event: threading.Event) -> JobContext:
+        """This job's context for a helper thread that may be abandoned: once ``event``
+        is set, its log lines and progress updates are dropped (checked under the lock,
+        so nothing lands after the caller has set the event and reported the outcome)."""
+        return JobContext(self._manager, self._job, event)
+
+    def _muted(self) -> bool:
+        return self._mute is not None and self._mute.is_set()
 
     @property
     def job_id(self) -> str:
@@ -214,6 +225,8 @@ class JobContext:
 
     def step(self, text: str, *, done: int | None = None, total: int | None = None) -> None:
         with self._manager._lock:
+            if self._muted():
+                return
             self._job.step = _clip(text, MAX_STEP)
             if total is not None:
                 self._job.total = max(int(total), 0)
@@ -223,30 +236,42 @@ class JobContext:
 
     def set_total(self, total: int) -> None:
         with self._manager._lock:
+            if self._muted():
+                return
             self._job.total = max(int(total), 0)
 
     def add_total(self, n: int) -> None:
         with self._manager._lock:
+            if self._muted():
+                return
             self._job.total += max(int(n), 0)
 
     def advance(self, n: int = 1) -> None:
         with self._manager._lock:
+            if self._muted():
+                return
             self._job.done += n
 
     def log(self, text: str) -> None:
         line = _clip(text, MAX_LOG_LINE)
         stamp = time.strftime("%H:%M:%S")
         with self._manager._lock:
+            if self._muted():
+                return
             self._job.log.append(f"{stamp} {line}")
 
     def message(self, category: str, text: str, link_url: str = "", link_text: str = "") -> None:
         with self._manager._lock:
+            if self._muted():
+                return
             if len(self._job.messages) < MAX_MESSAGES:
                 self._job.messages.append(Message(category, text, link_url, link_text))
 
     def plan_resources(self, names: list[str], resource_timeout: int, overall_timeout: int) -> None:
         """Announce a Refresh's resource types (all pending) and its timeouts."""
         with self._manager._lock:
+            if self._muted():
+                return
             self._job.limits = {"resource": int(resource_timeout), "overall": int(overall_timeout)}
             self._job.resources = [Resource(n, timeout=int(resource_timeout)) for n in names]
 
@@ -256,6 +281,8 @@ class JobContext:
         """Move a resource row to ``status`` (an unplanned name is appended)."""
         now = time.monotonic()
         with self._manager._lock:
+            if self._muted():
+                return
             row = next((r for r in self._job.resources if r.name == name), None)
             if row is None:
                 row = Resource(name, timeout=self._job.limits.get("resource", 0))
@@ -330,6 +357,9 @@ class NullProgress:
 
     def resource(self, *args: Any, **kwargs: Any) -> None:
         return None
+
+    def muted_when(self, event: threading.Event) -> NullProgress:
+        return self
 
     @contextmanager
     def bind(self) -> Iterator[NullProgress]:

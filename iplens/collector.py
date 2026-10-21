@@ -6,7 +6,11 @@ thread bounded by the per-resource timeout and by what is left of the overall li
 skipped, its pagination loop stops at the next page, and the botocore connect / read
 timeouts (:func:`iplens.aws.call_timeouts`) end a call stuck on the network. The other
 resource types still run. VPCs, subnets and ENIs are the snapshot itself: when one of
-them times out the Refresh fails instead of saving an empty snapshot.
+them times out the Refresh fails instead of saving an empty snapshot. Once abandoned, a
+resource's thread no longer writes to the job's log or progress.
+
+"Retry skipped" runs a Collector with ``only``: just the skipped resource types (plus what
+they need, see :func:`retry_plan`), the account identity and VPCs/subnets/ENIs.
 
 The snapshot is written in one transaction with a savepoint per resource type, so a
 failed write never leaves a resource half-saved.
@@ -70,6 +74,42 @@ RESOURCES = (
     "cloudformation:ListStacks",
 )
 CLOUDTRAIL_RESOURCE = "cloudtrail:LookupEvents"
+# Who the snapshot belongs to: collected by every Refresh, a retry included.
+IDENTITY_RESOURCES = ("sts:GetCallerIdentity", "iam:ListAccountAliases")
+# Snapshot write of the ownership sources (a resource row of the progress box).
+OWNERSHIP_WRITE = "ownership (tag:GetResources, CloudFormation)"
+# Retry skipped: what a resource type needs collected with it.
+_NEEDS: dict[str, tuple[str, ...]] = {
+    "elasticloadbalancing:DescribeTargetGroups": ("elasticloadbalancing:DescribeLoadBalancers",),
+    "elasticloadbalancing:DescribeTargetHealth": (
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeTargetGroups",
+    ),
+    "elasticloadbalancing:DescribeTags": ("elasticloadbalancing:DescribeLoadBalancers",),
+    "lambda:ListTags": ("lambda:ListFunctions",),
+    # Creators are only looked up for resources the other ownership sources left unowned.
+    CLOUDTRAIL_RESOURCE: ("tag:GetResources", "cloudformation:ListStacks"),
+    OWNERSHIP_WRITE: ("tag:GetResources", "cloudformation:ListStacks"),
+}
+
+
+def retry_plan(names: Iterable[str]) -> frozenset[str] | None:
+    """The resource types a "Retry skipped" collects for the skipped ``names``: those,
+    what they need (:data:`_NEEDS`), the identity calls and VPCs/subnets/ENIs. None (a
+    full Refresh) when a name is not one resource type (e.g. the "resource tags" write)."""
+    known = {*RESOURCES, CLOUDTRAIL_RESOURCE}
+    out = {*IDENTITY_RESOURCES, *CORE_RESOURCES}
+    todo = list(names)
+    if not todo:
+        return None
+    while todo:
+        name = todo.pop()
+        if name not in known and name not in _NEEDS:
+            return None
+        if name in known:
+            out.add(name)
+        todo += [n for n in _NEEDS.get(name, ()) if n not in out]
+    return frozenset(out)
 
 
 class ResourceTimeout(Exception):  # noqa: N818 - named like JobCancelled
@@ -80,7 +120,8 @@ class ResourceTimeout(Exception):  # noqa: N818 - named like JobCancelled
         super().__init__(f"{resource} skipped ({reason})")
 
 
-# The abandon flag of the resource running in this helper thread (see Collector._timed).
+# The abandon flag of the resource running in this helper thread and its job context,
+# muted once the flag is set (see Collector._timed).
 _abandon = threading.local()
 
 
@@ -351,6 +392,7 @@ class Collector:
         ownership_config: ownership.OwnershipConfig | None = None,
         resource_timeout: float = DEFAULT_RESOURCE_TIMEOUT,
         overall_timeout: float = DEFAULT_DISCOVERY_TIMEOUT_MIN * 60,
+        only: Iterable[str] | None = None,
     ):
         self.gw = gateway
         # Which tag values are kept, the CI role patterns and the optional sources.
@@ -360,7 +402,7 @@ class Collector:
         # The record's display name, frozen on the snapshot (later renames do not apply).
         self.account_name = account_name
         # Background job reporting; cancellation is checked between API calls.
-        self.progress: Progress = progress or NullProgress()
+        self._progress: Progress = progress or NullProgress()
         self._done = 0
         # Seconds one resource type may run, and the whole collection.
         self.resource_timeout = float(resource_timeout)
@@ -368,8 +410,18 @@ class Collector:
         self._deadline = math.inf
         self._touched: set[str] = set()
         self._planned: list[str] = []
+        # Retry skipped: the resource types to collect (see retry_plan); None = all.
+        self.only = retry_plan(only) if only is not None else None
         if isinstance(gateway, AwsGateway):
             gateway.call_config = call_timeouts(self.resource_timeout)
+
+    @property
+    def progress(self) -> Progress:
+        """The job context; in a resource's helper thread, the one muted on abandon."""
+        return getattr(_abandon, "progress", None) or self._progress
+
+    def _wants(self, what: str) -> bool:
+        return self.only is None or what in self.only
 
     def _step(self, text: str) -> None:
         self.progress.check()
@@ -403,9 +455,12 @@ class Collector:
         abandon = threading.Event()
         box: dict[str, Any] = {}
 
+        # Once abandoned, the thread's log lines and progress updates are dropped.
+        muted = self._progress.muted_when(abandon)
+
         def target() -> None:
-            _abandon.event = abandon
-            with self.progress.bind():
+            _abandon.event, _abandon.progress = abandon, muted
+            with muted.bind():
                 try:
                     box["value"] = fn()
                 except BaseException as exc:  # noqa: BLE001 - handed to the caller
@@ -454,7 +509,8 @@ class Collector:
 
     def run(self) -> CollectResult:
         self._deadline = time.monotonic() + self.overall_timeout
-        self._planned = [*RESOURCES, *([CLOUDTRAIL_RESOURCE] if self.own.cloudtrail else [])]
+        planned = [*RESOURCES, *([CLOUDTRAIL_RESOURCE] if self.own.cloudtrail else [])]
+        self._planned = [what for what in planned if self._wants(what)]
         self.progress.plan_resources(
             self._planned, math.ceil(self.resource_timeout), math.ceil(self.overall_timeout)
         )
@@ -470,6 +526,8 @@ class Collector:
         log.info(
             "collection started snapshot=%s account=%s region=%s", snap_id, self.account_ref, region
         )
+        if self.only is not None:
+            log.info("retry of skipped resources: collecting only %s", ", ".join(self._planned))
         try:
             result = self._collect(snap_id)
         except Exception as exc:
@@ -508,6 +566,12 @@ class Collector:
     def _collect(self, snap_id: int) -> CollectResult:
         ec2 = self.gw.client("ec2")
         result = CollectResult(snapshot_id=snap_id)
+        if self.only is not None:
+            retried = [w for w in self._planned if w not in (*IDENTITY_RESOURCES, *CORE_RESOURCES)]
+            result.warnings.append(
+                "Retry of skipped resources: this snapshot has VPCs, subnets, ENIs and only "
+                + (", ".join(retried) or "no other resource types")
+            )
 
         account_id = ""
         self._step("sts:GetCallerIdentity")
@@ -878,7 +942,7 @@ class Collector:
             ("ECS services and tasks", False, write_ecs),
             ("ec2:DescribeSecurityGroups", False, write_security_groups),
             ("resource tags", False, write_tags),
-            ("ownership (tag:GetResources, CloudFormation)", False, write_ownership),
+            (OWNERSHIP_WRITE, False, write_ownership),
         )
         with closing(self.db_path) as conn:
             conn.execute("BEGIN")  # the savepoints below nest inside this one transaction
@@ -887,7 +951,7 @@ class Collector:
                     write(conn)
 
         self._step("cloudtrail:LookupEvents")
-        if self.own.cloudtrail:
+        if self.own.cloudtrail and self._wants(CLOUDTRAIL_RESOURCE):
             self._collect_creators(result, snap_id)
         # Planned resource types that had nothing to collect (e.g. no load balancers).
         for what in self._planned:
@@ -1102,6 +1166,8 @@ class Collector:
         continue without the mapping.
         """
         what = "ECS services and tasks"
+        if not self._wants(what):
+            return EcsData()
         try:
             data = self._timed(result, what, self._fetch_ecs)
         except ResourceTimeout:
@@ -1152,7 +1218,10 @@ class Collector:
 
     def _optional(self, result: CollectResult, what: str, fn: Any) -> list[Any]:
         """Optional enrichment calls: missing permissions and timeouts downgrade to a
-        warning, and the collection continues without this resource type."""
+        warning, and the collection continues without this resource type. A type a
+        retry does not collect (see retry_plan) is left out without a call."""
+        if not self._wants(what):
+            return []
         try:
             return self._timed(result, what, fn)
         except ResourceTimeout:
