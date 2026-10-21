@@ -11,6 +11,11 @@ Demand rules (one :class:`Contributor` per resource and subnet, each with its as
   service's subnets, 1 IP per task. The maximum is the Application Auto Scaling target's
   ``MaxCapacity``; without a target the service does not scale and its maximum is the
   desired count.
+- **ECS deploy surge** (optional, on by default): a rolling deployment starts new tasks
+  before stopping old ones, up to ``maximumPercent`` of the desired count, so a service at
+  its maximum needs ``ceil(max * (maximumPercent - 100) / 100)`` extra tasks, spread like
+  the scale-out. ``maximumPercent`` defaults to :data:`DEFAULT_MAX_PERCENT`; not counted
+  for blue/green or external deployment controllers, nor at ``maximumPercent`` <= 100.
 - **ALB**: AWS needs at least :data:`ALB_RESERVE` free IPs in each subnet of an
   Application Load Balancer to scale it, so that many are reserved per ALB subnet.
 - **Lambda**: invocations take no IPs; a function only needs a new (Hyperplane) ENI when
@@ -36,6 +41,10 @@ from .scope import UNSCOPED, ResolvedScope
 
 # AWS: "your load balancer subnets must have at least eight free IP addresses" to scale.
 ALB_RESERVE = 8
+# ECS's maximumPercent when a service's deploymentConfiguration does not set it.
+DEFAULT_MAX_PERCENT = 200
+# The deployment controller doing rolling updates (the others replace a whole task set).
+ROLLING_CONTROLLER = "ECS"
 # Less than this share of the subnet's usable IPs left at max scale is "tight".
 TIGHT_PCT = 20.0
 # The resource types (collector names) the demand comes from.
@@ -90,6 +99,8 @@ class EcsService:
     desired: int
     running: int
     subnet_ids: tuple[str, ...] | None  # None: unknown (a snapshot from before this field)
+    max_percent: int | None = None  # deploymentConfiguration.maximumPercent; None: unset
+    controller: str | None = None  # deploymentController.type; None: unknown (rolling)
 
 
 @dataclass(frozen=True)
@@ -132,18 +143,27 @@ class Inputs:
 
 @dataclass(frozen=True)
 class Contributor:
-    kind: str  # asg | ecs | alb | lambda
+    kind: str  # asg | ecs | surge | alb | lambda
     name: str
     ips: int
     assumption: str
 
     @property
     def label(self) -> str:
-        return {"asg": "ASG", "ecs": "ECS service", "alb": "ALB", "lambda": "Lambda"}[self.kind]
+        return {
+            "asg": "ASG",
+            "ecs": "ECS service",
+            "surge": "ECS service",
+            "alb": "ALB",
+            "lambda": "Lambda",
+        }[self.kind]
 
     @property
     def text(self) -> str:
-        """e.g. "ASG web: +12 (max 20, now 8)"."""
+        """e.g. "ASG web: +12 (max 20, now 8)", or for a surge "ECS service c/api deploy
+        surge: +4, maxPercent 200 (...)"."""
+        if self.kind == "surge":
+            return f"{self.label} {self.name} deploy surge: +{self.ips}, {self.assumption}"
         return f"{self.label} {self.name}: +{self.ips} ({self.assumption})"
 
 
@@ -339,23 +359,32 @@ def asg_demand(asg: Asg, inputs: Inputs) -> dict[str, Contributor]:
     }
 
 
+def _ecs_subnets(svc: EcsService, inputs: Inputs) -> tuple[str, ...]:
+    """The service's awsvpc subnets, else those of its task ENIs; () when neither."""
+    return svc.subnet_ids or tuple(sorted(inputs.task_subnets.get((svc.cluster, svc.service), {})))
+
+
+def _ecs_max(svc: EcsService, inputs: Inputs) -> tuple[int, str]:
+    """The service's maximum task count and how it was found."""
+    key = (svc.cluster, svc.service)
+    if key in inputs.ecs_max:
+        return inputs.ecs_max[key], f"max {inputs.ecs_max[key]}"
+    if SCALING_SOURCE in inputs.missing:
+        return svc.desired, f"scaling unknown, max = desired {svc.desired}"
+    return svc.desired, f"no auto scaling, max = desired {svc.desired}"
+
+
 def ecs_demand(svc: EcsService, inputs: Inputs) -> tuple[dict[str, Contributor], str]:
     """ECS awsvpc service: (max - running) tasks over its subnets, 1 IP each. Returns the
     contributors and a note when the service's subnets are unknown."""
-    key = (svc.cluster, svc.service)
-    tasks = inputs.task_subnets.get(key, {})
-    subnets = svc.subnet_ids or tuple(sorted(tasks))
+    tasks = inputs.task_subnets.get((svc.cluster, svc.service), {})
+    subnets = _ecs_subnets(svc, inputs)
     name = f"{svc.cluster}/{svc.service}"
     if not subnets:
         if svc.subnet_ids is None:  # older snapshot without the service's subnets
             return {}, f"ECS service {name}: subnets unknown, not counted"
         return {}, ""  # not awsvpc: its tasks take no IPs of their own
-    if key in inputs.ecs_max:
-        top, how = inputs.ecs_max[key], f"max {inputs.ecs_max[key]}"
-    elif SCALING_SOURCE in inputs.missing:
-        top, how = svc.desired, f"scaling unknown, max = desired {svc.desired}"
-    else:
-        top, how = svc.desired, f"no auto scaling, max = desired {svc.desired}"
+    top, how = _ecs_max(svc, inputs)
     more = max(top - svc.running, 0)
     share = spread(more, subnets, tasks)
     n = len(set(subnets))
@@ -369,6 +398,32 @@ def ecs_demand(svc: EcsService, inputs: Inputs) -> tuple[dict[str, Contributor],
         )
         for sid, k in share.items()
     }, ""
+
+
+def ecs_surge(svc: EcsService, inputs: Inputs) -> dict[str, Contributor]:
+    """ECS rolling deployment at max scale: ceil(max * (maximumPercent - 100) / 100)
+    extra tasks over the service's subnets, 1 IP each (its own contributor)."""
+    if (svc.controller or ROLLING_CONTROLLER) != ROLLING_CONTROLLER:
+        return {}  # blue/green (CODE_DEPLOY) or EXTERNAL: no rolling surge
+    pct = svc.max_percent if svc.max_percent is not None else DEFAULT_MAX_PERCENT
+    if pct <= 100:
+        return {}  # old tasks stop before new ones start
+    subnets = _ecs_subnets(svc, inputs)
+    top, _how = _ecs_max(svc, inputs)
+    extra = math.ceil(top * (pct - 100) / 100)
+    share = spread(extra, subnets, inputs.task_subnets.get((svc.cluster, svc.service), {}))
+    pct_note = f"maxPercent {pct}" + ("" if svc.max_percent is not None else ", the ECS default")
+    n = len(set(subnets))
+    return {
+        sid: Contributor(
+            "surge",
+            f"{svc.cluster}/{svc.service}",
+            k,
+            f"{pct_note}: {_plural(k, 'task')} here of {extra} extra at max {top} over "
+            f"{_plural(n, 'subnet')} during a rolling deployment, 1 IP each",
+        )
+        for sid, k in share.items()
+    }
 
 
 def alb_demand(lb: LoadBalancer, inputs: Inputs) -> dict[str, Contributor]:
@@ -407,8 +462,9 @@ def lambda_demand(fns: Iterable[LambdaFn], inputs: Inputs) -> dict[str, list[Con
     return out
 
 
-def analyze(inputs: Inputs) -> Headroom:
-    """Every subnet's projected demand at max scale, worst first."""
+def analyze(inputs: Inputs, include_surge: bool = True) -> Headroom:
+    """Every subnet's projected demand at max scale, worst first; ``include_surge`` adds
+    the ECS rolling-deployment surge (:func:`ecs_surge`)."""
     rows = {s.subnet_id: SubnetHeadroom(s) for s in inputs.subnets}
     notes = [
         f"{what} was skipped in this snapshot: {_MISSING_EFFECT[what]}."
@@ -429,6 +485,9 @@ def analyze(inputs: Inputs) -> Headroom:
             add(sid, c)
         if note:
             notes.append(note)
+        if include_surge:
+            for sid, c in ecs_surge(svc, inputs).items():
+                add(sid, c)
     for lb in sorted(inputs.lbs, key=lambda b: b.name):
         for sid, c in alb_demand(lb, inputs).items():
             add(sid, c)
@@ -499,6 +558,8 @@ def load(conn: sqlite3.Connection, snap_id: int, scope: ResolvedScope = UNSCOPED
             desired=r["desired_count"] or 0,
             running=r["running_count"] or 0,
             subnet_ids=_ids(r["subnet_ids"]),
+            max_percent=r["max_percent"],
+            controller=r["deployment_controller"],
         )
         for r in conn.execute("SELECT * FROM ecs_services WHERE snapshot_id=?", (snap_id,))
     ]
@@ -560,6 +621,9 @@ def load(conn: sqlite3.Connection, snap_id: int, scope: ResolvedScope = UNSCOPED
 
 
 def for_snapshot(
-    conn: sqlite3.Connection, snap_id: int, scope: ResolvedScope = UNSCOPED
+    conn: sqlite3.Connection,
+    snap_id: int,
+    scope: ResolvedScope = UNSCOPED,
+    include_surge: bool = True,
 ) -> Headroom:
-    return analyze(load(conn, snap_id, scope))
+    return analyze(load(conn, snap_id, scope), include_surge)

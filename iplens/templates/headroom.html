@@ -15,6 +15,13 @@
   tasks still to launch are spread evenly over their subnets (the remainder to the subnets with the fewest
   now). <b>tight</b>: less than {{ tight_pct | int }}% of the subnet's usable IPs left at max scale;
   <b>over</b>: the subnet runs out before max. Read-only estimate from the latest snapshot.</p>
+<form method="get" class="row">
+  <input type="hidden" name="surge" value="0">
+  <label class="check" title="A rolling ECS deployment starts new tasks before stopping the old ones, up to maximumPercent (default 200) of the service's maximum; blue/green and external deployments, and maximumPercent ≤ 100, add none.">
+    <input type="checkbox" name="surge" value="1" {{ 'checked' if include_surge }} onchange="this.form.submit()">
+    include deploy surge</label>
+  <noscript><button type="submit">Apply</button></noscript>
+</form>
 {% for n in h.notes %}<div class="flash warn">{{ n }}</div>{% endfor %}
 
 {% set c = h.counts %}

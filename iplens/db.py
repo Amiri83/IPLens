@@ -141,6 +141,8 @@ CREATE TABLE IF NOT EXISTS ecs_services (
     last_deployment TEXT,           -- ISO timestamp of the newest deployment
     subnet_ids      TEXT,           -- JSON list of its awsvpc subnets ('[]': not awsvpc;
                                     -- NULL: a snapshot from before this column)
+    max_percent     INTEGER,        -- deploymentConfiguration.maximumPercent (NULL: unset)
+    deployment_controller TEXT,     -- ECS (rolling) | CODE_DEPLOY | EXTERNAL (NULL: unknown)
     PRIMARY KEY (snapshot_id, cluster, service)
 );
 
@@ -543,6 +545,8 @@ _ADDED_COLUMNS = (
     ("jobs", "resources", "TEXT NOT NULL DEFAULT '{}'"),
     ("load_balancers", "subnet_ids", "TEXT"),
     ("ecs_services", "subnet_ids", "TEXT"),
+    ("ecs_services", "max_percent", "INTEGER"),
+    ("ecs_services", "deployment_controller", "TEXT"),
 )
 
 # Single-account settings rows from before multi-account support.
