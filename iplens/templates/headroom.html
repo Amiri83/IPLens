@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% from "_macros.html" import no_data with context %}
+{% block title %}Headroom{% endblock %}
+{% macro status_badge(status, label) -%}
+  <span class="badge {{ {'over': 'err', 'tight': 'warn', 'ok': 'ok'}[status] }}">{{ label }}</span>
+{%- endmacro %}
+{% block content %}
+<h1>Scale headroom</h1>
+{% if not snap %}
+  {{ no_data() }}
+{% else %}
+<p class="muted small">Free IPs of each subnet against the worst case: every Auto Scaling group and ECS
+  service at its maximum, {{ alb_reserve }} free IPs kept per ALB subnet (AWS needs them to scale the ALB)
+  and 1 IP for each Lambda subnet / security group combination that has no ENI yet. ASG instances and ECS
+  tasks still to launch are spread evenly over their subnets (the remainder to the subnets with the fewest
+  now). <b>tight</b>: less than {{ tight_pct | int }}% of the subnet's usable IPs left at max scale;
+  <b>over</b>: the subnet runs out before max. Read-only estimate from the latest snapshot.</p>
+{% for n in h.notes %}<div class="flash warn">{{ n }}</div>{% endfor %}
+
+{% set c = h.counts %}
+<div class="card row">
+  <span>{{ status_badge('over', 'over') }} {{ c.over }}</span>
+  <span>{{ status_badge('tight', 'tight') }} {{ c.tight }}</span>
+  <span>{{ status_badge('ok', 'OK') }} {{ c.ok }}</span>
+  <span class="muted">subnets</span>
+</div>
+
+<h2>Subnets, worst first</h2>
+<table class="headroom">
+  <thead><tr><th>Subnet</th><th>Name</th><th>AZ</th><th>CIDR</th><th>Free</th><th>Demand at max</th>
+    <th>Left</th><th>Result</th><th>Contributors</th></tr></thead>
+  <tbody>
+  {% for r in h.subnets %}
+    <tr id="{{ r.subnet.subnet_id }}">
+      <td class="mono"><a href="{{ url_for('subnet', subnet_id=r.subnet.subnet_id) }}">{{ r.subnet.subnet_id }}</a></td>
+      <td>{{ r.subnet.name }}</td>
+      <td>{{ r.subnet.az }}</td>
+      <td class="mono">{{ r.subnet.cidr }}</td>
+      <td>{{ r.free }}</td>
+      <td>{{ r.demand }}</td>
+      <td>{{ r.left }} <span class="muted small">({{ r.left_pct | pct }})</span></td>
+      <td>{{ status_badge(r.status, r.status_label) }}</td>
+      <td class="small">
+        {% for c in r.contributors %}<div>{{ c.text }}</div>{% else %}<span class="muted">no scaling demand</span>{% endfor %}
+        {% if r.suggestion %}
+          <div class="headroom-suggestion"><b>Suggestion:</b> {{ r.suggestion }}
+            {% if r.needed_prefix %}
+            <a href="{{ url_for('cidr_planner', vpc=r.subnet.vpc_id, size=r.needed_prefix, az=r.subnet.az) }}">Plan a /{{ r.needed_prefix }} in the CIDR Planner</a>
+            {% else %}
+            <a href="{{ url_for('cidr_planner', vpc=r.subnet.vpc_id) }}">Open the CIDR Planner</a>
+            {% endif %}</div>
+        {% endif %}
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="9" class="muted">No subnets{{ ' in scope' if scope_count }}.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>By availability zone</h2>
+<p class="muted small">Free IPs and demand at max scale summed per AZ: an AZ that runs out while another
+  has room shows an imbalance (spread the subnets, or move the resources to bigger subnets in that AZ).</p>
+{% for v in h.by_az %}
+  <section class="card">
+    <h3 style="margin-top: 0"><span class="mono">{{ v.vpc_id }}</span>
+      {% if v.imbalanced %}<span class="badge warn">AZ imbalance</span>{% endif %}</h3>
+    <table>
+      <thead><tr><th>AZ</th><th>Subnets</th><th>Free</th><th>Demand at max</th><th>Left</th><th>Worst result</th></tr></thead>
+      <tbody>
+      {% for a in v.azs %}
+        <tr><td>{{ a.az or '–' }}</td><td>{{ a.subnets | length }}</td><td>{{ a.free }}</td><td>{{ a.demand }}</td>
+          <td>{{ a.left }} <span class="muted small">({{ a.left_pct | pct }})</span></td>
+          <td>{{ status_badge(a.status, {'over': 'over', 'tight': 'tight', 'ok': 'OK'}[a.status]) }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </section>
+{% endfor %}
+{% endif %}
+{% endblock %}

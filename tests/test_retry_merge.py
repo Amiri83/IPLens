@@ -44,6 +44,8 @@ SNAPSHOT_TABLES = (
     "resource_tags",
     "own_resources",
     "own_tags",
+    "asgs",
+    "ecs_scalable_targets",
 )
 
 
@@ -140,6 +142,33 @@ def aws_env():
         boto3.client("elbv2", region_name=REGION).create_load_balancer(
             Name="lb-a", Subnets=[sa, sb], Scheme="internal", Type="application"
         )
+        ec2.create_launch_template(
+            LaunchTemplateName="lt-a",
+            LaunchTemplateData={"ImageId": image_id, "InstanceType": "t3.micro"},
+        )
+        boto3.client("autoscaling", region_name=REGION).create_auto_scaling_group(
+            AutoScalingGroupName="asg-a",
+            MinSize=0,
+            MaxSize=4,
+            DesiredCapacity=0,
+            LaunchTemplate={"LaunchTemplateName": "lt-a"},
+            VPCZoneIdentifier=f"{sa},{sb}",
+        )
+        ecs = boto3.client("ecs", region_name=REGION)
+        ecs.create_cluster(clusterName="cluster-a")
+        ecs.register_task_definition(
+            family="td-a", containerDefinitions=[{"name": "app", "image": "example", "memory": 64}]
+        )
+        ecs.create_service(
+            cluster="cluster-a", serviceName="service-a", taskDefinition="td-a", desiredCount=0
+        )
+        boto3.client("application-autoscaling", region_name=REGION).register_scalable_target(
+            ServiceNamespace="ecs",
+            ResourceId="service/cluster-a/service-a",
+            ScalableDimension="ecs:service:DesiredCount",
+            MinCapacity=1,
+            MaxCapacity=4,
+        )
         yield
 
 
@@ -204,6 +233,7 @@ def test_retry_snapshot_has_the_source_rows_of_the_other_types(
     for table in ("enis", "ips", "lambdas", "endpoints", "load_balancers", "security_groups"):
         assert expected[table], table  # the source has rows of every kind
     assert expected["sg_cidr_rules"] and expected["resource_tags"] and expected["own_tags"]
+    assert expected["asgs"] and expected["ecs_scalable_targets"]
     with closing(db_path) as conn:
         enis = conn.execute(
             "SELECT owner_type, owner_names, instance_name FROM enis WHERE snapshot_id=?",

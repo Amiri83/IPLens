@@ -4,6 +4,19 @@
 
 ### Added
 
+- Scale headroom: per subnet, free IPs vs. the worst-case demand if everything scales to its
+  maximum – Auto Scaling groups (`max - current` instances spread evenly over their subnets ×
+  ENIs per instance), awsvpc ECS services (`max - running` tasks, 1 IP each), 8 free IPs per ALB
+  subnet and 1 IP per Lambda subnet / security group combination without an ENI – each
+  contributor shown with its assumption. A **Headroom** page (OK / tight / over, worst first,
+  per-AZ totals with an imbalance flag, a bigger-subnet / secondary-CIDR suggestion linking the
+  CIDR Planner), a Headroom column on Discovery and a Scale headroom section in the report. New
+  optional, read-only `autoscaling:DescribeAutoScalingGroups` and
+  `application-autoscaling:DescribeScalableTargets` (missing permission = Refresh warning; the
+  headroom uses what is known); load balancer and ECS service subnets are now stored per
+  snapshot. The new rows are copied by "Retry skipped" like the other resource types it does not
+  collect.
+
 - Owner names of managed-service ENIs: optional, read-only `rds:DescribeDBInstances`,
   `rds:DescribeDBClusters`, `redshift:DescribeClusters`, `elasticache:DescribeCacheClusters`,
   `elasticache:DescribeReplicationGroups`, `es:ListDomainNames` + `es:DescribeDomains` and

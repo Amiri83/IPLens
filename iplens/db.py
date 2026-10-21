@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS load_balancers (
     lb_type     TEXT,
     scheme      TEXT,
     vpc_id      TEXT,
+    subnet_ids  TEXT,               -- JSON list (NULL: a snapshot from before this column)
     PRIMARY KEY (snapshot_id, name)
 );
 
@@ -138,6 +139,31 @@ CREATE TABLE IF NOT EXISTS ecs_services (
     desired_count   INTEGER,
     running_count   INTEGER,
     last_deployment TEXT,           -- ISO timestamp of the newest deployment
+    subnet_ids      TEXT,           -- JSON list of its awsvpc subnets ('[]': not awsvpc;
+                                    -- NULL: a snapshot from before this column)
+    PRIMARY KEY (snapshot_id, cluster, service)
+);
+
+-- Auto Scaling groups (scale headroom, headroom.py): sizes, subnets (VPCZoneIdentifier)
+-- and current instances.
+CREATE TABLE IF NOT EXISTS asgs (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    min_size    INTEGER,
+    desired     INTEGER,
+    max_size    INTEGER,
+    subnet_ids  TEXT,               -- JSON list
+    instances   TEXT,               -- JSON list of [instance id, AZ]
+    PRIMARY KEY (snapshot_id, name)
+);
+
+-- Application Auto Scaling targets of ECS services (ecs:service:DesiredCount).
+CREATE TABLE IF NOT EXISTS ecs_scalable_targets (
+    snapshot_id  INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    cluster      TEXT NOT NULL,
+    service      TEXT NOT NULL,
+    min_capacity INTEGER,
+    max_capacity INTEGER,
     PRIMARY KEY (snapshot_id, cluster, service)
 );
 
@@ -515,6 +541,8 @@ _ADDED_COLUMNS = (
     ("tf_repo_envs", "backend_extra_enc", "TEXT NOT NULL DEFAULT ''"),
     ("tf_repo_envs", "backend_extra_keys", "TEXT NOT NULL DEFAULT ''"),
     ("jobs", "resources", "TEXT NOT NULL DEFAULT '{}'"),
+    ("load_balancers", "subnet_ids", "TEXT"),
+    ("ecs_services", "subnet_ids", "TEXT"),
 )
 
 # Single-account settings rows from before multi-account support.

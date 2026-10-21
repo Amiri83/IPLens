@@ -5,6 +5,15 @@
     <span class="reserved" style="width: {{ s.pct(s.reserved) }}%"></span>
   </div>
 {%- endmacro %}
+{# Scale headroom of one subnet (headroom.SubnetHeadroom): status, IPs left at max scale and
+   the demand's contributors as the tooltip. #}
+{% macro headroom_badge(hr) -%}
+  {% if hr %}
+  <a class="badge {{ {'over': 'err', 'tight': 'warn', 'ok': 'ok'}[hr.status] }}"
+     href="{{ url_for('headroom_page') }}#{{ hr.subnet.subnet_id }}"
+     title="free {{ hr.free }} · demand at max scale {{ hr.demand }}{% for c in hr.contributors %}&#10;{{ c.text }}{% endfor %}">{{ hr.status_label }} · {{ hr.left }} left</a>
+  {% else %}<span class="muted">–</span>{% endif %}
+{%- endmacro %}
 {# Import "with context": needs active_account, active_label and csrf_token. #}
 {% macro no_data() -%}
   {% if active_account %}

@@ -4,7 +4,8 @@ no external assets) to print to PDF or share.
 :func:`build` gathers the sections from the modules behind the regular pages: the
 summary and at-risk subnets (:mod:`iplens.queries`, :mod:`iplens.trends`), the top IP
 consumers (:func:`iplens.queries.ip_list`), the used-IP trend, the suggestions split into
-allowed / blocked by a rule (:mod:`iplens.suggestions`), CIDR headroom with a secondary
+allowed / blocked by a rule (:mod:`iplens.suggestions`), the scale headroom of each subnet
+(:mod:`iplens.headroom`), CIDR headroom with a secondary
 CIDR recommendation (:mod:`iplens.cidrplan`) and ownership coverage
 (:mod:`iplens.ownership`). The web route renders ``templates/report.html``.
 
@@ -35,6 +36,7 @@ from typing import Any
 from markupsafe import Markup
 
 from . import cidrplan, environment, ownership, queries, trends
+from . import headroom as scale_mod
 from . import suggestions as sugg_mod
 from .attribution import OWNER_LABELS
 from .queries import SubnetStats, VpcNode
@@ -212,6 +214,8 @@ class Report:
     totals: dict[str, int]
     headroom: list[VpcHeadroom]
     ownership: ownership.OwnershipReport | None
+    # Free IPs vs. demand at max scale per subnet (headroom.py).
+    scale: scale_mod.Headroom = field(default_factory=lambda: scale_mod.Headroom([]))
     secondary_prefix: int = cidrplan.DEFAULT_SECONDARY_PREFIX
     notes: list[str] = field(default_factory=list)
 
@@ -376,6 +380,7 @@ def build(
         totals=sugg_mod.totals(items),
         headroom=headroom,
         ownership=ownership.report(conn, snap_id, own),
+        scale=scale_mod.for_snapshot(conn, snap_id, scope),
         secondary_prefix=secondary_prefix,
         notes=notes,
     )

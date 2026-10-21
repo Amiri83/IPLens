@@ -13,6 +13,9 @@ to the job's log or progress.
 The clusters / domains of RDS, Redshift, ElastiCache, OpenSearch and MSK (each optional)
 give their ENIs an owner name such as "Aurora cluster db-a" (see :mod:`iplens.managed`).
 
+Auto Scaling groups and the Application Auto Scaling targets of ECS services (both
+optional) give the scale headroom its maximum sizes (see :mod:`iplens.headroom`).
+
 "Retry skipped" runs a Collector with ``only``: just the skipped resource types (plus what
 they need, see :func:`retry_plan`), the account identity and VPCs/subnets/ENIs, and a
 ``source_snapshot``: the latest successful snapshot it derives from. In the snapshot's
@@ -58,7 +61,7 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # Progress steps of one collection (see Collector._step).
-COLLECT_STEPS = 20
+COLLECT_STEPS = 22
 # tag:GetResources page size (the API maximum).
 _TAG_PAGE = 100
 # CloudTrail events read per looked-up resource.
@@ -79,6 +82,9 @@ MANAGED_SOURCES: dict[str, tuple[str, ...]] = {
     "opensearch": ("es:DescribeDomains",),  # es:ListDomainNames + es:DescribeDomains
     "msk": ("kafka:ListClustersV2",),
 }
+# Scale headroom (iplens.headroom): Auto Scaling groups and ECS service maximums.
+ASG_RESOURCE = "autoscaling:DescribeAutoScalingGroups"
+SCALABLE_TARGETS_RESOURCE = "application-autoscaling:DescribeScalableTargets"
 RESOURCES = (
     "sts:GetCallerIdentity",
     "iam:ListAccountAliases",
@@ -91,6 +97,8 @@ RESOURCES = (
     "elasticloadbalancing:DescribeTargetHealth",
     "ec2:DescribeSecurityGroups",
     "ECS services and tasks",
+    ASG_RESOURCE,
+    SCALABLE_TARGETS_RESOURCE,
     *(what for sources in MANAGED_SOURCES.values() for what in sources),
     "elasticloadbalancing:DescribeTags",
     "lambda:ListTags",
@@ -158,6 +166,8 @@ _MERGED: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
         ("own_resources", "own_tags"),
         (),
     ),
+    (frozenset({ASG_RESOURCE}), ("asgs",), ()),
+    (frozenset({SCALABLE_TARGETS_RESOURCE}), ("ecs_scalable_targets",), ()),
     *(
         (frozenset(sources), (managed.TABLES[service],), ())
         for service, sources in MANAGED_SOURCES.items()
@@ -419,7 +429,60 @@ def _ecs_service_row(cluster: str, svc: dict[str, Any]) -> dict[str, Any]:
             (lb.get("targetGroupArn") or "", lb.get("loadBalancerName") or "")
             for lb in svc.get("loadBalancers", [])
         ],
+        "subnet_ids": _ecs_service_subnets(svc),
     }
+
+
+def _ecs_service_subnets(svc: dict[str, Any]) -> list[str]:
+    """The awsvpc subnets of a service (its own network configuration, else the primary
+    deployment's); [] for a service whose tasks have no ENI of their own."""
+    configs = [svc.get("networkConfiguration")]
+    configs += [d.get("networkConfiguration") for d in svc.get("deployments", [])]
+    for cfg in configs:
+        subnets = ((cfg or {}).get("awsvpcConfiguration") or {}).get("subnets")
+        if subnets:
+            return sorted(set(subnets))
+    return []
+
+
+def asg_rows(groups: Iterable[dict[str, Any]]) -> list[tuple[str, int, int, int, str, str]]:
+    """``(name, min, desired, max, subnet ids JSON, [[instance id, AZ], ...] JSON)`` of
+    every Auto Scaling group (``VPCZoneIdentifier`` is a comma-separated subnet list)."""
+    out = []
+    for g in groups:
+        subnets = sorted({s.strip() for s in (g.get("VPCZoneIdentifier") or "").split(",")} - {""})
+        instances = sorted(
+            [i["InstanceId"], i.get("AvailabilityZone") or ""]
+            for i in g.get("Instances", []) or []
+            if i.get("InstanceId")
+        )
+        out.append(
+            (
+                g["AutoScalingGroupName"],
+                int(g.get("MinSize") or 0),
+                int(g.get("DesiredCapacity") or 0),
+                int(g.get("MaxSize") or 0),
+                json.dumps(subnets),
+                json.dumps(instances),
+            )
+        )
+    return sorted(out)
+
+
+def ecs_scalable_target_rows(targets: Iterable[dict[str, Any]]) -> list[tuple[str, str, int, int]]:
+    """``(cluster, service, min, max)`` of every ECS service desired-count target
+    (``ResourceId`` ``service/<cluster>/<service>``)."""
+    out = {}
+    for t in targets:
+        if t.get("ScalableDimension") != "ecs:service:DesiredCount":
+            continue
+        parts = (t.get("ResourceId") or "").split("/")
+        if len(parts) == 3 and parts[0] == "service":
+            out[(parts[1], parts[2])] = (
+                int(t.get("MinCapacity") or 0),
+                int(t.get("MaxCapacity") or 0),
+            )
+    return sorted((*key, *sizes) for key, sizes in out.items())
 
 
 def _task_service(task: dict[str, Any]) -> str:
@@ -782,6 +845,31 @@ class Collector:
         )
         self._step("ECS services and tasks")
         ecs = self._collect_ecs(result)
+        self._step(ASG_RESOURCE)
+        asgs = asg_rows(
+            self._optional(
+                result,
+                ASG_RESOURCE,
+                lambda: _paginate(
+                    self.gw.client("autoscaling"),
+                    "describe_auto_scaling_groups",
+                    "AutoScalingGroups",
+                ),
+            )
+        )
+        self._step(SCALABLE_TARGETS_RESOURCE)
+        scalable_targets = ecs_scalable_target_rows(
+            self._optional(
+                result,
+                SCALABLE_TARGETS_RESOURCE,
+                lambda: _paginate(
+                    self.gw.client("application-autoscaling"),
+                    "describe_scalable_targets",
+                    "ScalableTargets",
+                    ServiceNamespace="ecs",
+                ),
+            )
+        )
         managed_rows = self._collect_managed(result)
         self._step("tags")
         lb_tags = self._collect_lb_tags(result, lbs)
@@ -989,15 +1077,19 @@ class Collector:
 
         def write_load_balancers(conn: sqlite3.Connection) -> None:
             for lb in lbs:
+                subnet_ids = {
+                    az["SubnetId"] for az in lb.get("AvailabilityZones", []) if az.get("SubnetId")
+                }
                 conn.execute(
-                    "INSERT INTO load_balancers(snapshot_id, name, lb_type, scheme, vpc_id) "
-                    "VALUES(?,?,?,?,?)",
+                    "INSERT INTO load_balancers(snapshot_id, name, lb_type, scheme, vpc_id, "
+                    "subnet_ids) VALUES(?,?,?,?,?,?)",
                     (
                         snap_id,
                         lb["LoadBalancerName"],
                         lb.get("Type"),
                         lb.get("Scheme"),
                         lb.get("VpcId"),
+                        json.dumps(sorted(subnet_ids)),
                     ),
                 )
 
@@ -1013,7 +1105,8 @@ class Collector:
             for svc in ecs.services:
                 conn.execute(
                     "INSERT OR IGNORE INTO ecs_services(snapshot_id, cluster, service, "
-                    "desired_count, running_count, last_deployment) VALUES(?,?,?,?,?,?)",
+                    "desired_count, running_count, last_deployment, subnet_ids) "
+                    "VALUES(?,?,?,?,?,?,?)",
                     (
                         snap_id,
                         svc["cluster"],
@@ -1021,6 +1114,7 @@ class Collector:
                         svc["desired_count"],
                         svc["running_count"],
                         svc["last_deployment"],
+                        json.dumps(svc["subnet_ids"]),
                     ),
                 )
             for eni_id, task in ecs.task_enis.items():
@@ -1087,6 +1181,20 @@ class Collector:
                 [(snap_id, *row) for row in own_tags],
             )
 
+        def write_asgs(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                "INSERT OR IGNORE INTO asgs(snapshot_id, name, min_size, desired, max_size, "
+                "subnet_ids, instances) VALUES(?,?,?,?,?,?,?)",
+                [(snap_id, *row) for row in asgs],
+            )
+
+        def write_scalable_targets(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                "INSERT OR IGNORE INTO ecs_scalable_targets(snapshot_id, cluster, service, "
+                "min_capacity, max_capacity) VALUES(?,?,?,?,?)",
+                [(snap_id, *row) for row in scalable_targets],
+            )
+
         def write_managed(service: str) -> Callable[[sqlite3.Connection], None]:
             return lambda conn: managed.write(conn, snap_id, managed_rows[service])
 
@@ -1100,6 +1208,8 @@ class Collector:
             ("elasticloadbalancing:DescribeTargetHealth", False, write_lb_targets),
             ("ECS services and tasks", False, write_ecs),
             ("ec2:DescribeSecurityGroups", False, write_security_groups),
+            (ASG_RESOURCE, False, write_asgs),
+            (SCALABLE_TARGETS_RESOURCE, False, write_scalable_targets),
             *((MANAGED_SOURCES[s][0], False, write_managed(s)) for s in MANAGED_SOURCES),
             ("resource tags", False, write_tags),
             (OWNERSHIP_WRITE, False, write_ownership),
