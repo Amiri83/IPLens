@@ -2,12 +2,14 @@
 how the browser is found and when the test is skipped): once a job has finished, Cancel and
 Hide are hidden and only Close is left. The ``hidden`` attribute must win over the
 ``button`` display rule in style.css. A hidden box stays hidden on other pages and tabs
-(the "Discovery running…" badge shows instead). Placeholders only: example names, no AWS
-calls."""
+(the "Discovery running…" badge shows instead), and the hide request survives a page
+change (keepalive). "Retry skipped" asks for only the skipped resource types.
+Placeholders only: example names, no AWS calls."""
 
 from __future__ import annotations
 
 import threading
+from urllib.parse import parse_qs
 
 import pytest
 from werkzeug import serving
@@ -17,6 +19,18 @@ from iplens.web import create_app
 from tests.test_visual_browser import _free_port, browser  # noqa: F401  (fixture)
 
 WATCH_KEY = "iplens-job-watch"  # jobs.js: the job this tab started
+# Records the fetch options of the progress box's hide / show requests.
+RECORD_POSTS = """
+window.__jobPosts = [];
+const realFetch = window.fetch;
+window.fetch = (target, options) => {
+  const path = String(target).split("/").pop();
+  if (path === "hide" || path === "show") {
+    window.__jobPosts.push({ path: path, keepalive: Boolean(options && options.keepalive) });
+  }
+  return realFetch(target, options);
+};
+"""
 
 
 @pytest.fixture
@@ -107,6 +121,28 @@ def test_refresh_box_shows_limits_resources_and_skipped(browser, skipped_server)
     page.close()
 
 
+def test_retry_skipped_requests_only_the_skipped_types(browser, skipped_server):  # noqa: F811
+    base, job_id = skipped_server
+    page = browser.new_page()
+    errors: list[str] = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    # Answer the Refresh here: the test checks the request, no job is started.
+    page.route(
+        f"{base}/refresh",
+        lambda route: route.fulfill(status=500, content_type="application/json", body="{}"),
+    )
+    page.add_init_script(f"sessionStorage.setItem({WATCH_KEY!r}, {job_id!r})")
+    page.goto(f"{base}/")
+    page.wait_for_selector("#job-retry", state="visible")
+    with page.expect_request(lambda r: r.url == f"{base}/refresh") as req:
+        page.click("#job-retry")
+    form = parse_qs(req.value.post_data)
+    assert form["only"] == ["tag:GetResources"]  # not the collected ec2:DescribeVpcs
+    assert form["background"] == ["1"]
+    assert errors == []
+    page.close()
+
+
 @pytest.fixture
 def running_server(home):
     """A server whose account has a Refresh-kind job running until the test ends."""
@@ -136,11 +172,14 @@ def test_hidden_job_box_stays_hidden_on_another_tab(browser, running_server):  #
     page = context.new_page()
     errors: list[str] = []
     page.on("pageerror", lambda exc: errors.append(str(exc)))
+    page.add_init_script(RECORD_POSTS)
     page.goto(f"{base}/")
     page.wait_for_selector("#job-modal", state="visible")
     with page.expect_response(lambda r: r.url.endswith("/hide")):
         page.click("#job-hide")
     assert page.is_hidden("#job-modal")
+    # The hide request outlives an immediate navigation to another page.
+    assert page.evaluate("window.__jobPosts") == [{"path": "hide", "keepalive": True}]
 
     # Switch tabs: the box stays hidden and the badge says discovery is running.
     page.goto(f"{base}/ips")

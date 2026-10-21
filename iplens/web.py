@@ -101,6 +101,9 @@ GatewayFactory = Callable[[Account], AwsGateway]
 DELETE_CONFIRMATION = "DELETE"
 # Session key: id of the job whose progress box the user hid (see job_hide).
 JOB_HIDDEN_KEY = "job_hidden"
+# "Retry skipped" (POST /refresh only=...): names accepted, and characters per name.
+MAX_RETRY = 50
+MAX_RESOURCE_NAME = 100
 HISTORY_ROWS = 50
 # Snapshots offered by the Diff page's pickers (newest first).
 DIFF_CHOICES = 500
@@ -626,12 +629,17 @@ def _register(app: Flask) -> None:
                 return jsonify({"ok": False, "error": "Add an AWS account in Settings first."}), 400
             flash("Add an AWS account in Settings first.", "error")
             return redirect(url_for("settings_page"))
-        return _run_job(active.id, "refresh", _refresh_work(active.id), url_for("overview"))
+        # "Retry skipped": only the skipped resource types (unknown names: a full Refresh).
+        only = [name[:MAX_RESOURCE_NAME] for name in request.form.getlist("only")[:MAX_RETRY]]
+        work = _refresh_work(active.id, only or None)
+        return _run_job(active.id, "refresh", work, url_for("overview"))
 
-    def _refresh_work(account_id: int) -> Callable[[JobContext], None]:
+    def _refresh_work(
+        account_id: int, only: list[str] | None = None
+    ) -> Callable[[JobContext], None]:
         """The Refresh job of an account (a manual Refresh or a scheduled one). Needs a
         request context; everything the job needs is resolved here, so the worker never
-        touches the request."""
+        touches the request. ``only``: the resource types a "Retry skipped" collects."""
         account = _accounts().get(account_id, with_secret=True)
         if account is None:
             raise ValueError(f"unknown account {account_id}")
@@ -666,6 +674,7 @@ def _register(app: Flask) -> None:
                     ownership_config=own,
                     resource_timeout=resource_timeout,
                     overall_timeout=overall_timeout,
+                    only=only,
                 ).run()
                 with closing(db_path) as conn:
                     pruned = retention_mod.apply(conn, policy)

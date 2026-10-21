@@ -130,11 +130,22 @@ def build_session(account: Account) -> boto3.session.Session:
     return boto3.session.Session(region_name=region)
 
 
+# Refresh clients: botocore's "max_attempts" counts retries, so a call makes up to
+# CALL_RETRIES + 1 HTTP attempts.
+CALL_RETRIES = 2
+
+
 def call_timeouts(resource_timeout: float) -> Config:
-    """Refresh clients: no single HTTP call may outlive the per-resource timeout, so a
-    resource abandoned at its timeout stops instead of hanging on a dead connection."""
+    """Refresh clients: a call and all of its retries fit in the per-resource timeout
+    (attempts x read timeout <= timeout), so a resource abandoned at its timeout stops
+    instead of hanging on a dead connection or retrying in the background."""
     seconds = max(float(resource_timeout), 1.0)
-    return Config(connect_timeout=min(10.0, seconds), read_timeout=min(60.0, seconds))
+    read = min(60.0, seconds / (CALL_RETRIES + 1))
+    return Config(
+        connect_timeout=min(10.0, read),
+        read_timeout=read,
+        retries={"max_attempts": CALL_RETRIES, "mode": "standard"},
+    )
 
 
 class AwsGateway:

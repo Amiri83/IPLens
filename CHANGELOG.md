@@ -36,8 +36,18 @@
 - The Refresh progress box shows the timeouts in force (with a link to Settings), a row per
   resource type (pending / running / done / skipped, elapsed vs. timeout), the overall elapsed
   time vs. the limit and, at the end, the skipped resource types with their reason and a
-  **Retry skipped** button (a new Refresh); the same summary goes to the app log. Cancel now
-  also stops a resource type that is stuck in an AWS call.
+  **Retry skipped** button; the same summary goes to the app log. Cancel now also stops a
+  resource type that is stuck in an AWS call.
+- **Retry skipped** collects only the skipped resource types (plus what they need, e.g. load
+  balancers for target health), the account identity and VPCs / subnets / ENIs, instead of
+  re-running the whole Refresh; the new snapshot says which types it holds. A skipped write
+  that spans every type (resource tags) still retries everything.
+- Hide / reopen of the progress box is no longer lost when you navigate right after
+  clicking (the request is sent with `keepalive`).
+- Refresh AWS calls use 2 retries (standard mode) with a read timeout sized so that all
+  attempts fit in the per-resource timeout: an abandoned call no longer keeps retrying.
+- A resource type abandoned at its timeout no longer writes log lines or progress into the
+  job after it has been marked skipped.
 
 ### Security
 

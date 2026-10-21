@@ -3,7 +3,9 @@
 A resource type running past the per-resource timeout is skipped and the others still
 complete; the timeouts come from Settings at every start (no restart); a failed write of
 one resource type leaves none of its rows; Cancel stops a hanging resource; and a hidden
-progress box stays hidden on other pages (tabs). Placeholders only: 192.0.2.N addresses,
+progress box stays hidden on other pages (tabs). An abandoned resource's thread writes
+nothing more to the job, its AWS calls retry within the timeout, and "Retry skipped"
+collects only the skipped resource types. Placeholders only: 192.0.2.N addresses,
 example names, moto (no real AWS)."""
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
+from iplens import aws as aws_mod
 from iplens import collector as collector_mod
 from iplens import jobs
 from iplens import settings as settings_mod
@@ -144,7 +147,9 @@ def test_abandoned_resource_stops_at_its_next_page(db_path, monkeypatch, release
 def test_overall_limit_skips_the_remaining_resources(db_path, monkeypatch, release):
     _aws()
     monkeypatch.setattr(Collector, "_fetch_tagged_resources", _hang(release))
-    result = Collector(_gateway(), db_path, resource_timeout=30, overall_timeout=1).run()
+    # Long enough for the required resources on a loaded machine (a cold boto3 client
+    # alone can take a second); the hanging one then runs into the overall limit.
+    result = Collector(_gateway(), db_path, resource_timeout=30, overall_timeout=5).run()
     reason = "overall time limit of 1 min reached"
     assert ("tag:GetResources", reason) in result.skipped
     assert ("cloudformation:ListStacks", reason) in result.skipped  # never started
@@ -189,14 +194,136 @@ def test_cancel_stops_a_hanging_resource(db_path, monkeypatch, release):
     mgr.close()
 
 
-def test_collection_clients_get_botocore_timeouts():
+def test_collection_clients_get_botocore_timeouts_and_retries():
     gw = _gateway()
-    Collector(gw, "unused.db", resource_timeout=120)
+    Collector(gw, "unused.db", resource_timeout=240)
     cfg = gw.client("ec2", region=REGION).meta.config
     assert (cfg.connect_timeout, cfg.read_timeout) == (10, 60)
-    Collector(gw, "unused.db", resource_timeout=5)
-    cfg = gw.client("ec2", region=REGION).meta.config
-    assert (cfg.connect_timeout, cfg.read_timeout) == (5, 5)
+    # botocore: max_attempts 2 retries = 3 attempts in total (not the adaptive 5 retries).
+    assert cfg.retries == {"mode": "standard", "total_max_attempts": 3}
+    for timeout in (120, 30, 5):
+        Collector(gw, "unused.db", resource_timeout=timeout)
+        cfg = gw.client("ec2", region=REGION).meta.config
+        assert cfg.retries == {"mode": "standard", "total_max_attempts": 3}
+        assert 3 * cfg.read_timeout <= timeout
+        assert cfg.connect_timeout <= min(10, cfg.read_timeout)
+    raw = aws_mod.call_timeouts(120)
+    assert raw.retries == {"max_attempts": 2, "mode": "standard"}
+    assert (raw.connect_timeout, raw.read_timeout) == (10, 40)
+
+
+@mock_aws
+def test_abandoned_thread_writes_nothing_to_the_job_after_its_skip(db_path, monkeypatch, release):
+    _aws()
+    _warm_up(db_path)
+    late = threading.Event()  # set by the abandoned thread once it has tried to write
+
+    def fetch(self):
+        self.progress.log("before the timeout")
+        release.wait(WAIT)
+        collector_mod.log.info("late log record")
+        collector_mod.log.warning("late warning record")
+        self.progress.log("late log line")
+        self.progress.step("late step", done=99, total=99)
+        self.progress.resource("tag:GetResources", jobs.RES_DONE)
+        self.progress.resource("late resource", jobs.RES_DONE)
+        self.progress.message("ok", "late message")
+        late.set()
+        return []
+
+    monkeypatch.setattr(Collector, "_fetch_tagged_resources", fetch)
+    mgr = jobs.JobManager(db_path)
+
+    def work(ctx):
+        Collector(_gateway(), db_path, progress=ctx, resource_timeout=1, overall_timeout=60).run()
+        release.set()  # the abandoned thread wakes up while this job is still running
+        assert late.wait(WAIT)
+
+    job = mgr.start(1, "refresh", work, background=False)
+    assert job["state"] == jobs.DONE
+    assert any(line.endswith("before the timeout") for line in job["log"])
+    assert not [line for line in job["log"] if "late" in line]
+    assert "late" not in job["step"] and job["done"] < 99
+    rows = {r["name"]: r for r in job["items"]}
+    assert rows["tag:GetResources"]["status"] == jobs.SKIPPED
+    assert "late resource" not in rows
+    assert not [m for m in job["messages"] if "late" in m["text"]]
+    mgr.close()
+
+
+def test_retry_plan_adds_what_a_type_needs_and_unknown_names_mean_everything():
+    base = {*collector_mod.IDENTITY_RESOURCES, *collector_mod.CORE_RESOURCES}
+    assert collector_mod.retry_plan(["tag:GetResources"]) == {*base, "tag:GetResources"}
+    assert collector_mod.retry_plan(["elasticloadbalancing:DescribeTargetHealth"]) == {
+        *base,
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth",
+    }
+    assert collector_mod.retry_plan(["lambda:ListTags"]) == {
+        *base,
+        "lambda:ListFunctions",
+        "lambda:ListTags",
+    }
+    assert collector_mod.retry_plan([collector_mod.OWNERSHIP_WRITE]) == {
+        *base,
+        "tag:GetResources",
+        "cloudformation:ListStacks",
+    }
+    assert collector_mod.retry_plan(["ec2:DescribeSubnets"]) == base
+    # Not one resource type (the tags write spans all of them), or nothing: a full Refresh.
+    assert collector_mod.retry_plan(["resource tags"]) is None
+    assert collector_mod.retry_plan(["tag:GetResources", "example-unknown"]) is None
+    assert collector_mod.retry_plan([]) is None
+
+
+@mock_aws
+def test_retry_collects_only_the_skipped_types(db_path, monkeypatch):
+    _aws()
+    calls: list[str] = []
+    real = collector_mod._paginate
+
+    def paginate(client, op, key, **kwargs):
+        calls.append(op)
+        return real(client, op, key, **kwargs)
+
+    monkeypatch.setattr(collector_mod, "_paginate", paginate)
+    fetched = []
+    monkeypatch.setattr(Collector, "_fetch_tagged_resources", lambda self: fetched.append(1) or [])
+    mgr = jobs.JobManager(db_path)
+    out = {}
+
+    def work(ctx):
+        out["result"] = Collector(
+            _gateway(), db_path, progress=ctx, only=["tag:GetResources", "ec2:DescribeInstances"]
+        ).run()
+
+    job = mgr.start(1, "refresh", work, background=False)
+    result = out["result"]
+    assert job["state"] == jobs.DONE
+    assert sorted(calls) == [
+        "describe_instances",
+        "describe_network_interfaces",
+        "describe_subnets",
+        "describe_vpcs",
+    ]
+    assert fetched == [1]
+    assert [r["name"] for r in job["items"]] == [
+        "sts:GetCallerIdentity",
+        "iam:ListAccountAliases",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeInstances",
+        "tag:GetResources",
+    ]
+    assert {r["status"] for r in job["items"]} == {jobs.RES_DONE}
+    assert (result.enis, result.ips) == (1, 1) and result.skipped == []
+    assert (
+        "Retry of skipped resources: this snapshot has VPCs, subnets, ENIs and only "
+        "ec2:DescribeInstances, tag:GetResources"
+    ) in result.warnings
+    mgr.close()
 
 
 @mock_aws
@@ -338,6 +465,37 @@ def test_changed_resource_timeout_is_honoured_without_restart(app, client, monke
     rows = {r["name"]: r for r in job["items"]}
     assert rows["tag:GetResources"]["reason"] == "timeout after 2s"
     assert rows["tag:GetResources"]["elapsed"] >= 1
+
+
+@mock_aws
+def test_refresh_endpoint_passes_the_skipped_types_to_the_collector(app, client, monkeypatch):
+    _aws()
+    seen = []
+    real_init = Collector.__init__
+
+    def init(self, *args, only=None, **kwargs):
+        seen.append(None if only is None else list(only))
+        real_init(self, *args, only=only, **kwargs)
+
+    monkeypatch.setattr(Collector, "__init__", init)
+    manager = app.extensions["iplens"]["jobs"]
+
+    def refresh(data) -> dict:
+        body = _post(client, "/refresh", {"background": "1", **data}).get_json()
+        assert body["ok"], body
+        assert manager.wait(body["job"]["id"], WAIT)
+        return client.get(f"/jobs/{body['job']['id']}").get_json()["job"]
+
+    job = refresh({"only": ["tag:GetResources", "lambda:ListTags"]})
+    assert seen[-1] == ["tag:GetResources", "lambda:ListTags"]
+    assert job["state"] == jobs.DONE
+    names = {r["name"] for r in job["items"]}
+    assert {"tag:GetResources", "lambda:ListTags", "lambda:ListFunctions"} <= names
+    assert "ec2:DescribeInstances" not in names and "cloudformation:ListStacks" not in names
+    # A plain Refresh (no "only") still collects every resource type.
+    job = refresh({})
+    assert seen[-1] is None
+    assert "ec2:DescribeInstances" in {r["name"] for r in job["items"]}
 
 
 def test_progress_box_has_cancel_banner_and_retry(client):

@@ -9,7 +9,8 @@
    tab while a small badge ("Discovery running…" for a Refresh) shows the job is still
    going; the badge reopens it. A Refresh also lists its resource types with their
    status and elapsed time against the per-resource timeout, the overall limit, and at
-   the end the skipped ones with a "Retry skipped" button (a new Refresh). */
+   the end the skipped ones with a "Retry skipped" button (a new Refresh of just those
+   resource types, plus VPCs, subnets and ENIs). */
 (function () {
   "use strict";
 
@@ -40,6 +41,7 @@
   let jobId = null;
   let timer = null;
   let running = false;
+  let skippedNames = [];  // resource types the last rendered Refresh skipped
 
   const url = (template, id) => template.replace("__ID__", encodeURIComponent(id));
 
@@ -102,6 +104,7 @@
       return tr;
     }));
     const skipped = items.filter((r) => r.status === "skipped");
+    skippedNames = skipped.map((r) => r.name);
     skippedBox.hidden = running || skipped.length === 0;
     skippedList.replaceChildren(...skipped.map((r) => {
       const li = document.createElement("li");
@@ -155,15 +158,16 @@
     badge.hidden = !running;
   }
 
-  // User actions: remembered server-side so other pages and tabs follow.
+  // User actions: remembered server-side so other pages and tabs follow. keepalive lets
+  // the request finish when the user navigates away right after clicking.
   function userHide() {
     hide();
-    if (jobId) post(url(modal.dataset.hideUrl, jobId), {}).catch(() => {});
+    if (jobId) post(url(modal.dataset.hideUrl, jobId), {}, { keepalive: true }).catch(() => {});
   }
 
   function userOpen() {
     open();
-    if (jobId) post(url(modal.dataset.showUrl, jobId), {}).catch(() => {});
+    if (jobId) post(url(modal.dataset.showUrl, jobId), {}, { keepalive: true }).catch(() => {});
   }
 
   function poll() {
@@ -191,9 +195,13 @@
     if (job.running) timer = setTimeout(poll, POLL_MS);
   }
 
-  function post(target, fields) {
-    const body = new URLSearchParams({ csrf_token: csrf, ...fields });
-    return fetch(target, { method: "POST", body: body, credentials: "same-origin" });
+  // An array field is sent once per value (e.g. only=a&only=b).
+  function post(target, fields, options) {
+    const body = new URLSearchParams({ csrf_token: csrf });
+    Object.entries(fields).forEach(([key, value]) => {
+      [].concat(value).forEach((v) => body.append(key, v));
+    });
+    return fetch(target, { method: "POST", body: body, credentials: "same-origin", ...options });
   }
 
   cancelBtn.addEventListener("click", () => {
@@ -250,9 +258,10 @@
     });
   });
 
-  // "Retry skipped": a new Refresh of the active account (every resource type again).
+  // "Retry skipped": a new Refresh of the active account that collects only the skipped
+  // resource types (plus VPCs, subnets and ENIs, which every snapshot needs).
   retryBtn.addEventListener("click", () => {
-    startJob(modal.dataset.refreshUrl, {}, [retryBtn]);
+    startJob(modal.dataset.refreshUrl, { only: skippedNames }, [retryBtn]);
   });
 
   // Re-attach after a reload or on another page: the account's running job (kept hidden
