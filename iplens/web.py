@@ -912,11 +912,15 @@ def _register(app: Flask) -> None:
         snap = _snapshot_or_none()
         if not snap:
             return render_template("headroom.html", snap=None)
-        result = headroom.for_snapshot(_db(), snap["id"], _scope())
+        # The form sends surge=0 (hidden) plus surge=1 when checked; no field: default on.
+        flags = request.args.getlist("surge")
+        include_surge = not flags or "1" in flags
+        result = headroom.for_snapshot(_db(), snap["id"], _scope(), include_surge)
         return render_template(
             "headroom.html",
             snap=snap,
             h=result,
+            include_surge=include_surge,
             tight_pct=headroom.TIGHT_PCT,
             alb_reserve=headroom.ALB_RESERVE,
         )

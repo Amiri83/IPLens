@@ -17,6 +17,14 @@
   snapshot. The new rows are copied by "Retry skipped" like the other resource types it does not
   collect.
 
+- Scale headroom: ECS deploy surge – the extra tasks of a rolling deployment at max scale,
+  `ceil(max × (maximumPercent − 100) / 100)` spread over the service's subnets like the
+  scale-out, as its own contributor ("deploy surge: +N, maxPercent 200"). `maximumPercent`
+  defaults to 200; none for `CODE_DEPLOY` / `EXTERNAL` deployment controllers or
+  `maximumPercent` ≤ 100. An **include deploy surge** toggle on the Headroom page (on by
+  default). ECS services now store `deploymentConfiguration.maximumPercent` and the deployment
+  controller per snapshot.
+
 - Owner names of managed-service ENIs: optional, read-only `rds:DescribeDBInstances`,
   `rds:DescribeDBClusters`, `redshift:DescribeClusters`, `elasticache:DescribeCacheClusters`,
   `elasticache:DescribeReplicationGroups`, `es:ListDomainNames` + `es:DescribeDomains` and

@@ -430,6 +430,8 @@ def _ecs_service_row(cluster: str, svc: dict[str, Any]) -> dict[str, Any]:
             for lb in svc.get("loadBalancers", [])
         ],
         "subnet_ids": _ecs_service_subnets(svc),
+        "max_percent": (svc.get("deploymentConfiguration") or {}).get("maximumPercent"),
+        "deployment_controller": (svc.get("deploymentController") or {}).get("type"),
     }
 
 
@@ -1105,8 +1107,8 @@ class Collector:
             for svc in ecs.services:
                 conn.execute(
                     "INSERT OR IGNORE INTO ecs_services(snapshot_id, cluster, service, "
-                    "desired_count, running_count, last_deployment, subnet_ids) "
-                    "VALUES(?,?,?,?,?,?,?)",
+                    "desired_count, running_count, last_deployment, subnet_ids, max_percent, "
+                    "deployment_controller) VALUES(?,?,?,?,?,?,?,?,?)",
                     (
                         snap_id,
                         svc["cluster"],
@@ -1115,6 +1117,8 @@ class Collector:
                         svc["running_count"],
                         svc["last_deployment"],
                         json.dumps(svc["subnet_ids"]),
+                        svc["max_percent"],
+                        svc["deployment_controller"],
                     ),
                 )
             for eni_id, task in ecs.task_enis.items():

@@ -9,11 +9,15 @@ from __future__ import annotations
 
 import json
 import random
+import re
+from collections import Counter
 
 import boto3
 import pytest
 from botocore.exceptions import ClientError
 from moto import mock_aws
+from moto.core import DEFAULT_ACCOUNT_ID
+from moto.ecs.models import ecs_backends
 
 from iplens import collector as collector_mod
 from iplens import headroom as hr
@@ -120,7 +124,7 @@ def test_ecs_service_scales_to_its_scalable_target_max_one_ip_per_task():
         ecs_max={("cluster-a", "api"): 8},
         task_subnets={("cluster-a", "api"): {SA: 2, SB: 2}},
     )
-    result = analyze(inputs)
+    result = analyze(inputs, include_surge=False)
     # 4 more tasks: 1 each, the remainder to subnet-c (no task there yet).
     assert _demand(result) == {SA: 1, SB: 1, SC: 2}
     assert result.by_id[SC].contributors[0].text == (
@@ -131,7 +135,7 @@ def test_ecs_service_scales_to_its_scalable_target_max_one_ip_per_task():
 
 def test_ecs_service_without_a_scalable_target_counts_up_to_its_desired_count():
     svc = EcsService("cluster-a", "api", 5, 3, (SA,))
-    result = analyze(Inputs(subnets=_three(), ecs=[svc]))
+    result = analyze(Inputs(subnets=_three(), ecs=[svc]), include_surge=False)
     assert _demand(result)[SA] == 2
     assert "no auto scaling, max = desired 5" in result.by_id[SA].contributors[0].assumption
     assert result.notes == []
@@ -139,7 +143,8 @@ def test_ecs_service_without_a_scalable_target_counts_up_to_its_desired_count():
 
 def test_ecs_missing_scaling_permission_uses_what_is_known():
     svc = EcsService("cluster-a", "api", 5, 3, (SA,))
-    result = analyze(Inputs(subnets=_three(), ecs=[svc], missing=frozenset({hr.SCALING_SOURCE})))
+    inputs = Inputs(subnets=_three(), ecs=[svc], missing=frozenset({hr.SCALING_SOURCE}))
+    result = analyze(inputs, include_surge=False)
     assert _demand(result)[SA] == 2
     assert "scaling unknown, max = desired 5" in result.by_id[SA].contributors[0].assumption
     assert result.notes == [
@@ -158,9 +163,90 @@ def test_ecs_subnets_fall_back_to_the_task_enis_and_unknown_subnets_are_a_note()
         ecs_max={("cluster-a", "old"): 4, ("cluster-a", "bridge"): 9},
         task_subnets={("cluster-a", "old"): {SB: 2}},
     )
-    result = analyze(inputs)
+    result = analyze(inputs, include_surge=False)
     assert _demand(result) == {SA: 0, SB: 2, SC: 0}
     assert result.notes == ["ECS service cluster-a/lost: subnets unknown, not counted"]
+
+
+# -- ECS deploy surge -----------------------------------------------------------------------
+
+
+def _surge(result: hr.Headroom) -> dict[str, int]:
+    return {
+        s.subnet.subnet_id: sum(c.ips for c in s.contributors if c.kind == "surge")
+        for s in result.subnets
+    }
+
+
+def test_surge_missing_max_percent_defaults_to_200_spread_unevenly():
+    # Max 5 at the default 200%: 5 extra tasks over 3 subnets, 1 each and the remainder
+    # to the subnets with the fewest tasks now (subnet-c, then subnet-a before subnet-b).
+    svc = EcsService("cluster-a", "api", 4, 4, (SA, SB, SC))
+    inputs = Inputs(
+        subnets=_three(),
+        ecs=[svc],
+        ecs_max={("cluster-a", "api"): 5},
+        task_subnets={("cluster-a", "api"): {SA: 2, SB: 2}},
+    )
+    result = analyze(inputs)
+    assert _surge(result) == {SA: 2, SB: 1, SC: 2}
+    surge = next(c for c in result.by_id[SA].contributors if c.kind == "surge")
+    assert surge.text == (
+        "ECS service cluster-a/api deploy surge: +2, maxPercent 200, the ECS default: 2 tasks "
+        "here of 5 extra at max 5 over 3 subnets during a rolling deployment, 1 IP each"
+    )
+    # Its own contributor, next to the scale-out (1 more task, to subnet-c).
+    assert [c.kind for c in result.by_id[SC].contributors] == ["surge", "ecs"]
+    assert _demand(result) == {SA: 2, SB: 1, SC: 3}
+
+
+def test_surge_rounds_up_and_uses_the_desired_count_without_a_scalable_target():
+    # maxPercent 150 of desired 5 (no auto scaling): ceil(5 * 50 / 100) = 3 extra tasks.
+    svc = EcsService("cluster-a", "api", 5, 5, (SA, SB), max_percent=150, controller="ECS")
+    result = analyze(Inputs(subnets=_three(), ecs=[svc]))
+    assert _surge(result) == {SA: 2, SB: 1, SC: 0}
+    assert (
+        result.by_id[SB]
+        .contributors[0]
+        .text.startswith(
+            "ECS service cluster-a/api deploy surge: +1, maxPercent 150: 1 task here of 3 extra at "
+            "max 5 over 2 subnets"
+        )
+    )
+
+
+@pytest.mark.parametrize("controller", ["CODE_DEPLOY", "EXTERNAL"])
+def test_surge_is_not_counted_for_non_rolling_deployment_controllers(controller):
+    svc = EcsService("cluster-a", "api", 4, 4, (SA,), max_percent=200, controller=controller)
+    assert _surge(analyze(Inputs(subnets=_three(), ecs=[svc]))) == {SA: 0, SB: 0, SC: 0}
+
+
+@pytest.mark.parametrize("pct", [100, 50, 0])
+def test_surge_is_not_counted_at_max_percent_100_or_less(pct):
+    svc = EcsService("cluster-a", "api", 4, 4, (SA,), max_percent=pct)
+    assert _surge(analyze(Inputs(subnets=_three(), ecs=[svc]))) == {SA: 0, SB: 0, SC: 0}
+
+
+def test_surge_needs_awsvpc_subnets_and_falls_back_to_the_task_enis():
+    bridge = EcsService("cluster-a", "bridge", 3, 3, ())  # not awsvpc: no IPs of its own
+    lost = EcsService("cluster-a", "lost", 3, 3, None)  # subnets unknown
+    old = EcsService("cluster-a", "old", 2, 2, None)  # subnets from its task ENIs
+    inputs = Inputs(
+        subnets=_three(),
+        ecs=[bridge, lost, old],
+        task_subnets={("cluster-a", "old"): {SB: 2}},
+    )
+    assert _surge(analyze(inputs)) == {SA: 0, SB: 2, SC: 0}
+
+
+def test_include_surge_defaults_on_and_off_drops_the_surge_contributor():
+    svc = EcsService("cluster-a", "api", 2, 2, (SA,), max_percent=200)
+    inputs = Inputs(subnets=_three(), ecs=[svc], ecs_max={("cluster-a", "api"): 4})
+    on = analyze(inputs)
+    assert [(c.kind, c.ips) for c in on.by_id[SA].contributors] == [("surge", 4), ("ecs", 2)]
+    off = analyze(inputs, include_surge=False)
+    assert [(c.kind, c.ips) for c in off.by_id[SA].contributors] == [("ecs", 2)]
+    assert on.by_id[SA].demand - off.by_id[SA].demand == 4
 
 
 # -- ALB and Lambda -------------------------------------------------------------------------
@@ -367,13 +453,18 @@ def test_load_reads_the_inputs_from_a_snapshot(db_path, snapshot_builder, ips):
     rows = result.by_id
     # subnet-a /27: 27 usable, 7 IPs used -> 20 free. ASG: 14 more over 2 subnets, the
     # remainder-free split 7 / 7. ECS: max 5, running 1 -> 4 more in subnet-a (its task's
-    # subnet). Lambda: fn-a has no ENI in subnet-a with sg-a yet -> +1.
+    # subnet); its deploy surge (maxPercent unset: 200) 5 extra there. Lambda: fn-a has no
+    # ENI in subnet-a with sg-a yet -> +1.
     assert [(c.kind, c.ips) for c in rows[SA].contributors] == [
         ("asg", 7),
+        ("surge", 5),
         ("ecs", 4),
         ("lambda", 1),
     ]
-    assert (rows[SA].free, rows[SA].demand, rows[SA].status) == (20, 12, hr.OK)  # 8 of 27 left
+    assert (rows[SA].free, rows[SA].demand, rows[SA].status) == (20, 17, hr.TIGHT)  # 3 left
+    with closing(db_path) as conn:
+        off = hr.for_snapshot(conn, b.id, include_surge=False).by_id[SA]
+    assert (off.demand, off.status) == (12, hr.OK)  # 8 of 27 left
     # subnet-b: the ASG's 7 and the old ALB's reserve (subnet of its ENI).
     assert [(c.kind, c.name, c.ips) for c in rows[SB].contributors] == [
         ("alb", "alb-old", 8),
@@ -412,19 +503,28 @@ def test_headroom_page_overview_column_and_report_section(app, snapshot_builder,
     page = client.get("/headroom").get_data(as_text=True)
     assert page.index(f'id="{SA}"') < page.index(f'id="{SB}"')  # worst first
     assert "ASG web: +20 (max 41, now 1" in page
-    assert "Short by 5 IPs at max scale" in page
-    # 7 IPs used + 25 at max scale need a /26.
+    assert "ECS service cluster-a/api deploy surge: +5, maxPercent 200" in page
+    assert "Short by 10 IPs at max scale" in page
+    assert re.search(r'name="surge" value="1" checked', page)  # the toggle defaults on
+    # 7 IPs used + 30 at max scale need a /26.
     assert "/cidr-planner?vpc=vpc-a&amp;size=26&amp;az=us-east-1a" in page
     assert "AZ imbalance" in page
 
+    # Toggle off (the form's hidden surge=0 alone): no surge contributor.
+    off = client.get("/headroom?surge=0").get_data(as_text=True)
+    assert "deploy surge:" not in off and "Short by 5 IPs at max scale" in off
+    assert not re.search(r'name="surge" value="1" checked', off)
+    on = client.get("/headroom?surge=0&surge=1").get_data(as_text=True)
+    assert "deploy surge: +5" in on
+
     overview = client.get("/").get_data(as_text=True)
     assert "<th title=" in overview and ">Headroom</th>" in overview
-    assert f'href="/headroom#{SA}"' in overview and "over · -5 left" in overview
+    assert f'href="/headroom#{SA}"' in overview and "over · -10 left" in overview
 
     report = client.get("/report").get_data(as_text=True)
     assert '<section id="scale-headroom">' in report
     section = report.split('<section id="scale-headroom">', 1)[1].split("</section>", 1)[0]
-    assert "Short by 5 IPs at max scale" in section
+    assert "Short by 10 IPs at max scale" in section
     assert 'CIDR Planner: VPC <span class="mono">vpc-a</span>, a /26 in us-east-1a.' in section
 
 
@@ -535,6 +635,54 @@ def test_collector_stores_asgs_scalable_targets_and_subnets(aws_env, db_path):
     assert sum(c.ips for s in scale.subnets for c in s.contributors if c.kind == "asg") == 8
     for sid in (sa, sb):  # (moto's default VPC has subnets of its own)
         assert [c.ips for c in scale.by_id[sid].contributors if c.kind == "alb"] == [8]
+
+
+def test_collector_stores_max_percent_and_deployment_controller(aws_env, db_path):
+    sa, sb = aws_env["a"], aws_env["b"]
+    ecs = boto3.client("ecs", region_name=REGION)
+    net = {"awsvpcConfiguration": {"subnets": [sa, sb], "securityGroups": []}}
+    ecs.create_service(
+        cluster="cluster-a",
+        serviceName="worker",
+        taskDefinition="td-a",
+        desiredCount=4,
+        networkConfiguration=net,
+        deploymentConfiguration={"maximumPercent": 150, "minimumHealthyPercent": 100},
+    )
+    ecs.create_service(
+        cluster="cluster-a",
+        serviceName="bluegreen",
+        taskDefinition="td-a",
+        desiredCount=4,
+        networkConfiguration=net,
+        deploymentController={"type": "CODE_DEPLOY"},
+        deploymentConfiguration={"maximumPercent": 200},
+    )
+    # moto drops deploymentConfiguration: set it on its service models (serialized as is).
+    for svc in ecs_backends[DEFAULT_ACCOUNT_ID][REGION].services.values():
+        pct = {"worker": 150, "bluegreen": 200}.get(svc.name)
+        if pct:
+            svc.deployment_configuration = {"maximumPercent": pct, "minimumHealthyPercent": 100}
+    result = Collector(_gateway(), db_path).run()
+    with closing(db_path) as conn:
+        rows = {
+            r["service"]: (r["max_percent"], r["deployment_controller"])
+            for r in conn.execute(
+                "SELECT service, max_percent, deployment_controller FROM ecs_services "
+                "WHERE snapshot_id=?",
+                (result.snapshot_id,),
+            )
+        }
+        scale = hr.for_snapshot(conn, result.snapshot_id)
+    assert rows["worker"] == (150, "ECS")
+    assert rows["bluegreen"] == (200, "CODE_DEPLOY")
+    surge = Counter()
+    for s in scale.subnets:
+        for c in s.contributors:
+            if c.kind == "surge":
+                surge[c.name] += c.ips
+    # worker: ceil(4 * 50 / 100) = 2; bluegreen: none (not a rolling deployment).
+    assert surge["cluster-a/worker"] == 2 and "cluster-a/bluegreen" not in surge
 
 
 @pytest.mark.parametrize(

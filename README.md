@@ -206,6 +206,12 @@ here of 12 more over 2 subnets, 1 ENI per instance)":
   instances (1 when none is in the snapshot).
 - **ECS service** (awsvpc): `max - running` tasks spread the same way, 1 IP each. The maximum is
   the service's Application Auto Scaling target; without one it is the desired count.
+- **ECS deploy surge** (own contributor, e.g. "ECS service c/api deploy surge: +4, maxPercent
+  200: ..."): a rolling deployment starts new tasks before stopping old ones, so a service at its
+  maximum needs `ceil(max × (maximumPercent − 100) / 100)` extra tasks, spread the same way.
+  `maximumPercent` defaults to 200 when unset; blue/green (`CODE_DEPLOY`) and `EXTERNAL`
+  deployments, and `maximumPercent` ≤ 100, add none. The page's **include deploy surge** toggle
+  (on by default) leaves it out.
 - **ALB**: AWS needs at least 8 free IPs per ALB subnet to scale, so 8 are reserved per subnet.
 - **Lambda**: invocations take no IPs; only a subnet / security group combination without an ENI
   yet costs 1 IP.
