@@ -49,7 +49,7 @@ From a checkout (development):
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e ".[dev,mcp]"
 ```
 
 ## Run
@@ -61,6 +61,7 @@ iplens --home /path/to/data    # another data directory (default: $IPLENS_HOME o
 iplens --no-browser            # do not open the browser
 iplens --debug                 # Flask development server with the debugger (development only)
 iplens check --help            # pre-deploy IP fit check for CI (no web UI, see below)
+iplens mcp --help              # read-only MCP server for AI assistants (extra: aws-iplens[mcp])
 ```
 
 IPLens is served by [waitress](https://docs.pylonsproject.org/projects/waitress/) and prints one
@@ -382,6 +383,73 @@ iplens-fit-check:
 ```
 
 `--format json` instead gives a report for other tools (`jq '.subnets[] | select(.status != "fits")'`).
+
+## MCP server (AI assistants)
+
+`iplens mcp` is a read-only [MCP](https://modelcontextprotocol.io) server over stdio, so an AI
+assistant can answer "where do 40 more IPs fit?" or "who holds 10.1.2.3?" from your IPLens data.
+It is an optional extra built on the official MCP Python SDK:
+
+```bash
+pipx install 'aws-iplens[mcp]'        # or: python3 -m pip install 'aws-iplens[mcp]'
+iplens mcp --help
+```
+
+**Read-only, local only.** The server reads the local SQLite database (`--home`, default
+`$IPLENS_HOME` or `~/.iplens`) through a read-only connection, from the latest successful
+snapshot of the account. It never calls AWS (the process refuses to even import boto3) and never
+writes anything; run a Refresh in the UI to update the data. Every result carries
+`snapshot_taken_at`.
+
+| tool | answers |
+|---|---|
+| `list_subnets(vpc?, az?, limit?, offset?)` | id, name, CIDR, used / idle / free IPs, headroom status (ok / tight / over); paginated |
+| `find_subnet(need_ips, vpc?, az?)` | subnets where `need_ips` fit at max scale, most headroom left first |
+| `subnet_detail(subnet)` | usage, top consumers, headroom contributors with assumptions, exhaustion forecast |
+| `lookup_ip(ip)` | ENI, owning resource, ownership and subnet; or free / reserved by AWS |
+| `changes(since="latest-1")` | snapshot diff summary; `since`: `latest-N`, a snapshot id or an ISO date |
+| `fit_check(subnet, need, min_free_pct?, include_surge?)` | exactly `iplens check --subnet --need` against the latest snapshot and the saved rules |
+
+Subnets and VPCs can be given by id or by name. Options:
+
+- `--account ACCOUNT`: IPLens account id, AWS account id or display name (default: the account
+  active in the UI).
+- `--redact`: hide AWS account ids, ARNs, ENI / instance ids, IP addresses and CIDRs (shown as
+  `<cidr>/24`) in every result and error; subnets, VPCs and security groups are shown by name
+  (numbered `name#2` when names repeat), and those names are accepted as input.
+
+**VS Code** (`.vscode/mcp.json` in a workspace, or *MCP: Open User Configuration*):
+
+```json
+{
+  "servers": {
+    "iplens": {
+      "type": "stdio",
+      "command": "iplens",
+      "args": ["mcp", "--redact"]
+    }
+  }
+}
+```
+
+**Claude Code**:
+
+```bash
+claude mcp add iplens -- iplens mcp
+claude mcp add iplens-prod -- iplens mcp --account prod --redact   # another account, redacted
+```
+
+**Hermes** (`~/.hermes/config.yaml`):
+
+```yaml
+mcp_servers:
+  iplens:
+    command: iplens
+    args: ["mcp", "--redact"]
+```
+
+When `iplens` is not on the client's `PATH` (e.g. a virtualenv), use the absolute path of the
+command, such as `/path/to/.venv/bin/iplens`.
 
 ## Alerts
 

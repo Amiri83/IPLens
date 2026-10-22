@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `iplens mcp`: a read-only stdio MCP server (optional extra `aws-iplens[mcp]`, official MCP
+  Python SDK) over the local database. Tools: `list_subnets`, `find_subnet`, `subnet_detail`,
+  `lookup_ip`, `changes` and `fit_check` (the `iplens check` logic); JSON results with the
+  snapshot time, paginated where long. `--account` picks the account, `--redact` hides account
+  ids, ARNs, ENI / instance ids, IPs and CIDRs in every result and error. Never calls AWS (the
+  process refuses to import boto3) and never writes (read-only SQLite connection). README setup
+  for VS Code, Claude Code and Hermes.
+
 ## 1.2.3 – 2026-10-21
 
 ### Added
