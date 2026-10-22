@@ -50,7 +50,13 @@ def aws_env():
             PrivateIpAddress="10.0.1.50",
             Groups=[sg],
             Description="example detached",
-            SecondaryPrivateIpAddressCount=2,
+            # Explicit secondaries: SecondaryPrivateIpAddressCount makes moto draw random
+            # subnet IPs that can collide with the primary (or each other) and get deduped.
+            PrivateIpAddresses=[
+                {"PrivateIpAddress": "10.0.1.50", "Primary": True},
+                {"PrivateIpAddress": "10.0.1.51", "Primary": False},
+                {"PrivateIpAddress": "10.0.1.52", "Primary": False},
+            ],
         )["NetworkInterface"]["NetworkInterfaceId"]
         lambda_eni = ec2.create_network_interface(
             SubnetId=sb,
@@ -144,12 +150,13 @@ def test_collect_snapshot(aws_env, db_path):
         assert inst_enis[0]["owner_ref"] == aws_env["instance_id"]
 
         detached_ips = [
-            r["ip"]
+            (r["ip"], r["is_primary"])
             for r in conn.execute(
-                "SELECT ip FROM ips WHERE eni_id=? ORDER BY ip_int", (aws_env["detached"],)
+                "SELECT ip, is_primary FROM ips WHERE eni_id=? ORDER BY ip_int",
+                (aws_env["detached"],),
             )
         ]
-        assert len(detached_ips) == 3 and "10.0.1.50" in detached_ips
+        assert detached_ips == [("10.0.1.50", 1), ("10.0.1.51", 0), ("10.0.1.52", 0)]
 
         fns = {r["name"]: r for r in conn.execute("SELECT * FROM lambdas")}
         assert fns["example-fn"]["vpc_id"] == aws_env["vpc_id"]
