@@ -188,6 +188,9 @@ header .scope-indicator { align-self: center; display: flex; gap: .3rem; align-i
                           font-size: 12px; white-space: nowrap; }
 header .scope-indicator a { color: var(--nav-warn); font-weight: 700; }
 header .scope-indicator button { padding: .1rem .45rem; font-size: 12px; }
+/* MCP server status badge in the header (Settings → MCP server). */
+header .mcp-badge { align-self: center; text-decoration: none; }
+.mcp-status th { text-align: left; width: 9rem; }
 .refresh-form { gap: .5rem; align-items: center; }
 .refresh-form select { max-width: 320px; }
 .no-data button { margin: 0 .4rem; }

@@ -70,10 +70,10 @@ def configure_logging(log_dir: Path, level: int = logging.INFO) -> Path:
 
 
 def read_log(
-    log_dir: Path, *, min_level: str = "", q: str = "", limit: int = 500
+    log_dir: Path, *, min_level: str = "", q: str = "", limit: int = 500, file: str = LOG_FILE
 ) -> list[dict[str, str]]:
-    """Return the newest ``limit`` matching entries (newest first)."""
-    path = log_dir / LOG_FILE
+    """Return the newest ``limit`` matching entries of ``log_dir / file`` (newest first)."""
+    path = log_dir / file
     if not path.exists():
         return []
     threshold = LEVELS.index(min_level) if min_level in LEVELS else 0

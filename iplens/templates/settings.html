@@ -205,6 +205,102 @@
   </form>
 </section>
 
+{% macro snippet(id, text) -%}
+  <div class="tf-snippet">
+    <button type="button" class="secondary" data-copy="#{{ id }}">Copy</button>
+    <pre class="mono" id="{{ id }}">{{ text }}</pre>
+  </div>
+{%- endmacro %}
+{% set st = mcp_status %}
+<section class="card" id="mcp" data-status-url="{{ url_for('mcp_status') }}">
+  <h2 style="margin-top: 0">MCP server</h2>
+  <p class="muted">Serves the read-only <span class="mono">iplens mcp</span> tools (subnet usage, headroom, IP
+    lookup, snapshot diffs, fit check) over Streamable HTTP to editors and AI assistants. It runs as a separate
+    process started by IPLens, reads the local database only and never calls AWS. Every request needs the bearer
+    token below; requests from a browser page of another origin are rejected.</p>
+  {% if not mcp_available %}<div class="flash warn">{{ mcp_extra_hint }}</div>{% endif %}
+  {% if mcp.allow_remote and mcp.remote %}
+    <div class="flash warn mcp-remote-warning"><b>Remote access is enabled:</b> the MCP server listens on
+      <span class="mono">{{ mcp.host }}</span> and is reachable from other machines. The bearer token is its only
+      protection and plain HTTP is not encrypted: use it only on a trusted network.</div>
+  {% endif %}
+  <table class="mcp-status">
+    <tr><th>Status</th><td><span id="mcp-state" class="badge {{ {'running': 'ok', 'starting': 'warn', 'error': 'err'}.get(st.state, '') }}">{{ st.state }}</span>
+      {% if st.retries %}<span class="muted small">retry {{ st.retries }}/{{ st.max_retries }}</span>{% endif %}</td></tr>
+    <tr><th>PID</th><td class="mono" data-mcp-field="pid">{{ st.pid or '—' }}</td></tr>
+    <tr><th>URL</th><td class="mono" data-mcp-field="url">{{ st.url or mcp.url }}</td></tr>
+    <tr><th>Uptime</th><td data-mcp-field="uptime_text">{{ st.uptime_text or '—' }}</td></tr>
+    <tr><th>Last error</th><td class="mono small" data-mcp-field="last_error">{{ st.last_error or '—' }}</td></tr>
+    <tr><th>Log</th><td><a href="{{ url_for('logs', source='mcp') }}">MCP server log</a>
+      <span class="muted mono small">{{ st.log_file }}</span></td></tr>
+  </table>
+  <div class="row">
+    {% for action, label, cls in (('start', 'Start', ''), ('restart', 'Restart', 'secondary'), ('stop', 'Stop', 'danger')) %}
+    <form class="inline" method="post" action="{{ url_for('mcp_' ~ action) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="{{ cls }}"{% if (action == 'start' and (st.state in ('running', 'starting') or not mcp_available)) or (action == 'restart' and not mcp_available) or (action == 'stop' and st.state not in ('running', 'starting')) %} disabled{% endif %}>{{ label }}</button>
+    </form>
+    {% endfor %}
+  </div>
+
+  <form method="post" action="{{ url_for('mcp_save') }}" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <h3>Settings</h3>
+    <label class="check"><input type="checkbox" name="enabled" value="1" {{ 'checked' if mcp.enabled }}>
+      Start the MCP server with IPLens</label>
+    <div class="row">
+      <div><label for="mcp-host">Host</label>
+        <input id="mcp-host" name="host" value="{{ mcp.host }}" size="20" class="mono" required></div>
+      <div><label for="mcp-port">Port</label>
+        <input id="mcp-port" name="port" type="number" value="{{ mcp.port }}" min="1024" max="65535" size="6" required></div>
+      <div><label for="mcp-account">Account</label>
+        <select id="mcp-account" name="account">
+          <option value="" {{ 'selected' if not mcp.account }}>(the account active in the UI)</option>
+          {% for c in accounts %}<option value="{{ c.id }}" {{ 'selected' if mcp.account == c.id | string }}>{{ c.label }} · {{ c.account.region }}</option>{% endfor %}
+          {% if mcp.account and mcp.account not in accounts | map(attribute='id') | map('string') | list %}<option value="{{ mcp.account }}" selected>{{ mcp.account }}</option>{% endif %}
+        </select></div>
+    </div>
+    <label class="check"><input type="checkbox" name="redact" value="1" {{ 'checked' if mcp.redact }}>
+      Redact: hide account ids, ARNs, ENI / instance ids, IPs and CIDRs (names only)</label>
+    <label class="check"><input type="checkbox" name="allow_remote" value="1" {{ 'checked' if mcp.allow_remote }}>
+      Allow remote access (a non-loopback host such as <span class="mono">0.0.0.0</span>)</label>
+    <p class="muted small">Local only (127.0.0.1) by default. The port must be free; saving restarts the server
+      if it is running.</p>
+    <p><button type="submit">Save MCP settings</button></p>
+  </form>
+
+  <h3>Token</h3>
+  {% if mcp_new_token %}
+    <div class="flash ok">Copy the new token now: it is shown only once.</div>
+    {{ snippet('mcp-token', mcp_new_token) }}
+  {% elif mcp_has_token %}
+    <p class="small">A token is set <span class="badge">encrypted</span> <span class="muted">— it is shown only
+      when generated; regenerate it if you lost it.</span></p>
+  {% else %}
+    <p class="small muted">No token yet: one is generated on the first start (or now).</p>
+  {% endif %}
+  <form method="post" action="{{ url_for('mcp_token') }}"
+        {% if mcp_has_token %}onsubmit="return confirm('Generate a new token? Clients using the old one stop working.')"{% endif %}>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="secondary">{{ 'Regenerate token' if mcp_has_token else 'Generate token' }}</button>
+  </form>
+  <p class="muted small">Encrypted at rest like the account credentials. The server process gets it in its
+    environment, never on its command line.</p>
+
+  <h3 id="mcp-connect">Connect</h3>
+  <p class="small"><b>VS Code</b> — <span class="mono">.vscode/mcp.json</span> (VS Code asks for the token once
+    and keeps it):</p>
+  {{ snippet('mcp-vscode', mcp_vscode) }}
+  <p class="small"><b>Claude Code</b> — set <span class="mono">{{ mcp_token_env }}</span> to the token in your
+    shell first (it is expanded there, so it stays out of the shell history):</p>
+  {{ snippet('mcp-claude', mcp_claude) }}
+  <p class="small"><b>stdio alternative</b> — no HTTP server and no token: the client starts
+    <span class="mono">iplens mcp</span> itself (on this machine).</p>
+  {{ snippet('mcp-stdio-vscode', mcp_stdio.vscode) }}
+  {{ snippet('mcp-stdio-claude', mcp_stdio.claude) }}
+</section>
+<script src="{{ url_for('static', filename='copy.js') }}" defer></script>
+
 <section class="card" id="terraform">
   <h2 style="margin-top: 0">Terraform state</h2>
   <p class="muted">Load one or more <span class="mono">.tfstate</span> files or

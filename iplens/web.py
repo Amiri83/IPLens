@@ -75,7 +75,16 @@ from .export import XLSX_MIMETYPE, ips_to_xlsx
 from .extended import EVIDENCE_HELP, EVIDENCE_LABELS, EVIDENCE_LEVELS, ExtendedCrawler, latest_crawl
 from .jobs import KINDS as JOB_KINDS
 from .jobs import JobBusy, JobCancelled, JobContext, JobFailed, JobManager, Progress
-from .logging_setup import LEVELS, configure_logging, read_log
+from .logging_setup import LEVELS, LOG_FILE, configure_logging, read_log
+from .mcpconfig import (
+    TOKEN_ENV,
+    McpSettings,
+    McpStore,
+    claude_code_command,
+    stdio_configs,
+    vscode_config,
+)
+from .mcpcontrol import McpController, McpStartError
 from .queries import LB_ICONS, TYPE_ICONS
 from .settings import (
     DEFAULT_RESOURCE_TIMEOUT,
@@ -137,6 +146,10 @@ OWN_FILTERS = {
     ownership.FILTER_UNMANAGED: ownership.SOURCE_LABELS[ownership.UNMANAGED],
 }
 MAX_CRAWL_WARNINGS_FLASHED = 8
+# Logs page: which log file is shown.
+LOG_SOURCES = {"": "IPLens", "mcp": "MCP server"}
+# Session key: id of a newly generated MCP token to show once (see mcp_reveal).
+MCP_REVEAL_KEY = "mcp_reveal"
 
 
 def _ip_literal(name: str) -> bool:
@@ -241,6 +254,7 @@ def create_app(
     terraform_runner: tfrepo.Runner | None = None,
     scheduler_enabled: bool | None = None,
     allow_remote: bool = False,
+    mcp_autostart: bool | None = None,
 ) -> Flask:
     """Build the app. ``port`` is the port the server listens on; when given,
     the Host header must be ``127.0.0.1:<port>`` or ``localhost:<port>``.
@@ -248,7 +262,9 @@ def create_app(
     (default: the cancellable :func:`tfrepo.run_process`) are for tests; the command
     allowlist applies to both. ``scheduler_enabled`` (default: not ``testing``) starts the
     scheduled-Refresh thread (:mod:`iplens.scheduler`). ``allow_remote`` (``iplens
-    --allow-remote``) also accepts IP-address Host headers (see :func:`host_allowed`)."""
+    --allow-remote``) also accepts IP-address Host headers (see :func:`host_allowed`).
+    ``mcp_autostart`` (default: like ``scheduler_enabled``) starts the MCP HTTP server
+    child process when Settings → MCP server has it enabled."""
     paths = default_paths(home).ensure()
     init_db(paths.db_path)
     box = SecretBox.from_path(paths.key_path)
@@ -280,6 +296,12 @@ def create_app(
         "jobs": JobManager(paths.db_path),
         # Settings -> Alerts (the webhook URL is encrypted with the credentials' key).
         "alerts": alerts.AlertStore(paths.db_path, box),
+        # Settings → MCP server (the token is encrypted with the credentials' key) and
+        # the HTTP server child process.
+        "mcp_store": McpStore(paths.db_path, box),
+        "mcp": McpController(paths.home, lambda: app.extensions["iplens"]["log_dir"]),
+        # One-time display of a newly generated MCP token: reveal id -> token.
+        "mcp_reveal": {},
     }
     apply_log_dir(app, store.load())
     log.info("IPLens started (data dir %s)", paths.home)
@@ -291,23 +313,72 @@ def create_app(
         app.extensions["iplens"]["start_scheduled_refresh"],
     )
     app.extensions["iplens"]["scheduler"] = sched
-    if scheduler_enabled if scheduler_enabled is not None else not testing:
+    background = scheduler_enabled if scheduler_enabled is not None else not testing
+    if background:
         sched.start()
+    if mcp_autostart if mcp_autostart is not None else background:
+        autostart_mcp(app)
     return app
+
+
+def mcp_available() -> bool:
+    """True if the ``mcp`` extra (the MCP SDK) is installed."""
+    import importlib.util
+
+    return importlib.util.find_spec("mcp") is not None
+
+
+MCP_EXTRA_HINT = "the MCP server needs the mcp extra: pip install 'aws-iplens[mcp]'"
+
+
+def start_mcp(app: Flask, *, restart: bool = False) -> tuple[McpSettings, str | None]:
+    """Start (or restart) the MCP server child with the saved settings: (settings, the
+    token when it was generated just now). McpStartError if it cannot start."""
+    ext = app.extensions["iplens"]
+    settings: McpSettings = ext["mcp_store"].load()
+    if not mcp_available():
+        raise McpStartError(MCP_EXTRA_HINT)
+    if ext["port"] is not None and settings.port == ext["port"]:
+        raise McpStartError(f"port {settings.port} is the port of IPLens itself")
+    token, generated = ext["mcp_store"].ensure_token()
+    if generated:
+        log.info("mcp token generated")
+    ctl: McpController = ext["mcp"]
+    if restart:
+        ctl.restart(settings, token)
+    else:
+        ctl.start(settings, token)
+    return settings, token if generated else None
+
+
+def autostart_mcp(app: Flask) -> None:
+    """Start the MCP server with IPLens when Settings → MCP server has it enabled; a
+    failure is logged and shown in the UI (the server's status), never raised."""
+    if not app.extensions["iplens"]["mcp_store"].load().enabled:
+        return
+    try:
+        _, generated = start_mcp(app)
+    except McpStartError as exc:
+        log.error("mcp server not started: %s", exc)
+        return
+    if generated:  # shown once on the Settings page
+        app.extensions["iplens"]["mcp_reveal"]["autostart"] = generated
 
 
 def shutdown_app(app: Flask, timeout: float = 10.0) -> None:
     """Stop the app's background work (server shutdown): the scheduled-Refresh thread,
     running jobs (cancelled, waited for up to ``timeout`` seconds) and any terraform
-    process still left."""
+    process still left, and the MCP server child process."""
     ext = app.extensions["iplens"]
     ext["scheduler"].stop()
+    mcp_stopped = ext["mcp"].stop()
     cancelled = ext["jobs"].shutdown(timeout)
     stopped = tfrepo.stop_all_processes()
     log.info(
-        "IPLens stopped (%d job(s) cancelled, %d terraform process(es) stopped)",
+        "IPLens stopped (%d job(s) cancelled, %d terraform process(es) stopped%s)",
         len(cancelled),
         stopped,
+        ", MCP server stopped" if mcp_stopped else "",
     )
 
 
@@ -559,7 +630,15 @@ def _register(app: Flask) -> None:
             "header_snap": _snapshot_or_none(),
             "account_label": snapshot_label,
             "scope_count": _scope_config().count if active else 0,
+            # Header badge: the MCP server's status (when enabled or not stopped).
+            "mcp_header": _mcp_header(),
         }
+
+    def _mcp_header() -> dict[str, Any] | None:
+        status = _ext()["mcp"].status()
+        if status["state"] == "stopped" and not _ext()["mcp_store"].load().enabled:
+            return None
+        return status
 
     @app.template_filter("pct")
     def _pct(v: float) -> str:
@@ -1767,8 +1846,12 @@ def _register(app: Flask) -> None:
         level = request.args.get("level", "")
         q = request.args.get("q", "")
         limit = min(max(request.args.get("limit", 500, type=int), 1), 5000)
+        source = request.args.get("source", "")
+        source = source if source in LOG_SOURCES else ""
         log_dir = _ext()["log_dir"]
-        entries = read_log(log_dir, min_level=level, q=q, limit=limit)
+        # The MCP server child writes its stdout / stderr to its own file.
+        path = _ext()["mcp"].log_path if source == "mcp" else log_dir / LOG_FILE
+        entries = read_log(path.parent, min_level=level, q=q, limit=limit, file=path.name)
         return render_template(
             "logs.html",
             entries=entries,
@@ -1777,6 +1860,9 @@ def _register(app: Flask) -> None:
             limit=limit,
             levels=LEVELS,
             log_dir=log_dir,
+            log_path=path,
+            source=source,
+            sources=LOG_SOURCES,
         )
 
     # -- settings and accounts ---------------------------------------------------------
@@ -1827,7 +1913,110 @@ def _register(app: Flask) -> None:
             },
             alert_formats=alerts.FORMAT_LABELS,
             forecast_window=forecast_mod.DEFAULT_WINDOW_DAYS,
+            **_mcp_context(),
         )
+
+    # -- MCP server (HTTP, child process) ------------------------------------------------
+
+    def _mcp_context() -> dict[str, Any]:
+        ext = _ext()
+        mcp_settings: McpSettings = ext["mcp_store"].load()
+        # A token generated just now (by this browser session, or by the autostart) is
+        # shown once; it is never kept in the session cookie, only its reveal id.
+        reveal = ext["mcp_reveal"]
+        new_token = reveal.pop(session.pop(MCP_REVEAL_KEY, ""), None) or reveal.pop(
+            "autostart", None
+        )
+        home = _paths().home
+        return {
+            "mcp": mcp_settings,
+            "mcp_status": ext["mcp"].status(),
+            "mcp_available": mcp_available(),
+            "mcp_extra_hint": MCP_EXTRA_HINT,
+            "mcp_has_token": ext["mcp_store"].has_token(),
+            "mcp_new_token": new_token,
+            "mcp_token_env": TOKEN_ENV,
+            "mcp_vscode": vscode_config(mcp_settings.url),
+            "mcp_claude": claude_code_command(mcp_settings.url),
+            "mcp_stdio": stdio_configs(
+                mcp_settings, None if home == default_paths().home else home
+            ),
+        }
+
+    def _mcp_reveal(token: str | None) -> None:
+        if token:
+            reveal_id = secrets.token_urlsafe(16)
+            _ext()["mcp_reveal"][reveal_id] = token
+            session[MCP_REVEAL_KEY] = reveal_id
+
+    def _mcp_start(restart: bool = False) -> bool:
+        try:
+            settings, generated = start_mcp(current_app, restart=restart)
+        except McpStartError as exc:
+            log.warning("mcp server not started: %s", exc)
+            flash(f"MCP server not started: {exc}", "error")
+            return False
+        _mcp_reveal(generated)
+        log.info("mcp server %s on %s (UI)", "restarted" if restart else "started", settings.url)
+        flash(f"MCP server {'restarting' if restart else 'starting'} on {settings.url}", "ok")
+        return True
+
+    def _mcp_back():
+        return redirect(url_for("settings_page") + "#mcp")
+
+    @app.post("/settings/mcp")
+    def mcp_save():
+        f = request.form
+        try:
+            saved = _ext()["mcp_store"].save(
+                enabled=f.get("enabled") == "1",
+                host=f.get("host", ""),
+                port=f.get("port", ""),
+                redact=f.get("redact") == "1",
+                account=f.get("account", ""),
+                allow_remote=f.get("allow_remote") == "1",
+            )
+        except ValueError as exc:
+            flash(f"MCP settings not saved: {exc}", "error")
+            return _mcp_back()
+        log.info("mcp settings saved: %r", saved)
+        flash("MCP settings saved", "ok")
+        if _ext()["mcp"].running:  # apply them now
+            _mcp_start(restart=True)
+        return _mcp_back()
+
+    @app.post("/settings/mcp/token")
+    def mcp_token():
+        token = _ext()["mcp_store"].regenerate_token()
+        log.info("mcp token regenerated")
+        _mcp_reveal(token)
+        flash("New MCP token generated: the old one no longer works.", "ok")
+        if _ext()["mcp"].running:
+            _mcp_start(restart=True)
+        return _mcp_back()
+
+    @app.post("/mcp/start")
+    def mcp_start():
+        _mcp_start()
+        return _mcp_back()
+
+    @app.post("/mcp/restart")
+    def mcp_restart():
+        _mcp_start(restart=True)
+        return _mcp_back()
+
+    @app.post("/mcp/stop")
+    def mcp_stop():
+        if _ext()["mcp"].stop():
+            log.info("mcp server stopped from the UI")
+            flash("MCP server stopped", "ok")
+        else:
+            flash("The MCP server was not running", "warn")
+        return _mcp_back()
+
+    @app.get("/mcp/status")
+    def mcp_status():
+        return jsonify(_ext()["mcp"].status())
 
     # -- alerts (webhook) -------------------------------------------------------------
 

@@ -45,6 +45,12 @@
       · {{ active_account.status }}
     {% endif %}
   </span>
+  {% if mcp_header %}
+  {% set m = mcp_header %}
+  <a id="mcp-badge" class="mcp-badge badge {{ {'running': 'ok', 'starting': 'warn', 'error': 'err'}.get(m.state, '') }}"
+     href="{{ url_for('settings_page') }}#mcp" data-status-url="{{ url_for('mcp_status') }}" data-state="{{ m.state }}"
+     title="MCP server: {{ m.state }}{% if m.url %} · {{ m.url }}{% endif %}{% if m.last_error %} · {{ m.last_error }}{% endif %}">MCP {{ m.state }}{% if m.remote and m.state != 'stopped' %} · remote{% endif %}</a>
+  {% endif %}
   {% if scope_count %}
   <form class="scope-indicator" method="post" action="{{ url_for('scope_clear') }}">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -120,5 +126,6 @@
 </div>
 <button type="button" id="job-badge" class="job-badge" hidden></button>
 <script src="{{ url_for('static', filename='jobs.js') }}" defer></script>
+<script src="{{ url_for('static', filename='mcp.js') }}" defer></script>
 </body>
 </html>

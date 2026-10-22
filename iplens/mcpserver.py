@@ -1,26 +1,53 @@
-"""``iplens mcp``: a read-only stdio MCP server over the local IPLens database.
+"""``iplens mcp``: a read-only MCP server over the local IPLens database.
 
 Needs the optional extra: ``pip install 'aws-iplens[mcp]'`` (the official ``mcp`` SDK).
 The tools (:mod:`iplens.mcptools`) read the local SQLite database only, through a
 read-only connection; the server never calls AWS (the process refuses to import the AWS
-SDK, see :func:`iplens.mcptools.block_aws_sdk`) and never writes anything. stdout is the
-protocol channel: messages for people go to stderr.
+SDK, see :func:`iplens.mcptools.block_aws_sdk`) and never writes anything.
+
+The default transport is stdio: stdout is the protocol channel, messages for people go to
+stderr. ``--http`` serves the same tools over Streamable HTTP (see :mod:`iplens.mcphttp`)
+behind a required bearer token, read from ``$IPLENS_MCP_TOKEN`` or else the token stored
+(encrypted) by Settings → MCP server.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
+import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 from . import __version__
 from .config import default_paths
-from .mcptools import DEFAULT_LIMIT, DEFAULT_TOP, ToolInputError, Tools, block_aws_sdk
+from .mcpconfig import (
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    TOKEN_ENV,
+    check_token,
+    is_loopback,
+    parse_port,
+    read_token,
+)
+from .mcptools import (
+    DEFAULT_LIMIT,
+    DEFAULT_TOP,
+    ToolInputError,
+    Tools,
+    block_aws_sdk,
+    open_readonly,
+)
 
 if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
 
 INSTALL_HINT = "iplens mcp needs the mcp extra: pip install 'aws-iplens[mcp]'"
+# Set by IPLens for its child server: the server stops when that process is gone.
+PARENT_PID_ENV = "IPLENS_MCP_PARENT_PID"
+PARENT_POLL_SECONDS = 1.0
 
 INSTRUCTIONS = """\
 IPLens: private IPv4 usage of AWS subnets, from the latest IPLens snapshot on this machine
@@ -35,9 +62,10 @@ what changed between snapshots."""
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="iplens mcp",
-        description="Read-only MCP server (stdio) over the local IPLens database: subnet "
-        "usage, headroom, IP lookup, snapshot diffs and the fit check. Never calls AWS, "
-        "never writes.",
+        description="Read-only MCP server over the local IPLens database: subnet usage, "
+        "headroom, IP lookup, snapshot diffs and the fit check. Never calls AWS, never "
+        "writes. stdio by default; --http serves Streamable HTTP with a bearer token "
+        f"(${TOKEN_ENV}, else the token of Settings → MCP server).",
     )
     parser.add_argument(
         "--home", default=None, help="data directory (default: $IPLENS_HOME or ~/.iplens)"
@@ -53,8 +81,70 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="hide account ids, ARNs, ENI / instance ids, IPs and CIDRs; show names only",
     )
+    http = parser.add_argument_group("HTTP transport")
+    http.add_argument("--http", action="store_true", help="serve Streamable HTTP instead of stdio")
+    http.add_argument(
+        "--host", default=None, help=f"bind address (default: {DEFAULT_HOST}, local only)"
+    )
+    http.add_argument("--port", default=None, help=f"port (default: {DEFAULT_PORT})")
+    http.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow a non-loopback --host (the bearer token is the only protection)",
+    )
     parser.add_argument("--version", action="version", version=f"iplens {__version__}")
     return parser
+
+
+def remote_warning(host: str, port: int) -> str:
+    return (
+        f"WARNING: iplens mcp is listening on {host}:{port} and is reachable from other "
+        "machines; the bearer token is its only protection and HTTP is not encrypted. Use "
+        "--allow-remote only on a trusted network."
+    )
+
+
+_NO_TOKEN = f"no MCP token: generate one in IPLens (Settings → MCP server) or set ${TOKEN_ENV}"
+
+
+def resolve_token(home: Any) -> str:
+    """The bearer token: ``$IPLENS_MCP_TOKEN``, else the stored one (read-only: the key
+    file is never created here). ValueError if there is none."""
+    from_env = os.environ.get(TOKEN_ENV, "")
+    if from_env:
+        return check_token(from_env)
+    paths = default_paths(home)
+    if not (paths.key_path.exists() or os.environ.get("IPLENS_SECRET_KEY")):
+        raise ValueError(_NO_TOKEN)
+    from .crypto import SecretBox
+
+    try:
+        conn = open_readonly(paths.db_path)
+    except ToolInputError as exc:
+        raise ValueError(str(exc)) from None
+    try:
+        token = read_token(conn, SecretBox.from_path(paths.key_path))
+    finally:
+        conn.close()
+    if not token:
+        raise ValueError(_NO_TOKEN)
+    return token
+
+
+def watch_parent(pid: int, poll: float = PARENT_POLL_SECONDS) -> threading.Thread:
+    """Stop this process (SIGTERM to itself, a graceful shutdown) once process ``pid``,
+    IPLens, is gone: the server never outlives the app that started it."""
+
+    def run() -> None:
+        while True:
+            time.sleep(poll)
+            if os.getppid() != pid:
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+
+    thread = threading.Thread(target=run, name="iplens-mcp-parent", daemon=True)
+    thread.start()
+    return thread
 
 
 def build_server(tools: Tools) -> MCPServer:
@@ -141,7 +231,21 @@ def build_server(tools: Tools) -> MCPServer:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.http and (args.host or args.port or args.allow_remote):
+        parser.error("--host, --port and --allow-remote need --http")
+    host = (args.host or DEFAULT_HOST).strip().removeprefix("[").removesuffix("]")
+    try:
+        port = parse_port(args.port or DEFAULT_PORT)
+    except ValueError as exc:
+        parser.error(str(exc))
+    remote = not is_loopback(host)
+    if args.http and remote and not args.allow_remote:
+        parser.error(
+            f"refusing to listen on non-loopback host {host!r}: pass --allow-remote to do "
+            "it anyway (the bearer token is the only protection)"
+        )
     # Before anything else is imported: the server process must never load the AWS SDK.
     block_aws_sdk()
     try:
@@ -155,5 +259,37 @@ def main(argv: list[str] | None = None) -> int:
     except ToolInputError as exc:
         print(f"iplens mcp: error: {exc}", file=sys.stderr)
         return 2
-    build_server(tools).run("stdio")
+    if not args.http:
+        build_server(tools).run("stdio")
+        return 0
+    return _serve_http(args, tools, host, port, remote)
+
+
+def _serve_http(args: argparse.Namespace, tools: Tools, host: str, port: int, remote: bool) -> int:
+    from . import mcphttp
+
+    try:
+        token = resolve_token(args.home)
+    except ValueError as exc:
+        print(f"iplens mcp: error: {exc}", file=sys.stderr)
+        return 2
+    mcphttp.configure_logging()
+    try:
+        sock = mcphttp.bind(host, port)
+    except OSError as exc:
+        print(
+            f"iplens mcp: error: cannot listen on {host}:{port}: {exc.strerror or exc}",
+            file=sys.stderr,
+        )
+        return 2
+    if remote:
+        print(remote_warning(host, port), file=sys.stderr, flush=True)
+    parent = os.environ.get(PARENT_PID_ENV, "")
+    if parent.isdigit():
+        watch_parent(int(parent))
+    try:
+        asgi = mcphttp.app(build_server(tools), token, host, port, args.allow_remote)
+        mcphttp.serve(sock, asgi, host, port)
+    finally:
+        sock.close()
     return 0
