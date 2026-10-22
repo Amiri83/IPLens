@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0 – 2026-10-21
 
 ### Added
 
@@ -57,7 +57,7 @@
   with botocore read timeouts split to fit each (3 attempts × read timeout ≤ the timeout,
   connect timeout ≤ 10 s).
 
-## 1.0.1 – unreleased
+## 1.0.1
 
 ### Changed
 
@@ -118,7 +118,7 @@
   warning that there is no authentication and accepts IP-address `Host` headers (hostnames other
   than `localhost` stay rejected as DNS-rebinding protection).
 
-## 1.0.0 – unreleased
+## 1.0.0
 
 First public release, published to PyPI as `aws-iplens` (command `iplens`).
 
