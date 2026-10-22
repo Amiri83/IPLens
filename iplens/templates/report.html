@@ -166,6 +166,7 @@ footer { margin-top: 2rem; color: var(--muted); font-size: 11px; border-top: 1px
       <div class="muted">{{ r.blocked | length }} suggestion(s)</div></div>
   </div>
   <p class="muted">Estimates; alternative suggestions for the same resources can overlap. IPLens never changes AWS.</p>
+  {% for n in r.suggestion_notes %}<div class="note">{{ n }}</div>{% endfor %}
   {% for title, items, blocked in (("Allowed", r.allowed, False), ("Blocked by rule", r.blocked, True)) %}
     <h3 id="suggestions-{{ 'blocked' if blocked else 'allowed' }}">{{ title }}</h3>
     <table>
@@ -190,8 +191,8 @@ footer { margin-top: 2rem; color: var(--muted); font-size: 11px; border-top: 1px
   <h2>Scale headroom</h2>
   {% set sc = r.scale %}{% set c = sc.counts %}
   <p class="muted">Free IPs of each subnet against the worst case: Auto Scaling groups and ECS services at
-    their maximum (new instances / tasks spread evenly over their subnets), {{ alb_reserve }} free IPs kept per
-    ALB subnet and 1 IP per new Lambda subnet / security group combination. <b>tight</b>: less than
+    their maximum (new instances / tasks spread evenly over their subnets), {{ alb_reserve }} IPs per ALB per
+    subnet and 1 IP per new Lambda subnet / security group combination. <b>tight</b>: less than
     {{ tight_pct | int }}% of the subnet's usable IPs left at max scale; <b>over</b>: runs out before max.</p>
   {% for n in sc.notes %}<div class="note">{{ n }}</div>{% endfor %}
   <div class="tiles">

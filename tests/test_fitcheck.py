@@ -145,7 +145,7 @@ def test_each_plan_item_carries_its_assumption():
     texts = {(i.address, i.subnet_id): i.assumption for i in demand.items}
     assert texts[("aws_instance.web", SA)] == "1 ENI per instance: its primary network interface"
     assert texts[("aws_nat_gateway.ngw", SC)] == "1 IP for the NAT gateway's ENI"
-    assert "≥ 8 free IPs per subnet" in texts[("aws_lb.app", SA)]
+    assert texts[("aws_lb.app", SA)] == "ALB: 8 IPs per ALB per subnet"
     assert texts[("aws_lb.nlb", SC)] == "NLB: 1 ENI per subnet"
     assert texts[("aws_vpc_endpoint.ssm", SA)] == "Interface endpoint: 1 ENI per subnet"
     assert "Hyperplane ENI" in texts[("aws_lambda_function.fn_a", SB)]
@@ -752,8 +752,9 @@ def test_export_rules_for_ci_keeps_this_accounts_rules(app, tmp_path):
 
 @pytest.fixture
 def aws_env():
-    """Two subnets in 192.0.2.0/24, an ASG over both (max 6), an awsvpc ECS service, a
-    Lambda ENI for (subnet a, sg) and an ALB ENI in subnet b."""
+    """Two subnets in 192.0.2.0/24, an ASG over both (max 6), an awsvpc ECS service
+    (desired 2, auto scaling max 4), a Lambda ENI for (subnet a, sg) and an ALB ENI in
+    subnet b."""
     with mock_aws():
         ec2 = boto3.client("ec2", region_name=REGION)
         vpc_id = ec2.create_vpc(CidrBlock="192.0.2.0/24")["Vpc"]["VpcId"]
@@ -794,6 +795,13 @@ def aws_env():
             networkConfiguration={
                 "awsvpcConfiguration": {"subnets": [sa, sb], "securityGroups": [sg]}
             },
+        )
+        boto3.client("application-autoscaling", region_name=REGION).register_scalable_target(
+            ServiceNamespace="ecs",
+            ResourceId="service/cluster-a/api",
+            ScalableDimension="ecs:service:DesiredCount",
+            MinCapacity=1,
+            MaxCapacity=4,
         )
         ec2.create_network_interface(
             SubnetId=sa, Groups=[sg], Description="AWS Lambda VPC ENI-fn-a-0abc1234"
@@ -848,11 +856,42 @@ def test_live_mode_matches_snapshot_mode(aws_env, app, tmp_path, capsys, monkeyp
     live = _subnet_rows(out_live)
     assert code == code_live == 0
     assert live == from_snapshot
-    # ASG: 6 - 2 = 4 more, 2 per subnet; ECS: max = desired 2, running 0 -> 1 per subnet,
-    # surge 2 -> 1 per subnet; plan: the instance in a, the Lambda only in b (a has an ENI).
-    assert live[sa][1:3] == (2 + 1 + 1, 1) and live[sb][1:3] == (2 + 1 + 1, 1)
-    notes = json.loads(out_live)["notes"]
-    assert any("DescribeScalableTargets was skipped in the live check" in n for n in notes)
+    # ASG: 6 - 2 = 4 more, 2 per subnet; ECS: the scalable target's max 4, running 0 -> 2
+    # per subnet, surge 4 -> 2 per subnet; plan: the instance in a, the Lambda only in b
+    # (a has an ENI).
+    assert live[sa][1:3] == (2 + 2 + 2, 1) and live[sb][1:3] == (2 + 2 + 2, 1)
+    data = json.loads(out_live)
+    assert not any("DescribeScalableTargets" in n for n in data["notes"])
+    ecs = [h for s in data["subnets"] for h in s["headroom"] if h["kind"] == "ecs"]
+    assert ecs and all("max 4" in h["assumption"] for h in ecs)
+
+
+def test_live_mode_without_application_autoscaling_counts_to_desired(
+    aws_env, tmp_path, capsys, monkeypatch
+):
+    real_client = aws_mod.AwsGateway.client
+
+    def no_scaling(self, service, **kw):
+        if service == "application-autoscaling":
+            raise fitlive.ClientError(
+                {"Error": {"Code": "AccessDeniedException", "Message": "no"}},
+                "DescribeScalableTargets",
+            )
+        return real_client(self, service, **kw)
+
+    monkeypatch.setattr(aws_mod.AwsGateway, "client", no_scaling)
+    code, out, _ = _run(
+        capsys, "--subnet", aws_env["a"], "--need", "1", "--region", REGION, "--format", "json"
+    )
+    assert code == 0
+    data = json.loads(out)
+    ecs = [h for h in data["subnets"][0]["headroom"] if h["kind"] == "ecs"]
+    assert ecs[0]["ips"] == 1 and "scaling unknown, max = desired 2" in ecs[0]["assumption"]
+    assert (
+        "application-autoscaling:DescribeScalableTargets failed (AccessDeniedException)."
+        in (data["notes"])
+    )
+    assert any("DescribeScalableTargets was skipped in the live check" in n for n in data["notes"])
 
 
 def test_live_mode_only_reads_the_involved_subnets(aws_env, tmp_path, capsys, monkeypatch):
@@ -878,6 +917,7 @@ def test_live_mode_only_reads_the_involved_subnets(aws_env, tmp_path, capsys, mo
         ("ecs", "ListClusters"),
         ("ecs", "ListServices"),
         ("ecs", "DescribeServices"),
+        ("application-autoscaling", "DescribeScalableTargets"),
     }
     # The EC2 calls are filtered to the one subnet (the serialized query of the request).
     ec2_bodies = [p["body"] for svc, _op, p in calls if svc == "ec2"]
@@ -885,8 +925,12 @@ def test_live_mode_only_reads_the_involved_subnets(aws_env, tmp_path, capsys, mo
     for body in ec2_bodies:
         filters = {k: v for k, v in body.items() if k.startswith("Filter.")}
         assert filters == {"Filter.1.Name": "subnet-id", "Filter.1.Value.1": aws_env["b"]}
+    # The scalable targets are those of the services found in the subnet.
+    scaling = [p["body"] for svc, _op, p in calls if svc == "application-autoscaling"]
+    assert len(scaling) == 1
+    assert json.loads(scaling[0])["ResourceIds"] == ["service/cluster-a/api"]
     # The Refresh timeouts: the required resources get at least 120s, the others --timeout.
-    assert timeouts == [120, 20, 20]
+    assert timeouts == [120, 20, 20, 20]
 
 
 def test_live_mode_alb_and_skipped_sources(aws_env, tmp_path, capsys, monkeypatch):

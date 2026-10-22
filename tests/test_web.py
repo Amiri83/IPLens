@@ -141,8 +141,10 @@ def test_test_connection_and_refresh(client):
     # moto has no alias and no override is set: header shows the account id only
     assert "<b>123456789012</b> · us-east-1" in page
 
+    # One snapshot only: the detached ENI is not suggested before a week of history.
     page = client.get("/suggestions").data.decode()
-    assert "Delete detached ENI" in page
+    assert "Delete detached ENI" not in page
+    assert "Detached ENIs (1 detached now): not checked yet" in page
 
     page = client.get("/logs?q=collection").data.decode()
     assert "collection finished" in page

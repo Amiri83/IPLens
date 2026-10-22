@@ -19,7 +19,7 @@ from moto import mock_aws
 
 from iplens import aws as aws_mod
 from iplens import collector as collector_mod
-from iplens import jobs
+from iplens import jobs, queries
 from iplens import settings as settings_mod
 from iplens.aws import AwsGateway
 from iplens.collector import Collector
@@ -523,11 +523,13 @@ def test_changed_resource_timeout_is_honoured_without_restart(app, client, monke
 def test_refresh_endpoint_passes_the_skipped_types_to_the_collector(app, client, monkeypatch):
     _aws()
     seen = []
+    sources = []
     real_init = Collector.__init__
 
-    def init(self, *args, only=None, **kwargs):
+    def init(self, *args, only=None, source_snapshot=None, **kwargs):
         seen.append(None if only is None else list(only))
-        real_init(self, *args, only=only, **kwargs)
+        sources.append(source_snapshot)
+        real_init(self, *args, only=only, source_snapshot=source_snapshot, **kwargs)
 
     monkeypatch.setattr(Collector, "__init__", init)
     manager = app.extensions["iplens"]["jobs"]
@@ -542,13 +544,23 @@ def test_refresh_endpoint_passes_the_skipped_types_to_the_collector(app, client,
     job = refresh({})
     assert seen[-1] is None
     assert "ec2:DescribeInstances" in {r["name"] for r in job["items"]}
-    # The retry copies the other resource types from that (latest) snapshot.
+    first = job["source_snapshot"]  # the snapshot this job wrote
+    with closing(app.extensions["iplens"]["paths"].db_path) as conn:
+        assert first == queries.latest_snapshot(conn)["id"]
+    # Without a source (a job from before it was recorded): the latest snapshot.
     job = refresh({"only": ["elasticloadbalancing:DescribeTags", "lambda:ListTags"]})
     assert seen[-1] == ["elasticloadbalancing:DescribeTags", "lambda:ListTags"]
+    assert sources[-1] == first
     assert job["state"] == jobs.DONE
     names = {r["name"] for r in job["items"]}
     assert {"lambda:ListTags", "lambda:ListFunctions", "elasticloadbalancing:DescribeTags"} <= names
     assert "ec2:DescribeInstances" not in names and "tag:GetResources" not in names
+    assert job["source_snapshot"] > first  # the retry's own, merged snapshot
+    # A newer Refresh meanwhile: the retry of the first job still builds on its snapshot.
+    refresh({})
+    job = refresh({"only": ["lambda:ListTags"], "source": str(first)})
+    assert sources[-1] == first and job["state"] == jobs.DONE
+    assert any(f"the rest from snapshot {first}" in line for line in job["log"])
 
 
 def test_progress_box_has_cancel_banner_and_retry(client):

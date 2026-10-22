@@ -1,15 +1,39 @@
-"""IP-optimization suggestions derived from a snapshot, filtered through rules."""
+"""IP-optimization suggestions derived from a snapshot, filtered through rules.
+
+Most suggestions look at the snapshot alone. Three also use the account's snapshot
+history (successful snapshots up to this one):
+
+- ``detached_eni``: the ENI is detached in *every* snapshot of the last
+  :data:`DETACHED_DAYS` days, shown with the date since when it has been.
+- ``underused_subnet``: the subnet is under :data:`UNDERUSED_PCT` % used in every
+  snapshot of the last :data:`UNDERUSED_DAYS` days; the suggested size is the smallest
+  prefix whose usable IPs fit twice the peak.
+- ``unused_endpoint``: an interface endpoint whose ENIs saw no traffic in the flow log
+  queries (Visual → Extended view → Flow logs) of the last ``endpoint_days`` days.
+
+A check that cannot be made (history shorter than its window, no flow log data for a
+VPC) adds a line to :attr:`Context.notes` instead of a suggestion.
+"""
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import sqlite3
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .queries import SubnetStats, VpcNode, subnet_stats, vpc_tree
+from .queries import (
+    AWS_RESERVED_HEAD,
+    AWS_RESERVED_TAIL,
+    SubnetStats,
+    VpcNode,
+    subnet_stats,
+    vpc_tree,
+)
 from .rules import Rule
 from .scope import UNSCOPED, ResolvedScope
 
@@ -24,9 +48,27 @@ VPC_CONSUMED_PCT = 70.0
 # this many IPs and it has not been deployed for this many days.
 ECS_IDLE_MIN_IPS = 8
 ECS_IDLE_DAYS = 30
+# An ENI is suggested for deletion once it was detached in every snapshot of these days.
+DETACHED_DAYS = 7
+# A subnet under this share used in every snapshot of these days is "underused"; the
+# suggested size fits UNDERUSED_HEADROOM times its peak usage.
+UNDERUSED_PCT = 10.0
+UNDERUSED_DAYS = 30
+UNDERUSED_HEADROOM = 2
+# AWS subnet sizes: /28 (smallest) to /16 (largest).
+SMALLEST_PREFIX, LARGEST_PREFIX = 28, 16
+# An interface endpoint without flow log traffic in this many days is "unused".
+UNUSED_ENDPOINT_DAYS = 14
+# A window counts as covered when its oldest snapshot is at most this far from its start
+# (daily snapshots cover a 7-day window with 7 of them).
+HISTORY_SLACK = timedelta(days=1)
+# SQLite variables per IN (...) list.
+_IN_BATCH = 500
 
 KIND_LABELS = {
     "detached_eni": "Detached ENI",
+    "underused_subnet": "Underused subnet",
+    "unused_endpoint": "Unused endpoint",
     "lambda_sg_combo": "Lambda SG combos",
     "lambda_subnet_spread": "Lambda subnet spread",
     "lambda_detach_vpc": "Lambda outside VPC",
@@ -53,6 +95,30 @@ class Context:
     taken_at: datetime | None = None
     # Every subnet of the snapshot, in scope or not (rules tell "absent" from "out of scope").
     all_subnet_ids: set[str] = field(default_factory=set)
+    # The account's successful snapshots up to this one (oldest first, this one included).
+    history: list[tuple[int, datetime]] = field(default_factory=list)
+    # ENI id -> snapshot id -> its status there (the ENIs detached in this snapshot).
+    eni_status: dict[str, dict[int, str]] = field(default_factory=dict)
+    # Subnet id -> snapshot id -> (IPs in use, usable IPs), over UNDERUSED_DAYS.
+    subnet_usage: dict[str, dict[int, tuple[int, int]]] = field(default_factory=dict)
+    # Flow log queries of the last ``endpoint_days`` days (see FlowRun).
+    flow_runs: list[FlowRun] = field(default_factory=list)
+    endpoint_days: int = UNUSED_ENDPOINT_DAYS
+    # Checks that could not be made (filled by generate).
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class FlowRun:
+    """One stored flow log query of a VPC (flowlogs.run): the endpoint ENIs that existed
+    in its snapshot and the ENIs it saw traffic of."""
+
+    snapshot_id: int
+    vpc_id: str
+    ran_at: datetime
+    window_minutes: int
+    present: frozenset[str]
+    seen: frozenset[str]
 
 
 @dataclass
@@ -67,6 +133,10 @@ class Suggestion:
     subnet_ids: list[str] = field(default_factory=list)
     target_subnets: dict[str, int] = field(default_factory=dict)
     eni_ids: list[str] = field(default_factory=list)
+    # Subnet id -> its usable IPs once resized (rules check the free share after it).
+    resized: dict[str, int] = field(default_factory=dict)
+    # detached_eni: the date of the first snapshot of its current detached run.
+    since: str = ""
     flags: set[str] = field(default_factory=set)
     blocked_by: list[tuple[str, str]] = field(default_factory=list)
 
@@ -80,14 +150,19 @@ class Suggestion:
 
 
 def build_context(
-    conn: sqlite3.Connection, snap_id: int, scope: ResolvedScope = UNSCOPED
+    conn: sqlite3.Connection,
+    snap_id: int,
+    scope: ResolvedScope = UNSCOPED,
+    *,
+    endpoint_days: int = UNUSED_ENDPOINT_DAYS,
 ) -> Context:
     """Everything suggestions and rules look at, limited to ``scope``.
 
     Out of scope: ENIs in other subnets (or, with IP ranges, without an address in
     range), Lambda functions without a subnet in scope (and every non-VPC function
     once a scope is set), endpoints / load balancers / ECS services without anything
-    left in scope. IP counts only count in-scope addresses.
+    left in scope. IP counts only count in-scope addresses. ``endpoint_days``: the
+    window of the unused endpoint check.
     """
     enis = {}
     for r in conn.execute("SELECT * FROM enis WHERE snapshot_id=?", (snap_id,)):
@@ -137,10 +212,20 @@ def build_context(
         live = {(m["cluster"], m["service"]) for m in ecs_task_enis}
         ecs_services = [s for s in ecs_services if (s["cluster"], s["service"]) in live]
 
-    snap = conn.execute("SELECT taken_at FROM snapshots WHERE id=?", (snap_id,)).fetchone()
+    snap = conn.execute(
+        "SELECT taken_at, account_ref FROM snapshots WHERE id=?", (snap_id,)
+    ).fetchone()
+    taken_at = _parse_ts(snap["taken_at"] if snap else None)
     stats = subnet_stats(conn, snap_id)
+    subnets = {s.subnet_id: s for s in stats if scope.subnet_ok(s.subnet_id)}
+    history = _history(conn, snap_id, snap["account_ref"] if snap else None, taken_at)
+    detached = [
+        e["eni_id"]
+        for e in enis.values()
+        if e["status"] == "available" and not e["requester_managed"]
+    ]
     return Context(
-        subnets={s.subnet_id: s for s in stats if scope.subnet_ok(s.subnet_id)},
+        subnets=subnets,
         all_subnet_ids={s.subnet_id for s in stats},
         enis=enis,
         eni_ip_count=counts,
@@ -150,8 +235,151 @@ def build_context(
         load_balancers=load_balancers,
         ecs_services=ecs_services,
         ecs_task_enis=ecs_task_enis,
-        taken_at=_parse_ts(snap["taken_at"] if snap else None),
+        taken_at=taken_at,
+        history=history,
+        eni_status=_eni_status(conn, history, detached),
+        subnet_usage=_subnet_usage(
+            conn, _window(history, taken_at, UNDERUSED_DAYS)[0], set(subnets)
+        ),
+        flow_runs=_flow_runs(
+            conn,
+            history,
+            taken_at,
+            endpoint_days,
+            {e for ep in endpoints for e in ep["eni_ids"]},
+        ),
+        endpoint_days=endpoint_days,
     )
+
+
+# -- history ------------------------------------------------------------------
+
+
+def _history(
+    conn: sqlite3.Connection, snap_id: int, account_ref: int | None, taken_at: datetime | None
+) -> list[tuple[int, datetime]]:
+    """(id, taken_at) of the account's successful snapshots up to ``snap_id``, oldest
+    first; ``snap_id`` itself is always the last one."""
+    out = []
+    for r in conn.execute(
+        "SELECT id, taken_at FROM snapshots WHERE account_ref IS ? AND status='ok' AND id<>?",
+        (account_ref, snap_id),
+    ):
+        ts = _parse_ts(r["taken_at"])
+        if ts is not None and taken_at is not None and ts <= taken_at:
+            out.append((r["id"], ts))
+    out.sort(key=lambda p: (p[1], p[0]))
+    if taken_at is not None:
+        out.append((snap_id, taken_at))
+    return out
+
+
+def _window(
+    history: list[tuple[int, datetime]], taken_at: datetime | None, days: int
+) -> tuple[list[tuple[int, datetime]], bool]:
+    """The snapshots of the last ``days`` days (oldest first) and whether they span the
+    window: its oldest snapshot is within :data:`HISTORY_SLACK` of the window start."""
+    if taken_at is None:
+        return [], False
+    start = taken_at - timedelta(days=days)
+    window = [(i, ts) for i, ts in history if ts >= start]
+    return window, bool(window) and window[0][1] <= start + HISTORY_SLACK
+
+
+def _batches(values: Iterable[Any]) -> Iterable[list[Any]]:
+    items = sorted(set(values))
+    for i in range(0, len(items), _IN_BATCH):
+        yield items[i : i + _IN_BATCH]
+
+
+def _eni_status(
+    conn: sqlite3.Connection, history: list[tuple[int, datetime]], eni_ids: list[str]
+) -> dict[str, dict[int, str]]:
+    ids = {i for i, _ in history}
+    out: dict[str, dict[int, str]] = defaultdict(dict)
+    for batch in _batches(eni_ids):
+        marks = ",".join("?" * len(batch))
+        for r in conn.execute(
+            f"SELECT snapshot_id, eni_id, status FROM enis WHERE eni_id IN ({marks})",  # noqa: S608
+            batch,
+        ):
+            if r["snapshot_id"] in ids:
+                out[r["eni_id"]][r["snapshot_id"]] = r["status"] or ""
+    return dict(out)
+
+
+def _usable(cidr: str) -> int:
+    size = ipaddress.IPv4Network(cidr).num_addresses
+    return max(size - AWS_RESERVED_HEAD - AWS_RESERVED_TAIL, 0)
+
+
+def _subnet_usage(
+    conn: sqlite3.Connection, window: list[tuple[int, datetime]], subnet_ids: set[str]
+) -> dict[str, dict[int, tuple[int, int]]]:
+    """Subnet -> snapshot -> (distinct IPs held, idle ENIs included; usable IPs) for the
+    snapshots of ``window`` the subnet exists in."""
+    out: dict[str, dict[int, tuple[int, int]]] = defaultdict(dict)
+    for batch in _batches(i for i, _ in window):
+        marks = ",".join("?" * len(batch))
+        used = {
+            (r["snapshot_id"], r["subnet_id"]): r["n"]
+            for r in conn.execute(
+                "SELECT snapshot_id, subnet_id, COUNT(DISTINCT ip) AS n FROM ips "  # noqa: S608
+                f"WHERE snapshot_id IN ({marks}) GROUP BY snapshot_id, subnet_id",
+                batch,
+            )
+        }
+        for r in conn.execute(
+            f"SELECT snapshot_id, subnet_id, cidr FROM subnets WHERE snapshot_id IN ({marks})",  # noqa: S608
+            batch,
+        ):
+            if r["subnet_id"] in subnet_ids:
+                key = (r["snapshot_id"], r["subnet_id"])
+                out[r["subnet_id"]][r["snapshot_id"]] = (used.get(key, 0), _usable(r["cidr"]))
+    return dict(out)
+
+
+def _flow_runs(
+    conn: sqlite3.Connection,
+    history: list[tuple[int, datetime]],
+    taken_at: datetime | None,
+    days: int,
+    endpoint_enis: set[str],
+) -> list[FlowRun]:
+    """The flow log queries run in the last ``days`` days on snapshots of ``history``."""
+    if taken_at is None:
+        return []
+    ids = {i for i, _ in history}
+    start = taken_at - timedelta(days=days)
+    runs = []
+    for r in conn.execute(
+        "SELECT snapshot_id, vpc_id, ran_at, window_minutes FROM flow_runs ORDER BY ran_at"
+    ):
+        ran_at = _parse_ts(r["ran_at"])
+        if r["snapshot_id"] in ids and ran_at is not None and ran_at >= start:
+            runs.append((r["snapshot_id"], r["vpc_id"], ran_at, int(r["window_minutes"] or 0)))
+    seen: dict[tuple[int, str], set[str]] = defaultdict(set)
+    present: dict[int, set[str]] = defaultdict(set)
+    for batch in _batches(s for s, *_ in runs):
+        marks = ",".join("?" * len(batch))
+        for r in conn.execute(
+            "SELECT snapshot_id, vpc_id, src_eni, dst_eni FROM flow_aggregates "  # noqa: S608
+            f"WHERE snapshot_id IN ({marks})",
+            batch,
+        ):
+            seen[(r["snapshot_id"], r["vpc_id"])].update((r["src_eni"], r["dst_eni"]))
+        if not endpoint_enis:
+            continue
+        for r in conn.execute(
+            f"SELECT snapshot_id, eni_id FROM enis WHERE snapshot_id IN ({marks})",  # noqa: S608
+            batch,
+        ):
+            if r["eni_id"] in endpoint_enis:
+                present[r["snapshot_id"]].add(r["eni_id"])
+    return [
+        FlowRun(s, vpc, ran_at, minutes, frozenset(present[s]), frozenset(seen[(s, vpc)]))
+        for s, vpc, ran_at, minutes in runs
+    ]
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -167,11 +395,43 @@ def _parse_ts(value: str | None) -> datetime | None:
 # -- generators ---------------------------------------------------------------
 
 
+def _day(ts: datetime) -> str:
+    return ts.strftime("%Y-%m-%d")
+
+
+def _short_history(what: str, days: int, window: list[tuple[int, datetime]]) -> str:
+    back = f"only goes back to {_day(window[0][1])}" if window else "is empty"
+    return (
+        f"{what}: not checked yet; it needs snapshots spanning the last {days} days and "
+        f"the account's history {back}."
+    )
+
+
 def _detached_enis(ctx: Context) -> list[Suggestion]:
-    out = []
-    for eni in ctx.enis.values():
-        if eni["status"] != "available" or eni["requester_managed"]:
+    """ENIs detached in every snapshot of the last DETACHED_DAYS days."""
+    detached = [
+        e for e in ctx.enis.values() if e["status"] == "available" and not e["requester_managed"]
+    ]
+    if not detached:
+        return []
+    window, covered = _window(ctx.history, ctx.taken_at, DETACHED_DAYS)
+    if not covered:
+        ctx.notes.append(
+            _short_history(f"Detached ENIs ({len(detached)} detached now)", DETACHED_DAYS, window)
+        )
+        return []
+    out, recent = [], 0
+    for eni in detached:
+        status = ctx.eni_status.get(eni["eni_id"], {})
+        if any(status.get(i) != "available" for i, _ in window):
+            recent += 1
             continue
+        # The first snapshot of the run of detached snapshots that ends with this one.
+        since = window[-1][1]
+        for i, ts in reversed(ctx.history):
+            if status.get(i) != "available":
+                break
+            since = ts
         n = ctx.eni_ip_count.get(eni["eni_id"], 0)
         label = eni.get("name") or eni.get("description") or "no description"
         out.append(
@@ -180,11 +440,119 @@ def _detached_enis(ctx: Context) -> list[Suggestion]:
                 kind="detached_eni",
                 title=f"Delete detached ENI {eni['eni_id']}",
                 detail=f"ENI '{label}' in {eni['subnet_id']} is not attached to anything "
-                f"but holds {n} private IP(s).",
+                f"(detached since {_day(since)}, in every snapshot of the last "
+                f"{DETACHED_DAYS} days) but holds {n} private IP(s).",
                 vpc_id=eni["vpc_id"] or "",
                 ips_saved=n,
                 subnet_ids=[eni["subnet_id"]] if eni["subnet_id"] else [],
                 eni_ids=[eni["eni_id"]],
+                since=_day(since),
+            )
+        )
+    if recent:
+        ctx.notes.append(
+            f"Detached ENIs: {recent} ENI(s) detached now were attached (or absent) in a "
+            f"snapshot of the last {DETACHED_DAYS} days; not suggested yet."
+        )
+    return out
+
+
+def fit_prefix(need: int) -> int | None:
+    """The longest (smallest) subnet prefix whose usable IPs hold ``need``; None if not
+    even a /16 does."""
+    for prefix in range(SMALLEST_PREFIX, LARGEST_PREFIX - 1, -1):
+        if 2 ** (32 - prefix) - AWS_RESERVED_HEAD - AWS_RESERVED_TAIL >= need:
+            return prefix
+    return None
+
+
+def _underused_subnets(ctx: Context) -> list[Suggestion]:
+    """Subnets under UNDERUSED_PCT % used in every snapshot of the last UNDERUSED_DAYS."""
+    if not ctx.subnets:
+        return []
+    window, covered = _window(ctx.history, ctx.taken_at, UNDERUSED_DAYS)
+    if not covered:
+        ctx.notes.append(_short_history("Underused subnets", UNDERUSED_DAYS, window))
+        return []
+    out = []
+    for sid, st in sorted(ctx.subnets.items()):
+        usage = ctx.subnet_usage.get(sid, {})
+        points = [usage.get(i) for i, _ in window]
+        if any(p is None or not p[1] or 100.0 * p[0] / p[1] >= UNDERUSED_PCT for p in points):
+            continue  # missing from a snapshot (newer than the window) or used enough
+        peak = max(p[0] for p in points if p)
+        current = ipaddress.IPv4Network(st.cidr).prefixlen
+        prefix = fit_prefix(peak * UNDERUSED_HEADROOM)
+        if prefix is None or prefix <= current:
+            continue
+        usable_after = _usable(f"0.0.0.0/{prefix}")
+        saved = st.usable - usable_after
+        peak_pct = max(100.0 * p[0] / p[1] for p in points if p)
+        out.append(
+            Suggestion(
+                key=f"underused:{sid}",
+                kind="underused_subnet",
+                title=f"Shrink underused subnet {sid} to a /{prefix}",
+                detail=f"{sid} ({st.cidr}, {st.usable} usable IPs) used at most {peak} IP(s) "
+                f"({peak_pct:.1f}%), under {UNDERUSED_PCT:g}% in each of {len(window)} "
+                f"snapshot(s) of the last {UNDERUSED_DAYS} days. A /{prefix} "
+                f"({usable_after} usable) fits {UNDERUSED_HEADROOM}× that peak; recreate the "
+                f"subnet at that size (a subnet cannot be resized in place) to return "
+                f"{saved} IPs to the VPC.",
+                vpc_id=st.vpc_id,
+                ips_saved=saved,
+                subnet_ids=[sid],
+                resized={sid: usable_after},
+            )
+        )
+    return out
+
+
+def _unused_endpoints(ctx: Context) -> list[Suggestion]:
+    """Interface endpoints whose ENIs no flow log query of the window saw traffic of."""
+    interface = [
+        e
+        for e in ctx.endpoints
+        if (e["endpoint_type"] or "").lower() == "interface" and e["eni_ids"]
+    ]
+    days = ctx.endpoint_days
+    runs: dict[str, list[FlowRun]] = defaultdict(list)
+    for r in ctx.flow_runs:
+        runs[r.vpc_id].append(r)
+    out = []
+    for vpc_id in sorted({e["vpc_id"] for e in interface} - set(runs)):
+        ctx.notes.append(
+            f"Unused endpoints in {vpc_id}: skipped, no flow log data from the last {days} "
+            "days (flow logs not enabled for the VPC, or not queried yet: Visual → Extended "
+            "view → Flow logs)."
+        )
+    for ep in sorted(interface, key=lambda e: e["endpoint_id"]):
+        enis = set(ep["eni_ids"])
+        checked = [r for r in runs.get(ep["vpc_id"], []) if enis & r.present]
+        if not checked:
+            if ep["vpc_id"] in runs:
+                ctx.notes.append(
+                    f"Unused endpoints: {ep['endpoint_id']} is newer than the flow log "
+                    f"queries of the last {days} days; not checked."
+                )
+            continue
+        if any(enis & r.seen for r in checked):
+            continue
+        hours = sum(r.window_minutes for r in checked) / 60
+        out.append(
+            Suggestion(
+                key=f"unused-endpoint:{ep['endpoint_id']}",
+                kind="unused_endpoint",
+                title=f"Remove unused interface endpoint {ep['endpoint_id']} "
+                f"({ep['service_name']})",
+                detail=f"No flow log traffic to or from its {len(enis)} ENI(s) in the last "
+                f"{days} days: {len(checked)} flow log quer{'y' if len(checked) == 1 else 'ies'} "
+                f"of {ep['vpc_id']} ({hours:g} h of traffic, the first on "
+                f"{_day(checked[0].ran_at)}) saw none.",
+                vpc_id=ep["vpc_id"],
+                ips_saved=_endpoint_ip_count(ctx, ep),
+                subnet_ids=sorted(ep["subnet_ids"]),
+                eni_ids=sorted(enis),
             )
         )
     return out
@@ -454,13 +822,18 @@ GENERATORS = (
     _detached_enis,
     _lambda,
     _endpoints,
+    _unused_endpoints,
     _az_imbalance,
     _secondary_cidr,
+    _underused_subnets,
     _ecs_idle,
 )
 
 
 def generate(ctx: Context, rules: list[Rule]) -> list[Suggestion]:
+    """Every suggestion, vetoed by ``rules``, allowed / most IPs first; the checks that
+    could not be made are in ``ctx.notes`` afterwards."""
+    ctx.notes = []
     suggestions: list[Suggestion] = []
     for gen in GENERATORS:
         suggestions.extend(gen(ctx))

@@ -32,9 +32,10 @@ def _db(app):
     return app.extensions["iplens"]["paths"].db_path
 
 
-def _seed(app, snapshot_builder, ips, days=(3, 2, 1, 0)):
-    """A small history; the latest snapshot has an almost full subnet, an allowed and a
-    rule-blocked detached ENI (whose description carries an ARN) and two environments."""
+def _seed(app, snapshot_builder, ips, days=(6.5, 3, 2, 1, 0)):
+    """A week of history; the latest snapshot has an almost full subnet, an allowed and a
+    rule-blocked detached ENI (whose description carries an ARN; both detached all week)
+    and two environments."""
     now = datetime.now(UTC)
     b = None
     for i, ago in enumerate(days):
@@ -46,22 +47,22 @@ def _seed(app, snapshot_builder, ips, days=(3, 2, 1, 0)):
         b.eni("eni-00000000a1", SA, ips("10.0.1.0", 10, 20 + 5 * i), owner_ref="i-0example0001")
         b.eni("eni-00000000b1", SB, ips("10.0.2.0", 10, 8), owner_ref="i-0example0002")
         b.eni("eni-00000000f1", SF, ips("10.0.3.0", 4, 10), name="ip-10-0-3-4.ec2.internal")
-    b.eni(
-        "eni-00000000d1",
-        SB,
-        ["10.0.2.200", "10.0.2.201"],
-        status="available",
-        owner_type="other",
-        description=f"example keep {ARN}",
-    )
-    b.eni(
-        "eni-00000000d2",
-        SB,
-        ["10.0.2.210", "10.0.2.211", "10.0.2.212"],
-        status="available",
-        owner_type="other",
-        description="example scratch",
-    )
+        b.eni(
+            "eni-00000000d1",
+            SB,
+            ["10.0.2.200", "10.0.2.201"],
+            status="available",
+            owner_type="other",
+            description=f"example keep {ARN}",
+        )
+        b.eni(
+            "eni-00000000d2",
+            SB,
+            ["10.0.2.210", "10.0.2.211", "10.0.2.212"],
+            status="available",
+            owner_type="other",
+            description="example scratch",
+        )
     b.tag("subnet", SA, "Environment", "prod").tag("subnet", SF, "Environment", "prod")
     b.tag("subnet", SB, "Environment", "dev")
     b.tag("eni", "eni-00000000a1", "Project", "example-project")

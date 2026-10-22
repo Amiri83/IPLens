@@ -3,8 +3,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from iplens import suggestions as sg
-from iplens.db import closing
+from iplens.db import closing, init_db
 from iplens.rules import Rule, normalize_params
+from iplens.web import create_app
+from tests.conftest import add_test_account, ip_range
 
 VPC = "vpc-0example0000001"
 SA, SA2, SB, SC = "subnet-0000000a", "subnet-000000a2", "subnet-0000000b", "subnet-0000000c"
@@ -14,6 +16,10 @@ S3 = "com.amazonaws.us-east-1.s3"
 
 @pytest.fixture
 def ctx(db_path, snapshot_builder, ips):
+    # A week ago the detached ENIs already were: they are suggested now.
+    old = snapshot_builder(db_path, taken_at=datetime.now(UTC) - timedelta(days=7))
+    old.vpc(VPC, "10.0.0.0/22").subnet(SA, VPC, "10.0.0.0/24", az="us-east-1a")
+    old.eni("eni-00000000d1", SA, ["10.0.0.220"], status="available", owner_type="other")
     b = snapshot_builder(db_path)
     b.vpc(VPC, "10.0.0.0/22")
     b.subnet(SA, VPC, "10.0.0.0/24", az="us-east-1a")
@@ -221,3 +227,288 @@ def test_no_az_suggestion_when_balanced(db_path, snapshot_builder, ips):
     with closing(db_path) as conn:
         items = sg.generate(sg.build_context(conn, b.id), [])
     assert items == []
+
+
+# -- history-based suggestions (placeholders: 192.0.2.0/24, example ids) ---------------------
+
+VPC_H = "vpc-0000000a"
+SH, SH2 = "subnet-0000000a", "subnet-0000000b"
+
+
+def _snap(db_path, snapshot_builder, days_ago: float, *, subnets=(SH,)):
+    b = snapshot_builder(db_path, taken_at=datetime.now(UTC) - timedelta(days=days_ago))
+    b.vpc(VPC_H, "192.0.2.0/24", name="test-vpc-a")
+    cidrs = {SH: "192.0.2.0/25", SH2: "192.0.2.128/26"}
+    for sid in subnets:
+        b.subnet(sid, VPC_H, cidrs[sid], name=f"test-{sid}")
+    return b
+
+
+def _context(db_path, snap_id, **kwargs):
+    with closing(db_path) as conn:
+        return sg.build_context(conn, snap_id, **kwargs)
+
+
+def _kind(items, kind):
+    return [s for s in items if s.kind == kind]
+
+
+def _day(days_ago: float) -> str:
+    return (datetime.now(UTC) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+
+def _fresh_db(tmp_path, name: str):
+    db = tmp_path / name
+    init_db(db)
+    add_test_account(db)
+    return db
+
+
+def test_detached_eni_needs_every_snapshot_of_the_week(db_path, snapshot_builder):
+    # Daily snapshots over 8 days: eni-...a1 detached throughout, a2 attached 3 days ago,
+    # a3 only in the last 2 days.
+    for ago in range(8, -1, -1):
+        b = _snap(db_path, snapshot_builder, ago)
+        b.eni("eni-000000a1", SH, ["192.0.2.10", "192.0.2.11"], status="available")
+        b.eni(
+            "eni-000000a2",
+            SH,
+            ["192.0.2.12"],
+            status="in-use" if ago == 3 else "available",
+            description="test-server-a",
+        )
+        if ago <= 1:
+            b.eni("eni-000000a3", SH, ["192.0.2.13"], status="available")
+    ctx = _context(db_path, b.id)
+    (s,) = _kind(sg.generate(ctx, []), "detached_eni")
+    assert s.key == "detached:eni-000000a1" and s.ips_saved == 2
+    assert s.since == _day(8) and f"detached since {_day(8)}" in s.detail
+    assert "in every snapshot of the last 7 days" in s.detail
+    assert any("2 ENI(s) detached now were attached (or absent)" in n for n in ctx.notes)
+
+
+def test_detached_eni_since_is_the_start_of_the_current_run(db_path, snapshot_builder):
+    # Detached 20 days ago, attached 12 days ago, detached again from 9 days ago on.
+    for ago, status in ((20, "available"), (12, "in-use"), (9, "available"), (4, "available")):
+        _snap(db_path, snapshot_builder, ago).eni("eni-000000a1", SH, ["192.0.2.10"], status=status)
+    b = _snap(db_path, snapshot_builder, 0)
+    b.eni("eni-000000a1", SH, ["192.0.2.10"], status="available")
+    # The week's oldest snapshot is 4 days old: the window is not covered yet.
+    assert not _kind(sg.generate(_context(db_path, b.id), []), "detached_eni")
+    _snap(db_path, snapshot_builder, 6.5).eni(
+        "eni-000000a1", SH, ["192.0.2.10"], status="available"
+    )
+    (s,) = _kind(sg.generate(_context(db_path, b.id), []), "detached_eni")
+    assert s.since == _day(9)
+
+
+def test_detached_eni_short_history_is_a_note(db_path, snapshot_builder):
+    for ago in (2, 0):
+        b = _snap(db_path, snapshot_builder, ago)
+        b.eni("eni-000000a1", SH, ["192.0.2.10"], status="available")
+    ctx = _context(db_path, b.id)
+    assert not _kind(sg.generate(ctx, []), "detached_eni")
+    assert (
+        "Detached ENIs (1 detached now): not checked yet; it needs snapshots spanning the last "
+        f"7 days and the account's history only goes back to {_day(2)}."
+    ) in ctx.notes
+
+
+def test_detached_eni_history_is_per_account(db_path, snapshot_builder):
+    other = add_test_account(db_path)
+    old = snapshot_builder(
+        db_path, taken_at=datetime.now(UTC) - timedelta(days=6.5), account_ref=other
+    )
+    old.vpc(VPC_H, "192.0.2.0/24").subnet(SH, VPC_H, "192.0.2.0/25")
+    old.eni("eni-000000a1", SH, ["192.0.2.10"], status="available")
+    b = _snap(db_path, snapshot_builder, 0)  # the first account: one snapshot only
+    b.eni("eni-000000a1", SH, ["192.0.2.10"], status="available")
+    assert not _kind(sg.generate(_context(db_path, b.id), []), "detached_eni")
+
+
+def _underused_history(db_path, snapshot_builder, used_by_day):
+    """Snapshots ``days ago``: subnet a (/25, 123 usable) holds ``n`` IPs, subnet b (/26,
+    59 usable) 30."""
+    b = None
+    for ago, n in used_by_day:
+        b = _snap(db_path, snapshot_builder, ago, subnets=(SH, SH2))
+        if n:
+            b.eni("eni-000000a1", SH, ip_range("192.0.2.0", 10, n), description="test-server-a")
+        b.eni("eni-000000b1", SH2, ip_range("192.0.2.128", 10, 30))
+    return b
+
+
+def test_underused_subnet_suggests_the_smallest_prefix_for_twice_the_peak(
+    db_path, snapshot_builder
+):
+    # Peak 7 IPs (5.7% of 123): 14 needed, a /28 (11 usable) is too small, a /27 (27) fits.
+    b = _underused_history(db_path, snapshot_builder, ((29.5, 3), (20, 7), (10, 5), (0, 4)))
+    items = sg.generate(_context(db_path, b.id), [])
+    (s,) = _kind(items, "underused_subnet")  # subnet b is ~51% used
+    assert s.key == f"underused:{SH}" and s.title == f"Shrink underused subnet {SH} to a /27"
+    assert s.ips_saved == 123 - 27 and s.resized == {SH: 27}
+    assert s.subnet_ids == [SH] and s.vpc_id == VPC_H
+    assert "used at most 7 IP(s) (5.7%)" in s.detail and "4 snapshot(s)" in s.detail
+    assert s.kind_label == "Underused subnet"
+    assert sg.totals(items)["allowed"] == 123 - 27
+
+
+def test_underused_subnet_needs_every_snapshot_under_ten_percent(db_path, snapshot_builder):
+    # 13 of 123 IPs (10.6%) in one snapshot of the window: not underused.
+    b = _underused_history(db_path, snapshot_builder, ((29.5, 3), (15, 13), (0, 4)))
+    assert not _kind(sg.generate(_context(db_path, b.id), []), "underused_subnet")
+
+
+def test_underused_subnet_skips_subnets_newer_than_the_window(db_path, snapshot_builder):
+    # Subnet b only appears in the latest snapshot; a is empty throughout.
+    _snap(db_path, snapshot_builder, 29.5)
+    b = _snap(db_path, snapshot_builder, 0, subnets=(SH, SH2))
+    items = _kind(sg.generate(_context(db_path, b.id), []), "underused_subnet")
+    assert [s.key for s in items] == [f"underused:{SH}"]
+    assert items[0].title.endswith("to a /28") and items[0].ips_saved == 123 - 11
+
+
+def test_underused_subnet_short_history_is_a_note(tmp_path, snapshot_builder):
+    db = _fresh_db(tmp_path, "short.db")
+    _snap(db, snapshot_builder, 10)
+    b = _snap(db, snapshot_builder, 0)
+    ctx = _context(db, b.id)
+    assert not _kind(sg.generate(ctx, []), "underused_subnet")
+    assert (
+        "Underused subnets: not checked yet; it needs snapshots spanning the last 30 days and "
+        f"the account's history only goes back to {_day(10)}."
+    ) in ctx.notes
+
+
+def test_underused_subnet_rules(db_path, snapshot_builder):
+    b = _underused_history(db_path, snapshot_builder, ((29.5, 5), (0, 5)))
+    free = Rule(name="free-60", kind="min_free_pct", params={"percent": 60, "subnet_ids": [SH]})
+    (s,) = _kind(sg.generate(_context(db_path, b.id), [free]), "underused_subnet")
+    # A /28 (11 usable) holding 5 IPs keeps 54.5% free.
+    assert s.blocked_by == [("free-60", f"{SH} resized would have 54.5% free (< 60%)")]
+    frozen = Rule(name="frozen", kind="subnet_reserved", params={"subnet_ids": [SH]})
+    items = sg.generate(_context(db_path, b.id), [frozen])
+    (s,) = _kind(items, "underused_subnet")
+    assert [n for n, _ in s.blocked_by] == ["frozen"]
+    assert sg.totals(items) == {"allowed": 0, "blocked": 123 - 11}
+
+
+@pytest.mark.parametrize(
+    "need, prefix", [(0, 28), (11, 28), (12, 27), (27, 27), (28, 26), (65531, 16), (65532, None)]
+)
+def test_fit_prefix(need, prefix):
+    assert sg.fit_prefix(need) == prefix
+
+
+EP_USED, EP_IDLE = "vpce-000000001", "vpce-000000002"
+SQS_H, KMS_H = "com.amazonaws.us-east-1.sqs", "com.amazonaws.us-east-1.kms"
+CLIENT_ENI = "eni-000000c1"
+
+
+def _endpoint_snapshot(db_path, snapshot_builder, ago, *, with_idle=True):
+    b = _snap(db_path, snapshot_builder, ago)
+    b.eni("eni-000000e1", SH, ["192.0.2.20"], owner_type="vpc_endpoint")
+    b.eni(CLIENT_ENI, SH, ["192.0.2.30"], description="test-server-a")
+    b.endpoint(EP_USED, VPC_H, SQS_H, [SH], ["eni-000000e1"])
+    if with_idle:
+        b.eni("eni-000000e2", SH, ["192.0.2.21", "192.0.2.22"], owner_type="vpc_endpoint")
+        b.endpoint(EP_IDLE, VPC_H, KMS_H, [SH], ["eni-000000e2"])
+    return b
+
+
+def _flow_run(db_path, snap_id, days_ago, pairs, window_minutes=60):
+    """A stored flow log query of the VPC (as flowlogs.run writes it) seeing ``pairs``."""
+    ran_at = datetime.now(UTC) - timedelta(days=days_ago)
+    with closing(db_path) as conn:
+        conn.execute(
+            "INSERT INTO flow_runs(snapshot_id, vpc_id, ran_at, window_minutes, rows) "
+            "VALUES(?,?,?,?,?)",
+            (snap_id, VPC_H, ran_at.isoformat(timespec="seconds"), window_minutes, len(pairs)),
+        )
+        conn.executemany(
+            "INSERT INTO flow_aggregates(snapshot_id, vpc_id, src_eni, dst_eni, protocol, port, "
+            "flows, bytes, packets) VALUES(?,?,?,?,'tcp',443,1,100,1)",
+            [(snap_id, VPC_H, src, dst) for src, dst in pairs],
+        )
+
+
+def test_unused_endpoint_from_flow_logs(db_path, snapshot_builder):
+    old = _endpoint_snapshot(db_path, snapshot_builder, 5)
+    _flow_run(db_path, old.id, 5, [(CLIENT_ENI, "eni-000000e1")], window_minutes=1440)
+    b = _endpoint_snapshot(db_path, snapshot_builder, 0)
+    _flow_run(db_path, b.id, 0, [(CLIENT_ENI, "outside")])
+    ctx = _context(db_path, b.id)
+    (s,) = _kind(sg.generate(ctx, []), "unused_endpoint")  # SQS had traffic 5 days ago
+    assert s.key == f"unused-endpoint:{EP_IDLE}" and s.ips_saved == 2
+    assert s.eni_ids == ["eni-000000e2"] and s.subnet_ids == [SH] and s.vpc_id == VPC_H
+    assert s.title == f"Remove unused interface endpoint {EP_IDLE} ({KMS_H})"
+    assert "in the last 14 days: 2 flow log queries" in s.detail
+    assert f"(25 h of traffic, the first on {_day(5)})" in s.detail
+    assert s.kind_label == "Unused endpoint"
+    assert not any("Unused endpoints" in n for n in ctx.notes)
+    # A protected ENI rule vetoes it like any other suggestion.
+    keep = Rule(name="keep-kms", kind="protected_eni", params={"pattern": "eni-000000e2"})
+    (s,) = _kind(sg.generate(ctx, [keep]), "unused_endpoint")
+    assert s.blocked_by == [("keep-kms", "eni-000000e2 is protected")]
+
+
+def test_unused_endpoint_without_flow_logs_is_a_note(db_path, snapshot_builder):
+    b = _endpoint_snapshot(db_path, snapshot_builder, 0)
+    ctx = _context(db_path, b.id)
+    assert not _kind(sg.generate(ctx, []), "unused_endpoint")
+    assert (
+        f"Unused endpoints in {VPC_H}: skipped, no flow log data from the last 14 days (flow "
+        "logs not enabled for the VPC, or not queried yet: Visual → Extended view → Flow logs)."
+    ) in ctx.notes
+
+
+def test_unused_endpoint_window(db_path, snapshot_builder):
+    # The only flow log query is 20 days old: outside the default 14 days, inside 30.
+    old = _endpoint_snapshot(db_path, snapshot_builder, 20)
+    _flow_run(db_path, old.id, 20, [])
+    b = _endpoint_snapshot(db_path, snapshot_builder, 0)
+    ctx = _context(db_path, b.id)
+    assert not _kind(sg.generate(ctx, []), "unused_endpoint")
+    assert any(n.startswith(f"Unused endpoints in {VPC_H}: skipped") for n in ctx.notes)
+    items = _kind(sg.generate(_context(db_path, b.id, endpoint_days=30), []), "unused_endpoint")
+    assert {s.key for s in items} == {f"unused-endpoint:{EP_USED}", f"unused-endpoint:{EP_IDLE}"}
+    assert all("in the last 30 days: 1 flow log query " in s.detail for s in items)
+
+
+def test_unused_endpoint_newer_than_the_queries_is_not_checked(db_path, snapshot_builder):
+    old = _endpoint_snapshot(db_path, snapshot_builder, 3, with_idle=False)
+    _flow_run(db_path, old.id, 3, [(CLIENT_ENI, "eni-000000e1")])
+    b = _endpoint_snapshot(db_path, snapshot_builder, 0)
+    ctx = _context(db_path, b.id)
+    assert not _kind(sg.generate(ctx, []), "unused_endpoint")
+    assert (
+        f"Unused endpoints: {EP_IDLE} is newer than the flow log queries of the last 14 days; "
+        "not checked."
+    ) in ctx.notes
+
+
+def test_new_kinds_on_the_page_and_in_the_report(tmp_path, snapshot_builder):
+    home = tmp_path / "home"
+    home.mkdir()
+    db = _fresh_db(home, "iplens.db")
+    _endpoint_snapshot(db, snapshot_builder, 29.5)
+    b = _endpoint_snapshot(db, snapshot_builder, 0)
+    _flow_run(db, b.id, 0, [(CLIENT_ENI, "eni-000000e1")])
+    client = create_app(home, testing=True).test_client()
+    page = client.get("/suggestions").data.decode()
+    assert "Underused subnet" in page and f"Shrink underused subnet {SH} to a /28" in page
+    assert f"Remove unused interface endpoint {EP_IDLE}" in page
+    report = client.get("/report").data.decode()
+    assert f"Remove unused interface endpoint {EP_IDLE}" in report
+    assert f"Shrink underused subnet {SH} to a /28" in report
+
+
+def test_notes_on_the_page_and_in_the_report(tmp_path, snapshot_builder):
+    home = tmp_path / "home"
+    home.mkdir()
+    db = _fresh_db(home, "iplens.db")
+    _endpoint_snapshot(db, snapshot_builder, 0)
+    client = create_app(home, testing=True).test_client()
+    note = f"Unused endpoints in {VPC_H}: skipped"
+    assert note in client.get("/suggestions").data.decode()
+    assert note in client.get("/report").data.decode()

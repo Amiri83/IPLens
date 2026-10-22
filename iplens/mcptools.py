@@ -31,6 +31,7 @@ from . import fitcheck, headroom, queries, trends
 from . import forecast as forecast_mod
 from . import rules as rules_mod
 from . import scope as scope_mod
+from . import suggestions as sugg_mod
 from .attribution import OWNER_LABELS
 from .checkcli import to_dict as check_to_dict
 from .db import ACTIVE_ACCOUNT_KEY, BUSY_TIMEOUT
@@ -726,6 +727,61 @@ def fit_check(
     return check_to_dict(result)
 
 
+# The unused endpoint window a client may ask for.
+MAX_ENDPOINT_DAYS = 365
+
+
+def _suggestion_dict(s: sugg_mod.Suggestion) -> dict[str, Any]:
+    return {
+        "kind": s.kind,
+        "type": s.kind_label,
+        "title": s.title,
+        "detail": s.detail,
+        "vpc": s.vpc_id,
+        "ips_saved": s.ips_saved,
+        "impact": s.impact or None,
+        "subnets": list(s.subnet_ids),
+        "eni_ids": list(s.eni_ids),
+        "since": s.since or None,
+        "status": "blocked" if s.blocked else "allowed",
+        "blocked_by": [{"rule": name, "reason": reason} for name, reason in s.blocked_by],
+    }
+
+
+def suggestions(
+    ctx: Ctx,
+    kind: str | None = None,
+    include_blocked: bool = True,
+    endpoint_days: int = sugg_mod.UNUSED_ENDPOINT_DAYS,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """The Suggestions page: IP-saving suggestions of the latest snapshot, vetoed by the
+    saved rules that apply to the account, allowed / most IPs first."""
+    days = int(endpoint_days)
+    if not 1 <= days <= MAX_ENDPOINT_DAYS:
+        raise ToolInputError(f"endpoint_days must be 1 to {MAX_ENDPOINT_DAYS}")
+    want = (kind or "").strip() or None
+    if want is not None and want not in sugg_mod.KIND_LABELS:
+        raise ToolInputError(
+            f"unknown kind {want!r}; kinds: {', '.join(sorted(sugg_mod.KIND_LABELS))}"
+        )
+    sctx = sugg_mod.build_context(ctx.conn, ctx.snap_id, ctx.scope, endpoint_days=days)
+    rules = rules_mod.applicable(rules_mod.list_rules(ctx.conn), ctx.account_ref)
+    items = sugg_mod.generate(sctx, rules)
+    totals = sugg_mod.totals(items)
+    shown = [
+        s for s in items if (want is None or s.kind == want) and (include_blocked or not s.blocked)
+    ]
+    return {
+        "filters": {"kind": want, "include_blocked": bool(include_blocked)},
+        "ips_saved": {"allowed": totals["allowed"], "blocked_by_rules": totals["blocked"]},
+        "notes": list(sctx.notes),
+        "caveat": "estimates; alternative suggestions for the same resources can overlap",
+        **_page([_suggestion_dict(s) for s in shown], offset, limit),
+    }
+
+
 TOOLS: dict[str, Callable[..., dict[str, Any]]] = {
     "list_subnets": list_subnets,
     "find_subnet": find_subnet,
@@ -733,6 +789,7 @@ TOOLS: dict[str, Callable[..., dict[str, Any]]] = {
     "lookup_ip": lookup_ip,
     "changes": changes,
     "fit_check": fit_check,
+    "suggestions": suggestions,
 }
 
 

@@ -43,6 +43,7 @@ ALL_CALLS = [
     ("lookup_ip", {"ip": "192.0.2.70"}),
     ("changes", {}),
     ("fit_check", {"subnet": SUBNET_A, "need": 5}),
+    ("suggestions", {}),
 ]
 
 
@@ -235,7 +236,7 @@ def test_subnet_detail(tools):
             "kind": "alb",
             "name": "alb-a",
             "ips": 8,
-            "assumption": "AWS needs ≥ 8 free IPs per subnet to scale",
+            "assumption": "8 IPs per ALB per subnet",
         }
     ]
     fc = out["forecast"]
@@ -341,6 +342,67 @@ def test_fit_check_applies_saved_rules(tools, db):
     out = tools.call("fit_check", subnet=SUBNET_A, need=1)
     assert out["result"] == "does-not-fit"
     assert out["violations"][0]["rule"] == "keep-a-free"
+
+
+def _week_of_history(tmp_path: Path) -> Path:
+    """A database whose detached ENI (in test-subnet-c) already was 6.5 days ago."""
+    db = tmp_path / "week.db"
+    init_db(db)
+    _set_account(db, add_test_account(db), "test-account", ACCOUNT_ID)
+    now = datetime.now(UTC)
+    for taken_at in (now - timedelta(days=6.5), now):
+        b = _base(SnapshotBuilder(db, taken_at=taken_at, account_id=ACCOUNT_ID))
+        b.eni(
+            "eni-0000000d",
+            SUBNET_C,
+            ip_range("198.51.100.0", 4, 3),
+            status="available",
+            description="test-scratch",
+        )
+    return db
+
+
+def test_suggestions_tool(tools, tmp_path):
+    # Two days of history: no detached ENI suggestion yet, a note says why.
+    out = tools.call("suggestions")
+    assert not [s for s in out["items"] if s["kind"] == "detached_eni"]
+    assert any(
+        n.startswith("Detached ENIs (1 detached now): not checked yet") for n in out["notes"]
+    )
+
+    out = Tools(_week_of_history(tmp_path)).call("suggestions", kind="detached_eni")
+    assert out["filters"] == {"kind": "detached_eni", "include_blocked": True}
+    (s,) = out["items"]
+    assert s["title"] == "Delete detached ENI eni-0000000d" and s["ips_saved"] == 3
+    assert s["status"] == "allowed" and s["blocked_by"] == []
+    since = (datetime.now(UTC) - timedelta(days=6.5)).strftime("%Y-%m-%d")
+    assert s["since"] == since and f"detached since {since}" in s["detail"]
+    assert out["ips_saved"]["allowed"] >= 3
+
+    with pytest.raises(ToolInputError, match="unknown kind 'nope'"):
+        tools.call("suggestions", kind="nope")
+    with pytest.raises(ToolInputError, match="endpoint_days must be 1 to 365"):
+        tools.call("suggestions", endpoint_days=0)
+
+
+def test_suggestions_tool_applies_rules_and_redacts(tmp_path):
+    db = _week_of_history(tmp_path)
+    with closing(db) as conn:
+        rules_mod.save_rule(
+            conn,
+            rules_mod.Rule(
+                name="keep-scratch", kind="protected_eni", params={"pattern": "scratch"}
+            ),
+        )
+    out = Tools(db, redact=True).call("suggestions", kind="detached_eni")
+    (s,) = out["items"]
+    assert s["status"] == "blocked" and s["blocked_by"][0]["rule"] == "keep-scratch"
+    assert s["title"] == "Delete detached ENI <eni>" and s["eni_ids"] == ["<eni>"]
+    assert s["subnets"] == ["test-subnet-c"]
+    assert not LEAKS.search(json.dumps(out, ensure_ascii=False))
+    allowed = Tools(db).call("suggestions", include_blocked=False)["items"]
+    assert all(i["status"] == "allowed" for i in allowed)
+    assert not [i for i in allowed if i["kind"] == "detached_eni"]
 
 
 def test_account_selection(db):

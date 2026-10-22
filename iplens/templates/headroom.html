@@ -10,7 +10,7 @@
   {{ no_data() }}
 {% else %}
 <p class="muted small">Free IPs of each subnet against the worst case: every Auto Scaling group and ECS
-  service at its maximum, {{ alb_reserve }} free IPs kept per ALB subnet (AWS needs them to scale the ALB)
+  service at its maximum, {{ alb_reserve }} IPs per ALB per subnet (kept free: AWS needs them to scale the ALB)
   and 1 IP for each Lambda subnet / security group combination that has no ENI yet. ASG instances and ECS
   tasks still to launch are spread evenly over their subnets (the remainder to the subnets with the fewest
   now). <b>tight</b>: less than {{ tight_pct | int }}% of the subnet's usable IPs left at max scale;

@@ -336,14 +336,20 @@ def test_refresh_with_locally_expired_credentials_never_calls_aws(app, client):
 
 @pytest.fixture
 def two_accounts(app, client, snapshot_builder, ips):
-    """Account 1 (migrated default) and a second account, each with its own snapshot."""
+    """Account 1 (migrated default) and a second account, each with a week-old and a
+    current snapshot (a detached ENI in both, so it is suggested)."""
     b_id = _add_account(client, display_name="example-b", region="eu-west-1")
-    a = snapshot_builder(_db(app), account_ref=1)
-    a.vpc(VPC_A, "10.0.0.0/16", name="example-vpc-a").subnet(SUBNET_A, VPC_A, "10.0.1.0/24")
-    a.eni(ENI_A, SUBNET_A, ips("10.0.1.0", 10, 2), status="available", description="detached a")
-    b = snapshot_builder(_db(app), "eu-west-1", account_ref=b_id, account_id="123456789012")
-    b.vpc(VPC_B, "10.0.0.0/16", name="example-vpc-b").subnet(SUBNET_B, VPC_B, "10.0.2.0/24")
-    b.eni(ENI_B, SUBNET_B, ips("10.0.2.0", 20, 3), status="available", description="detached b")
+    week_ago = datetime.now(UTC) - timedelta(days=7)
+    a = b = None
+    for taken_at in (week_ago, None):
+        a = snapshot_builder(_db(app), account_ref=1, taken_at=taken_at)
+        a.vpc(VPC_A, "10.0.0.0/16", name="example-vpc-a").subnet(SUBNET_A, VPC_A, "10.0.1.0/24")
+        a.eni(ENI_A, SUBNET_A, ips("10.0.1.0", 10, 2), status="available", description="detached a")
+        b = snapshot_builder(
+            _db(app), "eu-west-1", account_ref=b_id, account_id="123456789012", taken_at=taken_at
+        )
+        b.vpc(VPC_B, "10.0.0.0/16", name="example-vpc-b").subnet(SUBNET_B, VPC_B, "10.0.2.0/24")
+        b.eni(ENI_B, SUBNET_B, ips("10.0.2.0", 20, 3), status="available", description="detached b")
     _activate(client, 1)
     return {"a": a, "b": b, "b_id": b_id}
 
