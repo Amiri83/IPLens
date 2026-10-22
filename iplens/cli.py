@@ -1,5 +1,6 @@
 """``iplens`` command: run the local web UI. ``iplens check ...`` is the pre-deploy IP fit
-check for CI (see :mod:`iplens.checkcli`)."""
+check for CI (see :mod:`iplens.checkcli`), ``iplens mcp`` the read-only MCP server (see
+:mod:`iplens.mcpserver`)."""
 
 from __future__ import annotations
 
@@ -113,10 +114,15 @@ def main(argv: list[str] | None = None) -> None:
         from .checkcli import main as check_main
 
         sys.exit(check_main(args_in[1:]))
+    if args_in[:1] == ["mcp"]:
+        from .mcpserver import main as mcp_main
+
+        sys.exit(mcp_main(args_in[1:]))
     parser = argparse.ArgumentParser(
         prog="iplens",
         description=__doc__,
-        epilog="Subcommand: iplens check --help (pre-deploy IP fit check for CI).",
+        epilog="Subcommands: iplens check --help (pre-deploy IP fit check for CI), "
+        "iplens mcp --help (read-only MCP server).",
     )
     parser.add_argument(
         "--host", default="127.0.0.1", help="bind address (default: 127.0.0.1, local only)"
