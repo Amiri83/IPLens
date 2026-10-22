@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Pre-deploy IP fit check for CI: `iplens check --plan plan.json` (a `terraform show -json`
+  plan) or `iplens check --subnet ID --need N`. Per subnet, free IPs − existing scale headroom
+  demand − plan demand; exit 0 = fits, 1 = does not fit (below 0, below `--min-free-pct`) or breaks
+  a saved rule (`--rules`), 2 = error. Plan demand per new / changed resource with its assumption:
+  `aws_instance`, `aws_network_interface`, `aws_nat_gateway` 1; `aws_lb` 8 per ALB subnet, 1 per
+  NLB / GWLB subnet; Interface `aws_vpc_endpoint` 1 per subnet; awsvpc `aws_ecs_service`
+  `desired_count` plus the headroom deploy surge; `aws_autoscaling_group` `max_size` (updates: the
+  delta); `aws_lambda_function` 1 per new subnet / security-group combination; `aws_db_instance` 1
+  (2 Multi-AZ). Subnets known only after apply are listed as unresolved (a warning). Output as a
+  table, `--format json` or `--format markdown` for PR comments; README examples for GitHub
+  Actions and GitLab CI.
+- Data for the check: **Headroom → Export snapshot for CI** (JSON of subnets, free IPs and the
+  headroom inputs; no credentials needed in CI), or live AWS through the read-only guard and the
+  Refresh timeouts with only `ec2:DescribeSubnets` / `DescribeNetworkInterfaces` (filtered to the
+  subnets involved), `autoscaling:DescribeAutoScalingGroups` and ECS List / Describe calls.
+  **Rules → Export rules for CI** exports the rules of the active account.
+
 ## 1.2.0 – 2026-10-21
 
 ### Added
