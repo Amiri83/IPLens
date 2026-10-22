@@ -417,8 +417,11 @@ def _endpoint_snapshot(db_path, snapshot_builder, ago, *, with_idle=True):
 
 
 def _flow_run(db_path, snap_id, days_ago, pairs, window_minutes=60):
-    """A stored flow log query of the VPC (as flowlogs.run writes it) seeing ``pairs``."""
-    ran_at = datetime.now(UTC) - timedelta(days=days_ago)
+    """A stored flow log query of the VPC (as flowlogs.run writes it) seeing ``pairs``,
+    run at noon UTC (windows up to 12 h stay within that day)."""
+    ran_at = (datetime.now(UTC) - timedelta(days=days_ago)).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
     with closing(db_path) as conn:
         conn.execute(
             "INSERT INTO flow_runs(snapshot_id, vpc_id, ran_at, window_minutes, rows) "
@@ -432,8 +435,17 @@ def _flow_run(db_path, snap_id, days_ago, pairs, window_minutes=60):
         )
 
 
+def _daily_runs(db_path, snapshot_builder, days_ago, pairs=(), window_minutes=8 * 60, **kw):
+    """One snapshot per day of ``days_ago``, each with an 8 h flow log query (one query per
+    snapshot and VPC is stored)."""
+    for d in days_ago:
+        old = _endpoint_snapshot(db_path, snapshot_builder, d, **kw)
+        _flow_run(db_path, old.id, d, list(pairs), window_minutes=window_minutes)
+
+
 def test_unused_endpoint_from_flow_logs(db_path, snapshot_builder):
     old = _endpoint_snapshot(db_path, snapshot_builder, 5)
+    # Noon to noon: 24 h over 2 days, plus 1 h today.
     _flow_run(db_path, old.id, 5, [(CLIENT_ENI, "eni-000000e1")], window_minutes=1440)
     b = _endpoint_snapshot(db_path, snapshot_builder, 0)
     _flow_run(db_path, b.id, 0, [(CLIENT_ENI, "outside")])
@@ -441,9 +453,11 @@ def test_unused_endpoint_from_flow_logs(db_path, snapshot_builder):
     (s,) = _kind(sg.generate(ctx, []), "unused_endpoint")  # SQS had traffic 5 days ago
     assert s.key == f"unused-endpoint:{EP_IDLE}" and s.ips_saved == 2
     assert s.eni_ids == ["eni-000000e2"] and s.subnet_ids == [SH] and s.vpc_id == VPC_H
-    assert s.title == f"Remove unused interface endpoint {EP_IDLE} ({KMS_H})"
-    assert "in the last 14 days: 2 flow log queries" in s.detail
-    assert f"(25 h of traffic, the first on {_day(5)})" in s.detail
+    assert s.title == f"Possibly unused interface endpoint {EP_IDLE} ({KMS_H})"
+    assert (
+        f"in 2 flow log queries of {VPC_H} over the last 14 days, covering 25h over 3 days "
+        f"(the first on {_day(5)}; the check needs 24h over 3 days)"
+    ) in s.detail
     assert s.kind_label == "Unused endpoint"
     assert not any("Unused endpoints" in n for n in ctx.notes)
     # A protected ENI rule vetoes it like any other suggestion.
@@ -462,28 +476,75 @@ def test_unused_endpoint_without_flow_logs_is_a_note(db_path, snapshot_builder):
     ) in ctx.notes
 
 
+def test_unused_endpoint_one_hour_is_a_note(db_path, snapshot_builder):
+    b = _endpoint_snapshot(db_path, snapshot_builder, 0)
+    _flow_run(db_path, b.id, 1, [])
+    ctx = _context(db_path, b.id)
+    assert not _kind(sg.generate(ctx, []), "unused_endpoint")
+    assert (
+        f"Unused endpoints in {VPC_H}: not enough flow log coverage "
+        "(1h over 1 day, need 24h over 3 days)"
+    ) in ctx.notes
+
+
+def test_unused_endpoint_three_days_of_eight_hours(db_path, snapshot_builder):
+    _daily_runs(db_path, snapshot_builder, (3, 2, 1))
+    b = _endpoint_snapshot(db_path, snapshot_builder, 0)
+    ctx = _context(db_path, b.id)
+    items = _kind(sg.generate(ctx, []), "unused_endpoint")
+    assert {s.key for s in items} == {f"unused-endpoint:{EP_USED}", f"unused-endpoint:{EP_IDLE}"}
+    assert all("covering 24h over 3 days" in s.detail for s in items)
+    assert not any("Unused endpoints" in n for n in ctx.notes)
+
+
+def test_unused_endpoint_coverage_thresholds(tmp_path, snapshot_builder):
+    # 24 h on 2 days, then 3 days with only 23 h: neither is enough.
+    for windows in (((1, 720), (2, 720)), ((3, 8 * 60), (2, 8 * 60), (1, 7 * 60))):
+        db = _fresh_db(tmp_path, f"{len(windows)}.db")
+        for days_ago, minutes in windows:
+            _daily_runs(db, snapshot_builder, (days_ago,), window_minutes=minutes)
+        b = _endpoint_snapshot(db, snapshot_builder, 0)
+        ctx = _context(db, b.id)
+        assert not _kind(sg.generate(ctx, []), "unused_endpoint")
+        assert any("not enough flow log coverage" in n for n in ctx.notes)
+
+
+def _run(ran_at, minutes):
+    return sg.FlowRun(1, VPC_H, ran_at, minutes, frozenset(), frozenset())
+
+
+def test_flow_coverage_merges_overlaps_and_counts_days():
+    t = datetime(2026, 1, 10, 12, tzinfo=UTC)
+    assert sg.flow_coverage([]) == (0, 0)
+    assert sg.flow_coverage([_run(t, 60), _run(t, 60)]) == (1, 1)  # the same hour twice
+    assert sg.flow_coverage([_run(t, 120), _run(t - timedelta(hours=1), 120)]) == (3, 1)
+    assert sg.flow_coverage([_run(t, 72 * 60)]) == (72, 4)  # noon to noon touches 4 days
+    assert sg.flow_coverage([_run(datetime(2026, 1, 10, tzinfo=UTC), 60)]) == (1, 1)
+
+
 def test_unused_endpoint_window(db_path, snapshot_builder):
-    # The only flow log query is 20 days old: outside the default 14 days, inside 30.
-    old = _endpoint_snapshot(db_path, snapshot_builder, 20)
-    _flow_run(db_path, old.id, 20, [])
+    # The flow log queries are 20 days old: outside the default 14 days, inside 30.
+    _daily_runs(db_path, snapshot_builder, (20, 19, 18))
     b = _endpoint_snapshot(db_path, snapshot_builder, 0)
     ctx = _context(db_path, b.id)
     assert not _kind(sg.generate(ctx, []), "unused_endpoint")
     assert any(n.startswith(f"Unused endpoints in {VPC_H}: skipped") for n in ctx.notes)
     items = _kind(sg.generate(_context(db_path, b.id, endpoint_days=30), []), "unused_endpoint")
     assert {s.key for s in items} == {f"unused-endpoint:{EP_USED}", f"unused-endpoint:{EP_IDLE}"}
-    assert all("in the last 30 days: 1 flow log query " in s.detail for s in items)
+    assert all("in 3 flow log queries of" in s.detail for s in items)
+    assert all("over the last 30 days, covering 24h over 3 days" in s.detail for s in items)
 
 
 def test_unused_endpoint_newer_than_the_queries_is_not_checked(db_path, snapshot_builder):
-    old = _endpoint_snapshot(db_path, snapshot_builder, 3, with_idle=False)
-    _flow_run(db_path, old.id, 3, [(CLIENT_ENI, "eni-000000e1")])
+    _daily_runs(
+        db_path, snapshot_builder, (5, 4, 3), [(CLIENT_ENI, "eni-000000e1")], with_idle=False
+    )
     b = _endpoint_snapshot(db_path, snapshot_builder, 0)
     ctx = _context(db_path, b.id)
     assert not _kind(sg.generate(ctx, []), "unused_endpoint")
     assert (
-        f"Unused endpoints: {EP_IDLE} is newer than the flow log queries of the last 14 days; "
-        "not checked."
+        f"Unused endpoints: {EP_IDLE} is newer than most flow log queries of the last 14 days "
+        "(it was there for 0h over 0 days of them, need 24h over 3 days); not checked."
     ) in ctx.notes
 
 
@@ -492,14 +553,14 @@ def test_new_kinds_on_the_page_and_in_the_report(tmp_path, snapshot_builder):
     home.mkdir()
     db = _fresh_db(home, "iplens.db")
     _endpoint_snapshot(db, snapshot_builder, 29.5)
-    b = _endpoint_snapshot(db, snapshot_builder, 0)
-    _flow_run(db, b.id, 0, [(CLIENT_ENI, "eni-000000e1")])
+    _daily_runs(db, snapshot_builder, (3, 2, 1), [(CLIENT_ENI, "eni-000000e1")])
+    _endpoint_snapshot(db, snapshot_builder, 0)
     client = create_app(home, testing=True).test_client()
     page = client.get("/suggestions").data.decode()
     assert "Underused subnet" in page and f"Shrink underused subnet {SH} to a /28" in page
-    assert f"Remove unused interface endpoint {EP_IDLE}" in page
+    assert f"Possibly unused interface endpoint {EP_IDLE}" in page
     report = client.get("/report").data.decode()
-    assert f"Remove unused interface endpoint {EP_IDLE}" in report
+    assert f"Possibly unused interface endpoint {EP_IDLE}" in report
     assert f"Shrink underused subnet {SH} to a /28" in report
 
 

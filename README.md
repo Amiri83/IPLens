@@ -193,8 +193,10 @@ mode `0700`). Delete it to reset IPLens completely.
      smallest prefix (/28 to /16) whose usable IPs fit twice the peak, saving the difference in
      usable IPs (recreate the subnet at that size).
    - **Unused endpoint**: an interface VPC endpoint whose ENIs had no traffic in the flow log
-     queries (Visual → Extended view → Flow logs) of the last 14 days; skipped with a note for a
-     VPC without flow log data.
+     queries (Visual → Extended view → Flow logs) of the last 14 days, suggested as "possibly
+     unused" only once those queries cover at least 24 hours (overlapping windows counted once)
+     spread over at least 3 distinct days; otherwise skipped with a note giving the coverage so
+     far (or saying the VPC has no flow log data).
 7. **Logs** shows the application log file.
 
 ## Trends

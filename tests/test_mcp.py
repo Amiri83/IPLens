@@ -405,6 +405,51 @@ def test_suggestions_tool_applies_rules_and_redacts(tmp_path):
     assert not [i for i in allowed if i["kind"] == "detached_eni"]
 
 
+def _endpoint_history(tmp_path: Path, runs: tuple[tuple[int, int], ...]) -> Path:
+    """An idle interface endpoint in test-vpc-a and one flow log query (days ago,
+    minutes) per older daily snapshot."""
+    db = tmp_path / f"endpoints-{len(runs)}.db"
+    init_db(db)
+    _set_account(db, add_test_account(db), "test-account", ACCOUNT_ID)
+    now = datetime.now(UTC)
+    for days_ago, minutes in (*runs, (0, 0)):
+        b = _base(
+            SnapshotBuilder(db, taken_at=now - timedelta(days=days_ago), account_id=ACCOUNT_ID)
+        )
+        b.eni("eni-000000e1", SUBNET_A, ["192.0.2.40"], owner_type="vpc_endpoint")
+        b.endpoint(
+            "vpce-000000001", VPC_A, "com.amazonaws.us-east-1.kms", [SUBNET_A], ["eni-000000e1"]
+        )
+        if minutes:
+            ran_at = (now - timedelta(days=days_ago)).replace(hour=12, minute=0, second=0)
+            with closing(db) as conn:
+                conn.execute(
+                    "INSERT INTO flow_runs(snapshot_id, vpc_id, ran_at, window_minutes, rows) "
+                    "VALUES(?,?,?,?,0)",
+                    (b.id, VPC_A, ran_at.isoformat(timespec="seconds"), minutes),
+                )
+    return db
+
+
+def test_suggestions_tool_unused_endpoint_coverage(tmp_path):
+    out = Tools(_endpoint_history(tmp_path, ((1, 60),)), redact=True).call(
+        "suggestions", kind="unused_endpoint"
+    )
+    assert out["items"] == []
+    assert (
+        "Unused endpoints in test-vpc-a: not enough flow log coverage "
+        "(1h over 1 day, need 24h over 3 days)"
+    ) in out["notes"]
+    assert not LEAKS.search(json.dumps(out, ensure_ascii=False))
+
+    db = _endpoint_history(tmp_path, ((3, 480), (2, 480), (1, 480)))
+    out = Tools(db, redact=True).call("suggestions", kind="unused_endpoint")
+    (s,) = out["items"]
+    assert s["title"].startswith("Possibly unused interface endpoint ")
+    assert "covering 24h over 3 days" in s["detail"] and s["eni_ids"] == ["<eni>"]
+    assert not LEAKS.search(json.dumps(out, ensure_ascii=False))
+
+
 def test_account_selection(db):
     other = add_test_account(db)  # also becomes the active account in the UI
     _set_account(db, other, "test-account-b", OTHER_ACCOUNT_ID)

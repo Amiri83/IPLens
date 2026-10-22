@@ -9,10 +9,11 @@ history (successful snapshots up to this one):
   snapshot of the last :data:`UNDERUSED_DAYS` days; the suggested size is the smallest
   prefix whose usable IPs fit twice the peak.
 - ``unused_endpoint``: an interface endpoint whose ENIs saw no traffic in the flow log
-  queries (Visual → Extended view → Flow logs) of the last ``endpoint_days`` days.
+  queries (Visual → Extended view → Flow logs) of the last ``endpoint_days`` days, once
+  those cover :data:`ENDPOINT_MIN_HOURS` hours over :data:`ENDPOINT_MIN_DAYS` days.
 
-A check that cannot be made (history shorter than its window, no flow log data for a
-VPC) adds a line to :attr:`Context.notes` instead of a suggestion.
+A check that cannot be made (history shorter than its window, no or too little flow log
+data for a VPC) adds a line to :attr:`Context.notes` instead of a suggestion.
 """
 
 from __future__ import annotations
@@ -57,8 +58,12 @@ UNDERUSED_DAYS = 30
 UNDERUSED_HEADROOM = 2
 # AWS subnet sizes: /28 (smallest) to /16 (largest).
 SMALLEST_PREFIX, LARGEST_PREFIX = 28, 16
-# An interface endpoint without flow log traffic in this many days is "unused".
+# An interface endpoint without flow log traffic in this many days is "possibly unused",
+# provided the VPC's flow log queries of those days cover at least this many hours (their
+# windows merged) spread over at least this many distinct (UTC) days.
 UNUSED_ENDPOINT_DAYS = 14
+ENDPOINT_MIN_HOURS = 24
+ENDPOINT_MIN_DAYS = 3
 # A window counts as covered when its oldest snapshot is at most this far from its start
 # (daily snapshots cover a 7-day window with 7 of them).
 HISTORY_SLACK = timedelta(days=1)
@@ -508,47 +513,97 @@ def _underused_subnets(ctx: Context) -> list[Suggestion]:
     return out
 
 
+def flow_coverage(runs: Iterable[FlowRun]) -> tuple[float, int]:
+    """(hours, distinct UTC days) of traffic the queries' windows cover, overlaps merged."""
+    spans = sorted(
+        (r.ran_at - timedelta(minutes=r.window_minutes), r.ran_at)
+        for r in runs
+        if r.window_minutes > 0
+    )
+    merged: list[list[datetime]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    seconds, days = 0.0, set()
+    for start, end in merged:
+        seconds += (end - start).total_seconds()
+        last = (end - timedelta(microseconds=1)).astimezone(UTC).date()
+        day = start.astimezone(UTC).date()
+        while day <= last:
+            days.add(day)
+            day += timedelta(days=1)
+    return seconds / 3600, len(days)
+
+
+def _covered(hours: float, days: int) -> bool:
+    return hours >= ENDPOINT_MIN_HOURS and days >= ENDPOINT_MIN_DAYS
+
+
+def _coverage_text(hours: float, days: int) -> str:
+    return f"{round(hours, 1):g}h over {days} day{'' if days == 1 else 's'}"
+
+
 def _unused_endpoints(ctx: Context) -> list[Suggestion]:
-    """Interface endpoints whose ENIs no flow log query of the window saw traffic of."""
+    """Interface endpoints whose ENIs no flow log query of the window saw traffic of, once
+    the queries that saw them cover ENDPOINT_MIN_HOURS over ENDPOINT_MIN_DAYS."""
     interface = [
         e
         for e in ctx.endpoints
         if (e["endpoint_type"] or "").lower() == "interface" and e["eni_ids"]
     ]
     days = ctx.endpoint_days
+    need = f"need {ENDPOINT_MIN_HOURS}h over {ENDPOINT_MIN_DAYS} days"
     runs: dict[str, list[FlowRun]] = defaultdict(list)
     for r in ctx.flow_runs:
         runs[r.vpc_id].append(r)
     out = []
-    for vpc_id in sorted({e["vpc_id"] for e in interface} - set(runs)):
-        ctx.notes.append(
-            f"Unused endpoints in {vpc_id}: skipped, no flow log data from the last {days} "
-            "days (flow logs not enabled for the VPC, or not queried yet: Visual → Extended "
-            "view → Flow logs)."
-        )
-    for ep in sorted(interface, key=lambda e: e["endpoint_id"]):
-        enis = set(ep["eni_ids"])
-        checked = [r for r in runs.get(ep["vpc_id"], []) if enis & r.present]
-        if not checked:
-            if ep["vpc_id"] in runs:
-                ctx.notes.append(
-                    f"Unused endpoints: {ep['endpoint_id']} is newer than the flow log "
-                    f"queries of the last {days} days; not checked."
-                )
+    skipped = set()
+    for vpc_id in sorted({e["vpc_id"] for e in interface}):
+        if vpc_id not in runs:
+            ctx.notes.append(
+                f"Unused endpoints in {vpc_id}: skipped, no flow log data from the last {days} "
+                "days (flow logs not enabled for the VPC, or not queried yet: Visual → Extended "
+                "view → Flow logs)."
+            )
+            skipped.add(vpc_id)
             continue
+        cover = flow_coverage(runs[vpc_id])
+        if not _covered(*cover):
+            ctx.notes.append(
+                f"Unused endpoints in {vpc_id}: not enough flow log coverage "
+                f"({_coverage_text(*cover)}, {need})"
+            )
+            skipped.add(vpc_id)
+    for ep in sorted(interface, key=lambda e: e["endpoint_id"]):
+        if ep["vpc_id"] in skipped:
+            continue
+        enis = set(ep["eni_ids"])
+        checked = [r for r in runs[ep["vpc_id"]] if enis & r.present]
         if any(enis & r.seen for r in checked):
             continue
-        hours = sum(r.window_minutes for r in checked) / 60
+        hours, n_days = flow_coverage(checked)
+        if not _covered(hours, n_days):
+            # Newer than most of the VPC's queries: they say nothing about it.
+            ctx.notes.append(
+                f"Unused endpoints: {ep['endpoint_id']} is newer than most flow log queries "
+                f"of the last {days} days (it was there for {_coverage_text(hours, n_days)} "
+                f"of them, {need}); not checked."
+            )
+            continue
         out.append(
             Suggestion(
                 key=f"unused-endpoint:{ep['endpoint_id']}",
                 kind="unused_endpoint",
-                title=f"Remove unused interface endpoint {ep['endpoint_id']} "
+                title=f"Possibly unused interface endpoint {ep['endpoint_id']} "
                 f"({ep['service_name']})",
-                detail=f"No flow log traffic to or from its {len(enis)} ENI(s) in the last "
-                f"{days} days: {len(checked)} flow log quer{'y' if len(checked) == 1 else 'ies'} "
-                f"of {ep['vpc_id']} ({hours:g} h of traffic, the first on "
-                f"{_day(checked[0].ran_at)}) saw none.",
+                detail=f"No flow log traffic to or from its {len(enis)} ENI(s) in "
+                f"{len(checked)} flow log quer{'y' if len(checked) == 1 else 'ies'} of "
+                f"{ep['vpc_id']} over the last {days} days, covering "
+                f"{_coverage_text(hours, n_days)} (the first on {_day(checked[0].ran_at)}; "
+                f"the check needs {ENDPOINT_MIN_HOURS}h over {ENDPOINT_MIN_DAYS} days). "
+                "Traffic outside the covered hours is not seen: confirm before removing it.",
                 vpc_id=ep["vpc_id"],
                 ips_saved=_endpoint_ip_count(ctx, ep),
                 subnet_ids=sorted(ep["subnet_ids"]),

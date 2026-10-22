@@ -25,9 +25,11 @@
   variable), Claude Code (`claude mcp add --transport http`) and the stdio alternative.
 - Suggestions **Underused subnet** (under 10% used in every snapshot of the last 30 days: the
   smallest prefix fitting 2× the peak, saving the usable-IP difference; `min_free_pct` and
-  `subnet_reserved` rules apply) and **Unused endpoint** (an interface endpoint without traffic in
-  the flow log queries of the last 14 days). Checks that cannot be made (short history, no flow
-  log data for a VPC) are listed as notes on the page, in the report and in MCP.
+  `subnet_reserved` rules apply) and **Unused endpoint** ("possibly unused": an interface endpoint
+  without traffic in the flow log queries of the last 14 days, once those cover at least 24 hours
+  over at least 3 distinct days; the detail states the coverage). Checks that cannot be made
+  (short history, no or too little flow log data for a VPC) are listed as notes on the page, in
+  the report and in MCP.
 - MCP tool `suggestions` (redacted with `--redact` like every tool).
 
 ### Changed
