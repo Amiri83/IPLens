@@ -21,6 +21,9 @@ Local web app for private IPv4 usage visibility &amp; optimization across one or
 - **Scale headroom** – free IPs per subnet vs. the worst-case demand if every Auto Scaling group,
   ECS service, ALB and Lambda scales to its maximum; subnets that run out before max are flagged,
   with an exhaustion forecast (days until free = 0 and until the demand no longer fits).
+- **Pre-deploy fit check** – `iplens check` in CI: does a Terraform plan (or N more IPs) fit its
+  subnets on top of the scale headroom, and does it keep your rules? Exit code + table, JSON or
+  Markdown for PR comments.
 - **Alerts** (optional) – a Slack or Teams (Workflows) webhook notified after each Refresh when a subnet's
   state changes (over at max scale, forecast to run out soon, low free IPs).
 - **CIDR planner** – free blocks and fragmentation per VPC CIDR, a Fit tool for new subnets and
@@ -57,6 +60,7 @@ iplens --port 8080             # another port
 iplens --home /path/to/data    # another data directory (default: $IPLENS_HOME or ~/.iplens)
 iplens --no-browser            # do not open the browser
 iplens --debug                 # Flask development server with the debugger (development only)
+iplens check --help            # pre-deploy IP fit check for CI (no web UI, see below)
 ```
 
 IPLens is served by [waitress](https://docs.pylonsproject.org/projects/waitress/) and prints one
@@ -234,6 +238,151 @@ the demand at max scale no longer fits (free − demand = 0). A flat or shrinkin
 "stable", fewer points "not enough data". It is shown in a Forecast column on Headroom, next to a
 used-IP sparkline on the subnet page, and in the report.
 
+## Pre-deploy fit check (CI)
+
+`iplens check` answers, before `terraform apply`: will the new IPs fit? Per subnet it computes
+
+```
+left = free IPs - existing scale headroom demand - plan demand
+```
+
+and fails when `left` < 0, when less than `--min-free-pct` (default 0) of the subnet's usable IPs
+would be left, or when the change breaks a saved [rule](#rules). The existing demand is exactly the
+[Scale headroom](#scale-headroom) worst case (including the ECS deploy surge; `--no-surge` leaves
+it out of both).
+
+```bash
+iplens check --subnet subnet-a --need 12 --snapshot iplens-ci-snapshot.json   # simple ask
+iplens check --plan plan.json --snapshot iplens-ci-snapshot.json \
+             --rules iplens-ci-rules.yaml --min-free-pct 10 --format markdown
+iplens check --plan plan.json --region us-east-1                # live AWS instead of a snapshot
+```
+
+**Exit codes**: `0` fits, `1` does not fit or breaks a rule, `2` error (bad arguments, unreadable
+or invalid file, a subnet missing from the data, AWS error). **Output**: a table (default),
+`--format json` (machine-readable, includes every assumption) or `--format markdown` (a PR / MR
+comment with a collapsible per-subnet breakdown).
+
+**Plan demand.** `--plan` takes `terraform show -json <planfile>`. Only new and changed managed
+resources count; each one is listed with its assumption:
+
+| resource | IPs |
+|---|---|
+| `aws_instance` | 1 per instance (primary ENI; instances attaching `network_interface` blocks are counted on the interface) |
+| `aws_network_interface` | 1 |
+| `aws_lb` application | 8 per subnet (AWS needs ≥ 8 free IPs per ALB subnet to scale) |
+| `aws_lb` network / gateway | 1 per subnet |
+| `aws_vpc_endpoint` Interface / GatewayLoadBalancer | 1 per subnet (Gateway endpoints: none) |
+| `aws_nat_gateway` | 1 |
+| `aws_ecs_service` (awsvpc) | `desired_count` spread over its subnets, plus the deploy surge of the headroom rule |
+| `aws_autoscaling_group` | `max_size` spread over its subnets, 1 ENI per instance |
+| `aws_lambda_function` | 1 per subnet / security-group combination without a Lambda ENI yet (shared by functions of the plan) |
+| `aws_db_instance` | 1, 2 with Multi-AZ; AWS picks the subnets of the DB subnet group (from the plan or its prior state), so each candidate must fit 1 |
+
+An update counts what it adds (demand after minus before per subnet: e.g. `max_size` 4 → 10, a new
+ALB subnet, Multi-AZ turned on); a replacement that destroys first likewise, a
+`create_before_destroy` one in full. Subnets that are **known after apply** (e.g. a subnet created
+in the same plan) are listed as *unresolved* with what they would need: a warning, never a
+failure. A subnet id the data does not know is an error (a stale snapshot, another account?).
+
+**Data source.**
+
+- `--snapshot FILE`: **Headroom → Export snapshot for CI** in the UI downloads the latest
+  snapshot's subnets, free IPs and headroom inputs (every subnet, not just the scope) as JSON. No
+  AWS access or credentials needed in CI; the file holds no secrets, only resource ids and counts.
+- live (default without `--snapshot`): the profile (`--profile`) or the default credential chain
+  and `--region`. Through the same read-only guard and per-call timeouts as a Refresh
+  (`--timeout`, default 30 s; subnets / ENIs at least 120 s), and only for the subnets involved:
+  `ec2:DescribeSubnets` and `ec2:DescribeNetworkInterfaces` filtered to them (required), then
+  `autoscaling:DescribeAutoScalingGroups`, `ecs:ListClusters`, `ecs:ListServices` and
+  `ecs:DescribeServices` (optional: an error is a note and that demand is skipped). ALBs come from
+  their ENIs and Lambda combinations from the Lambda ENIs. Application Auto Scaling and Lambda are
+  not called, so ECS services count up to their desired count and existing functions' new
+  combinations are not counted; both are named in the notes.
+
+**Rules.** **Rules → Export rules for CI** downloads the rules that apply to the active account
+(without the account limit). `--rules` also takes the full YAML export; a rule limited to another
+account than the snapshot's is skipped. A plan breaks `min_free_pct` when a subnet would keep less
+than the percentage at max scale after the change, `subnet_reserved` when it places IPs in a
+reserved subnet, `internal_only` with an internet-facing `aws_lb`, `lambda_vpc_required` with a
+function without `vpc_config`, and `protected_eni` when it deletes a matching
+`aws_network_interface`. `ecs_scale_down` only concerns suggestions and is skipped.
+
+### GitHub Actions
+
+Commit the two exports (e.g. under `ci/`) and refresh them from the UI now and then, or use live
+mode with an OIDC role that has the permissions above.
+
+```yaml
+name: ip-fit-check
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write                 # only for live mode / terraform plan via OIDC
+jobs:
+  fit-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install aws-iplens
+      - run: |
+          terraform init -input=false
+          terraform plan -input=false -out=tfplan
+          terraform show -json tfplan > plan.json
+      - name: IP fit check
+        id: fit
+        run: |
+          set +e
+          iplens check --plan plan.json --snapshot ci/iplens-ci-snapshot.json \
+            --rules ci/iplens-ci-rules.yaml --min-free-pct 10 --format markdown > fit.md
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+          cat fit.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Comment on the PR
+        run: gh pr comment ${{ github.event.pull_request.number }} --body-file fit.md --edit-last || gh pr comment ${{ github.event.pull_request.number }} --body-file fit.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Fail when it does not fit
+        run: exit ${{ steps.fit.outputs.code }}
+```
+
+### GitLab CI
+
+```yaml
+iplens-fit-check:
+  stage: test
+  image: python:3.12                # has curl for the MR comment
+  needs: [terraform-plan]           # a job that saved `terraform show -json tfplan > plan.json`
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  script:
+    - pip install aws-iplens
+    - status=0
+    - iplens check --plan plan.json --snapshot ci/iplens-ci-snapshot.json
+        --rules ci/iplens-ci-rules.yaml --min-free-pct 10 --format markdown > fit.md || status=$?
+    - cat fit.md
+    # Optional MR comment: a project access token with the api scope in IPLENS_NOTE_TOKEN.
+    - 'if [ -n "$IPLENS_NOTE_TOKEN" ]; then curl --fail -sS -X POST
+        -H "PRIVATE-TOKEN: $IPLENS_NOTE_TOKEN" --data-urlencode "body@fit.md"
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"; fi'
+    - exit $status
+  artifacts:
+    when: always
+    paths: [fit.md]
+```
+
+`--format json` instead gives a report for other tools (`jq '.subnets[] | select(.status != "fits")'`).
+
 ## Alerts
 
 **Settings → Alerts** posts subnet alerts to a webhook. The **Webhook format** setting picks the
@@ -378,6 +527,8 @@ sources, simply not enabled).
 | Extended view: X-Ray | `xray:GetServiceGraph` | optional, skipped with warning |
 | Flow logs | `ec2:DescribeFlowLogs`, `logs:DescribeLogGroups`, `logs:StartQuery`, `logs:GetQueryResults`, `logs:StopQuery` | optional, **opt-in** per run |
 | Trends, Diff, CIDR planner, Report | none – computed from stored snapshots | – |
+| `iplens check` with `--snapshot` | none | – |
+| `iplens check` live mode | `ec2:DescribeSubnets`, `ec2:DescribeNetworkInterfaces`; optional `autoscaling:DescribeAutoScalingGroups`, `ecs:ListClusters`, `ecs:ListServices`, `ecs:DescribeServices` | EC2 ones **required** (error = exit 2); others optional (note, demand skipped) |
 | Terraform sync | `sts:GetCallerIdentity`; S3 backends: `s3:ListBucket`, `s3:GetObject` on the state object, and `sts:AssumeRole` when the backend names a role; other backends: whatever `terraform init` needs to read their state | optional (enrichment off by default) |
 
 Besides the `Describe` / `List` / `Get` prefixes, the guard's explicit allowlist is exactly:
@@ -395,6 +546,9 @@ sources `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListSta
 | `subnet_reserved` | `subnet_ids` | blocks any suggestion touching or targeting the subnets |
 | `min_free_pct` | `percent`, optional `subnet_ids` | blocks moves that drop a subnet below the threshold; flags subnets below it |
 | `protected_eni` | `pattern` (regex) | blocks suggestions that remove matching ENIs |
+
+`iplens check --rules` enforces the same rules on a Terraform plan; see
+[Pre-deploy fit check](#pre-deploy-fit-check-ci).
 
 ```yaml
 rules:

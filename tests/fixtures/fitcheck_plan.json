@@ -1,0 +1,330 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.9.0",
+  "resource_changes": [
+    {
+      "address": "aws_instance.web",
+      "mode": "managed",
+      "type": "aws_instance",
+      "name": "web",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"ami": "ami-0abc1234", "instance_type": "t3.micro", "subnet_id": "subnet-0000000a"},
+        "after_unknown": {"id": true, "private_ip": true}
+      }
+    },
+    {
+      "address": "aws_instance.pending",
+      "mode": "managed",
+      "type": "aws_instance",
+      "name": "pending",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"ami": "ami-0abc1234", "instance_type": "t3.micro"},
+        "after_unknown": {"id": true, "subnet_id": true}
+      }
+    },
+    {
+      "address": "aws_instance.unchanged",
+      "mode": "managed",
+      "type": "aws_instance",
+      "name": "unchanged",
+      "change": {
+        "actions": ["no-op"],
+        "before": {"id": "i-0abc1234", "subnet_id": "subnet-0000000a"},
+        "after": {"id": "i-0abc1234", "subnet_id": "subnet-0000000a"},
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "aws_network_interface.extra",
+      "mode": "managed",
+      "type": "aws_network_interface",
+      "name": "extra",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"subnet_id": "subnet-0000000b", "description": "test-server-a extra"},
+        "after_unknown": {"id": true}
+      }
+    },
+    {
+      "address": "aws_lb.app",
+      "mode": "managed",
+      "type": "aws_lb",
+      "name": "app",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "name": "alb-a",
+          "internal": true,
+          "load_balancer_type": "application",
+          "subnets": ["subnet-0000000a", "subnet-0000000b"]
+        },
+        "after_unknown": {"id": true, "subnets": [false, false]}
+      }
+    },
+    {
+      "address": "aws_lb.nlb",
+      "mode": "managed",
+      "type": "aws_lb",
+      "name": "nlb",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "name": "nlb-a",
+          "internal": true,
+          "load_balancer_type": "network",
+          "subnet_mapping": [{"subnet_id": "subnet-0000000c"}]
+        },
+        "after_unknown": {"id": true, "subnets": true}
+      }
+    },
+    {
+      "address": "aws_lb.partial",
+      "mode": "managed",
+      "type": "aws_lb",
+      "name": "partial",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "name": "alb-b",
+          "internal": true,
+          "load_balancer_type": "application",
+          "subnets": ["subnet-0000000c", null]
+        },
+        "after_unknown": {"id": true, "subnets": [false, true]}
+      }
+    },
+    {
+      "address": "aws_vpc_endpoint.ssm",
+      "mode": "managed",
+      "type": "aws_vpc_endpoint",
+      "name": "ssm",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "service_name": "com.amazonaws.us-east-1.ssm",
+          "vpc_endpoint_type": "Interface",
+          "subnet_ids": ["subnet-0000000a", "subnet-0000000b"]
+        },
+        "after_unknown": {"id": true}
+      }
+    },
+    {
+      "address": "aws_vpc_endpoint.s3",
+      "mode": "managed",
+      "type": "aws_vpc_endpoint",
+      "name": "s3",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"service_name": "com.amazonaws.us-east-1.s3", "vpc_endpoint_type": "Gateway"},
+        "after_unknown": {"id": true}
+      }
+    },
+    {
+      "address": "aws_nat_gateway.ngw",
+      "mode": "managed",
+      "type": "aws_nat_gateway",
+      "name": "ngw",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"subnet_id": "subnet-0000000c", "connectivity_type": "private"},
+        "after_unknown": {"id": true}
+      }
+    },
+    {
+      "address": "aws_ecs_service.api",
+      "mode": "managed",
+      "type": "aws_ecs_service",
+      "name": "api",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "name": "api",
+          "desired_count": 3,
+          "deployment_maximum_percent": 200,
+          "network_configuration": [
+            {
+              "subnets": ["subnet-0000000a", "subnet-0000000b", "subnet-0000000c"],
+              "security_groups": ["sg-0001"]
+            }
+          ]
+        },
+        "after_unknown": {"id": true, "cluster": true}
+      }
+    },
+    {
+      "address": "aws_ecs_service.worker",
+      "mode": "managed",
+      "type": "aws_ecs_service",
+      "name": "worker",
+      "change": {
+        "actions": ["update"],
+        "before": {
+          "name": "worker",
+          "desired_count": 2,
+          "deployment_maximum_percent": 100,
+          "network_configuration": [{"subnets": ["subnet-0000000a", "subnet-0000000b"]}]
+        },
+        "after": {
+          "name": "worker",
+          "desired_count": 4,
+          "deployment_maximum_percent": 100,
+          "network_configuration": [{"subnets": ["subnet-0000000a", "subnet-0000000b"]}]
+        },
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "aws_ecs_service.new_net",
+      "mode": "managed",
+      "type": "aws_ecs_service",
+      "name": "new_net",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"name": "new-net", "desired_count": 2, "network_configuration": [{}]},
+        "after_unknown": {"id": true, "network_configuration": [{"subnets": true}]}
+      }
+    },
+    {
+      "address": "aws_ecs_service.bridge",
+      "mode": "managed",
+      "type": "aws_ecs_service",
+      "name": "bridge",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"name": "bridge", "desired_count": 5, "network_configuration": []},
+        "after_unknown": {"id": true}
+      }
+    },
+    {
+      "address": "aws_autoscaling_group.app",
+      "mode": "managed",
+      "type": "aws_autoscaling_group",
+      "name": "app",
+      "change": {
+        "actions": ["update"],
+        "before": {
+          "name": "asg-a",
+          "max_size": 4,
+          "vpc_zone_identifier": ["subnet-0000000a", "subnet-0000000b"]
+        },
+        "after": {
+          "name": "asg-a",
+          "max_size": 10,
+          "vpc_zone_identifier": ["subnet-0000000a", "subnet-0000000b"]
+        },
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "aws_lambda_function.fn_a",
+      "mode": "managed",
+      "type": "aws_lambda_function",
+      "name": "fn_a",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "function_name": "fn-a",
+          "vpc_config": [
+            {"subnet_ids": ["subnet-0000000a", "subnet-0000000b"], "security_group_ids": ["sg-0001"]}
+          ]
+        },
+        "after_unknown": {"arn": true}
+      }
+    },
+    {
+      "address": "aws_lambda_function.fn_b",
+      "mode": "managed",
+      "type": "aws_lambda_function",
+      "name": "fn_b",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {
+          "function_name": "fn-b",
+          "vpc_config": [{"subnet_ids": ["subnet-0000000b"], "security_group_ids": ["sg-0001"]}]
+        },
+        "after_unknown": {"arn": true}
+      }
+    },
+    {
+      "address": "aws_db_subnet_group.db",
+      "mode": "managed",
+      "type": "aws_db_subnet_group",
+      "name": "db",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"name": "db-group-a", "subnet_ids": ["subnet-0000000a", "subnet-0000000b"]},
+        "after_unknown": {"id": true}
+      }
+    },
+    {
+      "address": "aws_db_instance.db",
+      "mode": "managed",
+      "type": "aws_db_instance",
+      "name": "db",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"identifier": "db-a", "db_subnet_group_name": "db-group-a", "multi_az": true},
+        "after_unknown": {"id": true}
+      }
+    },
+    {
+      "address": "aws_db_instance.lonely",
+      "mode": "managed",
+      "type": "aws_db_instance",
+      "name": "lonely",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {"identifier": "db-b", "db_subnet_group_name": "db-group-elsewhere", "multi_az": false},
+        "after_unknown": {"id": true}
+      }
+    },
+    {
+      "address": "aws_network_interface.old",
+      "mode": "managed",
+      "type": "aws_network_interface",
+      "name": "old",
+      "change": {
+        "actions": ["delete"],
+        "before": {
+          "id": "eni-0abc1234",
+          "subnet_id": "subnet-0000000c",
+          "description": "test-server-a legacy",
+          "tags": {"Name": "test-server-a"}
+        },
+        "after": null,
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "data.aws_subnet.lookup",
+      "mode": "data",
+      "type": "aws_subnet",
+      "name": "lookup",
+      "change": {
+        "actions": ["read"],
+        "before": null,
+        "after": {"id": "subnet-0000000a"},
+        "after_unknown": {}
+      }
+    }
+  ]
+}

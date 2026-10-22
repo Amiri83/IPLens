@@ -1,4 +1,5 @@
-"""``iplens`` command: run the local web UI."""
+"""``iplens`` command: run the local web UI. ``iplens check ...`` is the pre-deploy IP fit
+check for CI (see :mod:`iplens.checkcli`)."""
 
 from __future__ import annotations
 
@@ -107,7 +108,16 @@ def serve_waitress(app: Flask, host: str, port: int, ready: Callable[[], None]) 
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="iplens", description=__doc__)
+    args_in = sys.argv[1:] if argv is None else argv
+    if args_in[:1] == ["check"]:
+        from .checkcli import main as check_main
+
+        sys.exit(check_main(args_in[1:]))
+    parser = argparse.ArgumentParser(
+        prog="iplens",
+        description=__doc__,
+        epilog="Subcommand: iplens check --help (pre-deploy IP fit check for CI).",
+    )
     parser.add_argument(
         "--host", default="127.0.0.1", help="bind address (default: 127.0.0.1, local only)"
     )
@@ -127,7 +137,7 @@ def main(argv: list[str] | None = None) -> None:
         "--debug", action="store_true", help="use the Flask development server with the debugger"
     )
     parser.add_argument("--version", action="version", version=f"iplens {__version__}")
-    args = parser.parse_args(argv)
+    args = parser.parse_args(args_in)
 
     remote = not is_loopback(args.host)
     if remote and not args.allow_remote:

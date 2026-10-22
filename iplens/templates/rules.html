@@ -39,6 +39,14 @@
   </tbody>
 </table>
 
+<div class="card">
+  <h2>Pre-deploy fit check (CI)</h2>
+  <p class="muted small"><code>iplens check --rules iplens-ci-rules.yaml</code> fails a plan that breaks
+    one of these rules: the rules that apply to this account, without the account limit.
+    Use it with the <a href="{{ url_for('headroom_page') }}">snapshot for CI</a> from the Headroom page.</p>
+  <p><a class="btn secondary" href="{{ url_for('rules_export_ci') }}">Export rules for CI</a></p>
+</div>
+
 <details class="advanced">
   <summary>Advanced: import/export (YAML)</summary>
   <p><a class="btn secondary" href="{{ url_for('rules_export') }}">Export YAML</a></p>

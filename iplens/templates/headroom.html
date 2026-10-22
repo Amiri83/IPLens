@@ -24,6 +24,8 @@
     <input type="checkbox" name="surge" value="1" {{ 'checked' if include_surge }} onchange="this.form.submit()">
     include deploy surge</label>
   <noscript><button type="submit">Apply</button></noscript>
+  <a class="btn secondary" href="{{ url_for('headroom_export_ci') }}"
+     title="Subnets, free IPs and the headroom inputs of this snapshot (every subnet, not only the scope) as JSON for `iplens check --snapshot` in CI. No credentials.">Export snapshot for CI</a>
 </form>
 {% for n in h.notes %}<div class="flash warn">{{ n }}</div>{% endfor %}
 

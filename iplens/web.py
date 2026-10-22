@@ -36,6 +36,7 @@ from . import (
     diagram,
     environment,
     extgraph,
+    fitcheck,
     flowlogs,
     headroom,
     ownership,
@@ -982,6 +983,24 @@ def _register(app: Flask) -> None:
             alb_reserve=headroom.ALB_RESERVE,
         )
 
+    @app.get("/headroom/export-ci.json")
+    def headroom_export_ci():
+        """ "Export snapshot for CI": the latest snapshot's subnets, free IPs and headroom
+        inputs for ``iplens check --snapshot`` (all subnets, not just the scope)."""
+        snap = _snapshot_or_none()
+        if not snap:
+            abort(404, "No snapshot yet: refresh the account first.")
+        doc = fitcheck.export_snapshot(_db(), snap)
+        log.info("exported snapshot %s for CI", snap["id"])
+        return Response(
+            json.dumps(doc, indent=2),
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": "attachment; filename=iplens-ci-snapshot.json",
+                "Cache-Control": "no-store",
+            },
+        )
+
     # -- report (one self-contained HTML document) ----------------------------------------
 
     @app.get("/report")
@@ -1646,6 +1665,18 @@ def _register(app: Flask) -> None:
             body,
             mimetype="application/x-yaml",
             headers={"Content-Disposition": "attachment; filename=iplens-rules.yaml"},
+        )
+
+    @app.get("/rules/export-ci.yaml")
+    def rules_export_ci():
+        """Rules for ``iplens check --rules``: those applying to the active account, with
+        the account scope dropped (CI has no IPLens account to match)."""
+        applicable = rules_mod.applicable(rules_mod.list_rules(_db()), _active_ref())
+        body = rules_mod.export_yaml([replace(r, account_ref=None) for r in applicable])
+        return Response(
+            body,
+            mimetype="application/x-yaml",
+            headers={"Content-Disposition": "attachment; filename=iplens-ci-rules.yaml"},
         )
 
     @app.post("/rules/import")

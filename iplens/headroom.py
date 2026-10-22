@@ -462,12 +462,13 @@ def lambda_demand(fns: Iterable[LambdaFn], inputs: Inputs) -> dict[str, list[Con
     return out
 
 
-def analyze(inputs: Inputs, include_surge: bool = True) -> Headroom:
+def analyze(inputs: Inputs, include_surge: bool = True, source: str = "this snapshot") -> Headroom:
     """Every subnet's projected demand at max scale, worst first; ``include_surge`` adds
-    the ECS rolling-deployment surge (:func:`ecs_surge`)."""
+    the ECS rolling-deployment surge (:func:`ecs_surge`). ``source`` names where the
+    inputs came from in the notes about skipped sources."""
     rows = {s.subnet_id: SubnetHeadroom(s) for s in inputs.subnets}
     notes = [
-        f"{what} was skipped in this snapshot: {_MISSING_EFFECT[what]}."
+        f"{what} was skipped in {source}: {_MISSING_EFFECT[what]}."
         for what in SOURCES
         if what in inputs.missing
     ]
