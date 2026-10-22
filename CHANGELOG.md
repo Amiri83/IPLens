@@ -11,6 +11,18 @@
   ids, ARNs, ENI / instance ids, IPs and CIDRs in every result and error. Never calls AWS (the
   process refuses to import boto3) and never writes (read-only SQLite connection). README setup
   for VS Code, Claude Code and Hermes.
+- `iplens mcp --http [--host] [--port] [--allow-remote]`: the same tools over Streamable HTTP
+  (stdio stays the default). A bearer token is required on every request (`$IPLENS_MCP_TOKEN`,
+  else the token stored encrypted by the UI; never on the command line); a foreign browser
+  `Origin` and a foreign `Host` are rejected; a non-loopback host needs `--allow-remote`.
+- **Settings → MCP server**: runs the HTTP server as a child process of IPLens. Start / Stop /
+  Restart, status (running / stopped / error + last error), PID, URL and uptime, plus a header
+  badge; settings for autostart, host, port (checked free before start), redact (on by default),
+  account and remote access (with a warning); saving restarts a running server. Token shown once,
+  copy, regenerate. A crash is shown and retried at most 3 times; the server stops with IPLens
+  (and by itself if IPLens is killed). Its output goes to `mcp-server.log`, shown on the Logs page.
+  **Connect** panel with copy-ready configs for VS Code (`type: http`, token via an input
+  variable), Claude Code (`claude mcp add --transport http`) and the stdio alternative.
 
 ## 1.2.3 – 2026-10-21
 

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import ipaddress
 import os
 import signal
 import sys
@@ -18,21 +17,12 @@ from typing import Any
 from flask import Flask
 
 from . import __version__
+from .mcpconfig import is_loopback
 
 # waitress worker threads serving requests (``iplens`` without --debug).
 THREADS = 8
 # Bind addresses that mean "every interface": the browser URL uses 127.0.0.1 for them.
 WILDCARD_HOSTS = ("0.0.0.0", "::")  # noqa: S104 - names, nothing is bound here
-
-
-def is_loopback(host: str) -> bool:
-    """True if binding ``host`` keeps the server local (``localhost`` or 127.0.0.0/8, ::1)."""
-    if host.lower() == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host.strip("[]")).is_loopback
-    except ValueError:
-        return False
 
 
 def browse_url(host: str, port: int) -> str:
@@ -159,7 +149,11 @@ def main(argv: list[str] | None = None) -> None:
     # child (WERKZEUG_RUN_MAIN) runs the scheduled-Refresh thread.
     serving = not args.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     app = create_app(
-        args.home, port=args.port, scheduler_enabled=serving, allow_remote=args.allow_remote
+        args.home,
+        port=args.port,
+        scheduler_enabled=serving,
+        allow_remote=args.allow_remote,
+        mcp_autostart=serving,
     )
     try:
         if args.debug:

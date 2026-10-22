@@ -451,6 +451,46 @@ mcp_servers:
 When `iplens` is not on the client's `PATH` (e.g. a virtualenv), use the absolute path of the
 command, such as `/path/to/.venv/bin/iplens`.
 
+### HTTP mode, managed from the UI
+
+`iplens mcp --http [--host 127.0.0.1] [--port 8765] [--redact] [--account X]` serves the same
+tools over Streamable HTTP at `http://127.0.0.1:8765/mcp` (stdio stays the default). The same
+read-only and no-AWS guarantees apply, and every request needs `Authorization: Bearer <token>`
+(401 without it). The token comes from `$IPLENS_MCP_TOKEN`, else the one stored encrypted by
+**Settings → MCP server**; it is never passed on the command line. A browser request with a
+foreign `Origin` is rejected (403); clients that send no Origin (editors, CLIs) are fine. A
+non-loopback `--host` is refused unless `--allow-remote` is passed: the token is then the only
+protection, and plain HTTP is not encrypted.
+
+**Settings → MCP server** runs it as a child process of IPLens: Start / Stop / Restart, the status
+(running / stopped / error with the last error), PID, URL and uptime, with a status badge in the
+header. Settings: start with IPLens, host, port (it must be free), redact (on by default),
+account, allow remote access. Saving restarts a running server. The token is generated on the first
+start (or with *Generate token*), shown once to copy, and can be regenerated. A crashed server is
+shown in the UI and retried at most 3 times; it is stopped when IPLens stops. Its output goes to
+`mcp-server.log` in the log directory (Logs page → *MCP server*). The **Connect** panel there has
+copy-ready configs:
+
+```json
+{
+  "inputs": [
+    {"type": "promptString", "id": "iplens-mcp-token", "description": "IPLens MCP token", "password": true}
+  ],
+  "servers": {
+    "iplens": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {"Authorization": "Bearer ${input:iplens-mcp-token}"}
+    }
+  }
+}
+```
+
+```bash
+export IPLENS_MCP_TOKEN=...   # the token from Settings → MCP server
+claude mcp add --transport http iplens http://127.0.0.1:8765/mcp --header "Authorization: Bearer $IPLENS_MCP_TOKEN"
+```
+
 ## Alerts
 
 **Settings → Alerts** posts subnet alerts to a webhook. The **Webhook format** setting picks the
