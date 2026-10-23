@@ -19,13 +19,14 @@ import logging
 import secrets
 import socket
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import Any
+
+import uvicorn
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .logging_setup import LOG_FORMAT, RedactingFilter
 from .mcpconfig import MCP_PATH, url_host
-
-if TYPE_CHECKING:
-    from mcp.server.mcpserver import MCPServer
 
 log = logging.getLogger("iplens.mcp")
 
@@ -157,8 +158,6 @@ def configure_logging() -> None:
 
 def app(server: MCPServer, token: str, host: str, port: int, allow_remote: bool) -> Guard:
     """The guarded ASGI app: stateless Streamable HTTP with JSON responses at MCP_PATH."""
-    from mcp.server.transport_security import TransportSecuritySettings
-
     inner = server.streamable_http_app(
         streamable_http_path=MCP_PATH,
         stateless_http=True,
@@ -172,8 +171,6 @@ def app(server: MCPServer, token: str, host: str, port: int, allow_remote: bool)
 
 def serve(sock: socket.socket, asgi: Guard, host: str, port: int) -> None:
     """Serve until SIGTERM / SIGINT (uvicorn shuts down gracefully)."""
-    import uvicorn
-
     config = uvicorn.Config(
         asgi,
         log_config=None,  # our stderr handler

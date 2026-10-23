@@ -8,8 +8,8 @@ AWS documentation account id and made-up resource ids / names.
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -23,6 +23,7 @@ from iplens import fitcheck, mcptools
 from iplens import rules as rules_mod
 from iplens.checkcli import main as check_main
 from iplens.db import closing, init_db
+from iplens.mcpconfig import DISABLED_MESSAGE, ENABLED_KEY
 from iplens.mcptools import Redactor, ToolInputError, Tools, unique_labels
 from tests.conftest import SnapshotBuilder, add_test_account, ip_range
 
@@ -120,12 +121,24 @@ def _accounts(db: Path) -> list[int]:
         return [r["id"] for r in conn.execute("SELECT id FROM accounts ORDER BY id")]
 
 
+def set_mcp_enabled(db: Path, on: bool = True) -> None:
+    """Settings → MCP server → Enable MCP server (off in a fresh database)."""
+    with closing(db) as conn:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (ENABLED_KEY, "1" if on else "0"),
+        )
+
+
 @pytest.fixture
 def mcp_home(tmp_path) -> Path:
+    """A data directory with the fixture database and MCP enabled."""
     home = tmp_path / "home"
     home.mkdir()
     init_db(home / "iplens.db")
     build_db(home / "iplens.db")
+    set_mcp_enabled(home / "iplens.db")
     return home
 
 
@@ -594,10 +607,6 @@ def test_connection_is_read_only(db):
 
 # -- the MCP server -------------------------------------------------------------------------
 
-needs_mcp = pytest.mark.skipif(
-    importlib.util.find_spec("mcp") is None, reason="needs the mcp extra"
-)
-
 
 def _run(coro):
     import anyio
@@ -614,7 +623,6 @@ async def _call_all(server) -> list[dict]:
     return out
 
 
-@needs_mcp
 def test_server_lists_read_only_tools(tools):
     from iplens.mcpserver import build_server
 
@@ -628,7 +636,6 @@ def test_server_lists_read_only_tools(tools):
         assert t.description
 
 
-@needs_mcp
 def test_server_calls_tools_and_reports_errors(db):
     from mcp.server.mcpserver.exceptions import ToolError
 
@@ -646,7 +653,6 @@ def test_server_calls_tools_and_reports_errors(db):
 # -- never AWS ------------------------------------------------------------------------------
 
 
-@needs_mcp
 def test_no_boto3_client_is_created(db, monkeypatch):
     """Every client / session constructor of boto3 and botocore fails loudly; every tool
     still answers through the MCP server."""
@@ -702,7 +708,6 @@ print(json.dumps(sorted(m for m in sys.modules if m.split(".")[0] in AWS_SDK_MOD
 """
 
 
-@needs_mcp
 @pytest.mark.parametrize("mode", ["plain", "block"])
 def test_mcp_code_path_never_imports_the_aws_sdk(db, mode):
     """In a fresh interpreter: importing the CLI and the server and running every tool
@@ -752,7 +757,6 @@ def _iplens(*args: str, **kwargs) -> subprocess.CompletedProcess:
     )
 
 
-@needs_mcp
 def test_cli_help_and_errors(mcp_home, tmp_path):
     proc = _iplens("mcp", "--help")
     assert proc.returncode == 0 and "--redact" in proc.stdout and "--account" in proc.stdout
@@ -764,29 +768,41 @@ def test_cli_help_and_errors(mcp_home, tmp_path):
     assert proc.returncode == 2 and "no IPLens database" in proc.stderr
 
 
-def test_cli_without_the_extra_explains_how_to_install(mcp_home):
-    script = (
-        "import importlib.abc, sys\n"
-        "class NoMcp(importlib.abc.MetaPathFinder):\n"
-        "    def find_spec(self, name, path=None, target=None):\n"
-        "        if name.split('.')[0] == 'mcp':\n"
-        "            raise ImportError(name)\n"
-        "sys.meta_path.insert(0, NoMcp())\n"
-        "from iplens.cli import main\n"
-        "main(['mcp', '--home', sys.argv[1]])\n"
-    )
-    proc = subprocess.run(  # noqa: S603
-        [sys.executable, "-c", script, str(mcp_home)],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert proc.returncode == 2
-    assert "pip install 'aws-iplens[mcp]'" in proc.stderr
+def test_cli_refuses_to_run_while_mcp_is_disabled(mcp_home):
+    """stdio and --http alike: exit 2 with the message, nothing on the protocol channel."""
+    set_mcp_enabled(mcp_home / "iplens.db", False)
+    env = {**os.environ, "IPLENS_MCP_TOKEN": "test-token-0123456789abcdef"}
+    for extra in ([], ["--http"]):
+        proc = _iplens("mcp", "--home", str(mcp_home), *extra, env=env)
+        assert proc.returncode == 2, (extra, proc.stderr)
+        assert DISABLED_MESSAGE in proc.stderr and proc.stdout == ""
 
 
-@needs_mcp
+def test_cli_refuses_a_fresh_install(tmp_path):
+    """A fresh database (default settings): MCP is off."""
+    home = tmp_path / "fresh"
+    home.mkdir()
+    init_db(home / "iplens.db")
+    build_db(home / "iplens.db")
+    proc = _iplens("mcp", "--home", str(home))
+    assert proc.returncode == 2 and DISABLED_MESSAGE in proc.stderr
+
+
+def test_running_server_refuses_calls_once_disabled(db):
+    """No restart needed: a running (e.g. stdio) server checks the switch on every call."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from iplens.mcpserver import build_server
+
+    server = build_server(Tools(db))
+    assert not _run(server.call_tool("lookup_ip", {"ip": "192.0.2.12"})).is_error
+    set_mcp_enabled(db, False)
+    with pytest.raises(ToolError, match=DISABLED_MESSAGE):
+        _run(server.call_tool("lookup_ip", {"ip": "192.0.2.12"}))
+    set_mcp_enabled(db, True)
+    assert not _run(server.call_tool("lookup_ip", {"ip": "192.0.2.12"})).is_error
+
+
 def test_stdio_end_to_end(mcp_home):
     """A real MCP client speaking to `python -m iplens mcp` over stdio."""
     from mcp import ClientSession, StdioServerParameters

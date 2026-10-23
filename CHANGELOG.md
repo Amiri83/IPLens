@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The MCP server is part of the core install: `mcp` (and `uvicorn`, its HTTP mode) are regular
+  dependencies, so a plain `pip install aws-iplens` is enough. The `aws-iplens[mcp]` extra is
+  kept as an empty alias and still installs.
+
+### Added
+
+- **Settings → MCP server → Enable MCP server**: a master switch, **off by default** (also after
+  an upgrade: turn it on to keep using MCP). While it is off the Start / Restart buttons are
+  disabled, "start with IPLens" is ignored, the header badge is hidden, and `iplens mcp` (stdio
+  and `--http`) exits with status 2: "MCP is disabled in IPLens Settings"; a server already
+  running refuses tool calls. Saving with it off stops the running server. Takes effect at once
+  (no IPLens restart); enabling / disabling is logged.
+
 ## 1.3.0 – 2026-10-22
 
 ### Added

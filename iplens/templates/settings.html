@@ -218,7 +218,8 @@
     lookup, snapshot diffs, fit check) over Streamable HTTP to editors and AI assistants. It runs as a separate
     process started by IPLens, reads the local database only and never calls AWS. Every request needs the bearer
     token below; requests from a browser page of another origin are rejected.</p>
-  {% if not mcp_available %}<div class="flash warn">{{ mcp_extra_hint }}</div>{% endif %}
+  {% if not mcp.enabled %}<div class="flash warn mcp-disabled">MCP is disabled: tick <b>Enable MCP server</b> below
+    and save to start it. While disabled, <span class="mono">iplens mcp</span> (stdio and HTTP) refuses to run.</div>{% endif %}
   {% if mcp.allow_remote and mcp.remote %}
     <div class="flash warn mcp-remote-warning"><b>Remote access is enabled:</b> the MCP server listens on
       <span class="mono">{{ mcp.host }}</span> and is reachable from other machines. The bearer token is its only
@@ -238,7 +239,7 @@
     {% for action, label, cls in (('start', 'Start', ''), ('restart', 'Restart', 'secondary'), ('stop', 'Stop', 'danger')) %}
     <form class="inline" method="post" action="{{ url_for('mcp_' ~ action) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button type="submit" class="{{ cls }}"{% if (action == 'start' and (st.state in ('running', 'starting') or not mcp_available)) or (action == 'restart' and not mcp_available) or (action == 'stop' and st.state not in ('running', 'starting')) %} disabled{% endif %}>{{ label }}</button>
+      <button type="submit" class="{{ cls }}"{% if (action == 'start' and (st.state in ('running', 'starting') or not mcp.enabled)) or (action == 'restart' and not mcp.enabled) or (action == 'stop' and st.state not in ('running', 'starting')) %} disabled{% endif %}>{{ label }}</button>
     </form>
     {% endfor %}
   </div>
@@ -247,6 +248,8 @@
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <h3>Settings</h3>
     <label class="check"><input type="checkbox" name="enabled" value="1" {{ 'checked' if mcp.enabled }}>
+      <b>Enable MCP server</b> (off: no MCP server at all; saving stops a running one)</label>
+    <label class="check"><input type="checkbox" name="autostart" value="1" {{ 'checked' if mcp.autostart }}>
       Start the MCP server with IPLens</label>
     <div class="row">
       <div><label for="mcp-host">Host</label>

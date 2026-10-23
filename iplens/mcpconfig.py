@@ -30,17 +30,27 @@ TOKEN_ENV = "IPLENS_MCP_TOKEN"  # noqa: S105 - a variable name, not a secret
 TOKEN_BYTES = 32
 MIN_TOKEN_LENGTH = 16
 MAX_ACCOUNT = 64
+DISABLED_MESSAGE = "MCP is disabled in IPLens Settings"
 _HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 
 # Settings rows.
-_ENABLED_KEY = "mcp_enabled"
+ENABLED_KEY = "mcp_server_enabled"  # the master switch: off = no MCP at all
+_AUTOSTART_KEY = "mcp_enabled"  # its name predates the master switch
 _HOST_KEY = "mcp_host"
 _PORT_KEY = "mcp_port"
 _REDACT_KEY = "mcp_redact"
 _ACCOUNT_KEY = "mcp_account"
 _REMOTE_KEY = "mcp_allow_remote"
 _TOKEN_KEY = "mcp_token_enc"  # noqa: S105 - a settings row name
-_SETTING_KEYS = (_ENABLED_KEY, _HOST_KEY, _PORT_KEY, _REDACT_KEY, _ACCOUNT_KEY, _REMOTE_KEY)
+_SETTING_KEYS = (
+    ENABLED_KEY,
+    _AUTOSTART_KEY,
+    _HOST_KEY,
+    _PORT_KEY,
+    _REDACT_KEY,
+    _ACCOUNT_KEY,
+    _REMOTE_KEY,
+)
 
 
 def is_loopback(host: str) -> bool:
@@ -115,7 +125,8 @@ def check_token(token: str) -> str:
 
 @dataclass(frozen=True)
 class McpSettings:
-    enabled: bool = False  # start with IPLens
+    enabled: bool = False  # the master switch (Enable MCP server)
+    autostart: bool = False  # start with IPLens (when enabled)
     host: str = DEFAULT_HOST
     port: int = DEFAULT_PORT
     redact: bool = True
@@ -146,6 +157,11 @@ class McpSettings:
 def _get(conn: sqlite3.Connection, key: str) -> str:
     row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return (row[0] if row else "") or ""
+
+
+def is_enabled(conn: sqlite3.Connection) -> bool:
+    """True if Settings → MCP server → Enable MCP server is on (off by default)."""
+    return _get(conn, ENABLED_KEY) == "1"
 
 
 def read_token(conn: sqlite3.Connection, box: SecretBox) -> str:
@@ -183,7 +199,8 @@ class McpStore:
         except ValueError:
             port = DEFAULT_PORT
         return McpSettings(
-            enabled=raw[_ENABLED_KEY] == "1",
+            enabled=raw[ENABLED_KEY] == "1",
+            autostart=raw[_AUTOSTART_KEY] == "1",
             host=host,
             port=port,
             redact=raw[_REDACT_KEY] != "0",  # on unless turned off
@@ -195,6 +212,7 @@ class McpStore:
         self,
         *,
         enabled: bool,
+        autostart: bool,
         host: str,
         port: str | int,
         redact: bool,
@@ -204,6 +222,7 @@ class McpStore:
         """Validate and store; ValueError (nothing stored) if a value is invalid."""
         settings = McpSettings(
             enabled=enabled,
+            autostart=autostart,
             host=parse_host(host, allow_remote),
             port=parse_port(port),
             redact=redact,
@@ -212,7 +231,8 @@ class McpStore:
         )
         self._set(
             {
-                _ENABLED_KEY: "1" if settings.enabled else "0",
+                ENABLED_KEY: "1" if settings.enabled else "0",
+                _AUTOSTART_KEY: "1" if settings.autostart else "0",
                 _HOST_KEY: settings.host,
                 _PORT_KEY: str(settings.port),
                 _REDACT_KEY: "1" if settings.redact else "0",
