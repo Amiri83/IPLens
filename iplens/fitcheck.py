@@ -42,7 +42,7 @@ from typing import Any
 
 from . import __version__, headroom
 from . import rules as rules_mod
-from .headroom import ALB_RESERVE, Contributor, EcsService, Inputs, Subnet
+from .headroom import ALB_ASSUMPTION, ALB_RESERVE, Contributor, EcsService, Inputs, Subnet
 
 SNAPSHOT_FORMAT = "iplens-ci-snapshot"
 SNAPSHOT_VERSION = 1
@@ -505,7 +505,7 @@ def _lb(v: dict[str, Any], u: Any, ctx: _Ctx) -> _Found:
     lb_type = v.get("load_balancer_type") or "application"
     ids, unknown = _either(_strings(v, u, "subnets"), _strings(v, u, "subnet_mapping", "subnet_id"))
     if lb_type == "application":
-        per, text = ALB_RESERVE, f"ALB: AWS needs ≥ {ALB_RESERVE} free IPs per subnet to scale"
+        per, text = ALB_RESERVE, f"ALB: {ALB_ASSUMPTION}"
     else:
         per, text = 1, f"{'NLB' if lb_type == 'network' else 'GWLB'}: 1 ENI per subnet"
     return _per_subnet(ids, unknown, per, text, "subnet")

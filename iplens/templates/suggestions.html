@@ -11,6 +11,7 @@
   <span class="muted">{{ totals.blocked }} more are blocked by <a href="{{ url_for('rules_list') }}">rules</a></span>
   <div class="muted">Estimates; alternative suggestions for the same resources can overlap. IPLens never changes AWS — apply changes through your normal process.</div>
 </div>
+{% for n in notes %}<div class="note">{{ n }}</div>{% endfor %}
 <table>
   <thead><tr><th>Type</th><th>Suggestion</th><th>IPs saved</th><th>Status</th></tr></thead>
   <tbody>

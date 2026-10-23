@@ -153,9 +153,16 @@ class Job:
     # Refresh only: {"resource": seconds, "overall": seconds} and the resource rows.
     limits: dict[str, int] = field(default_factory=dict)
     resources: list[Resource] = field(default_factory=list)
+    # Refresh only: the snapshot a "Retry skipped" of this job copies from (the one the
+    # job wrote; a failed retry: the one it was copying from). None: unknown.
+    source_snapshot: int | None = None
 
     def resources_dict(self) -> dict[str, Any]:
-        return {"limits": self.limits, "items": [r.as_dict() for r in self.resources]}
+        return {
+            "limits": self.limits,
+            "items": [r.as_dict() for r in self.resources],
+            "source_snapshot": self.source_snapshot,
+        }
 
     def as_dict(self) -> dict[str, Any]:
         end = self.finished if self.finished is not None else time.monotonic()
@@ -309,6 +316,13 @@ class JobContext:
                     row.started = now
                 row.finished = now
 
+    def set_source_snapshot(self, snapshot_id: int | None) -> None:
+        """The snapshot a "Retry skipped" of this Refresh copies the other types from."""
+        with self._manager._lock:
+            if self._muted():
+                return
+            self._job.source_snapshot = int(snapshot_id) if snapshot_id else None
+
     @contextmanager
     def bind(self) -> Iterator[JobContext]:
         """Route this thread's ``iplens`` log records into the job's log tail."""
@@ -433,7 +447,13 @@ class JobManager:
                         d["error"],
                         json.dumps(d["messages"]),
                         json.dumps(d["log"][-LOG_TAIL:]),
-                        json.dumps({"limits": d["limits"], "items": d["items"]}),
+                        json.dumps(
+                            {
+                                "limits": d["limits"],
+                                "items": d["items"],
+                                "source_snapshot": d["source_snapshot"],
+                            }
+                        ),
                     ),
                 )
                 # Keep the newest few jobs per account.
@@ -467,6 +487,7 @@ class JobManager:
             "log": json.loads(row["log"] or "[]"),
             "limits": resources.get("limits") or {},
             "items": resources.get("items") or [],
+            "source_snapshot": resources.get("source_snapshot"),
         }
 
     # -- queries -----------------------------------------------------------------------

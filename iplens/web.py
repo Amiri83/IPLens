@@ -762,11 +762,20 @@ def _register(app: Flask) -> None:
             flash("Add an AWS account in Settings first.", "error")
             return redirect(url_for("settings_page"))
         # "Retry skipped": only the skipped resource types (unknown names: a full Refresh);
-        # the others are copied from the account's latest successful snapshot, the one the
-        # skipped resources are missing from (none: a full Refresh).
+        # the others are copied from the snapshot of the job being retried (``source``, the
+        # one the skipped resources are missing from), not whatever is latest by now. A
+        # source that is gone or another account's makes it a full Refresh (Collector).
+        # Without one (a job from before this was recorded): the latest snapshot.
         only = [name[:MAX_RESOURCE_NAME] for name in request.form.getlist("only")[:MAX_RETRY]]
-        source = queries.latest_snapshot(_db(), active.id) if only else None
-        work = _refresh_work(active.id, only or None, source["id"] if source else None)
+        source_id: int | None = None
+        if only:
+            raw_source = request.form.get("source", "")
+            if raw_source.isdigit():
+                source_id = int(raw_source)
+            else:
+                latest = queries.latest_snapshot(_db(), active.id)
+                source_id = latest["id"] if latest else None
+        work = _refresh_work(active.id, only or None, source_id)
         return _run_job(active.id, "refresh", work, url_for("overview"))
 
     def _refresh_work(
@@ -801,6 +810,8 @@ def _register(app: Flask) -> None:
         )
 
         def work(ctx: JobContext) -> None:
+            # Until a snapshot is saved, a retry of this job builds on what it copies from.
+            ctx.set_source_snapshot(source_snapshot)
             try:
                 gw = factory(account)
                 result = Collector(
@@ -815,6 +826,8 @@ def _register(app: Flask) -> None:
                     only=only,
                     source_snapshot=source_snapshot,
                 ).run()
+                # A retry of this job's skipped types builds on the snapshot it wrote.
+                ctx.set_source_snapshot(result.snapshot_id)
                 with closing(db_path) as conn:
                     pruned = retention_mod.apply(conn, policy)
                 if pruned:
@@ -1785,7 +1798,11 @@ def _register(app: Flask) -> None:
             rules = rules_mod.applicable(rules_mod.list_rules(_db()), _active_ref())
             items = sugg_mod.generate(ctx, rules)
         return render_template(
-            "suggestions.html", snap=snap, items=items, totals=sugg_mod.totals(items)
+            "suggestions.html",
+            snap=snap,
+            items=items,
+            totals=sugg_mod.totals(items),
+            notes=ctx.notes if ctx else [],
         )
 
     # -- scope -------------------------------------------------------------------

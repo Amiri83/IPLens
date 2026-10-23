@@ -23,6 +23,27 @@
   (and by itself if IPLens is killed). Its output goes to `mcp-server.log`, shown on the Logs page.
   **Connect** panel with copy-ready configs for VS Code (`type: http`, token via an input
   variable), Claude Code (`claude mcp add --transport http`) and the stdio alternative.
+- Suggestions **Underused subnet** (under 10% used in every snapshot of the last 30 days: the
+  smallest prefix fitting 2× the peak, saving the usable-IP difference; `min_free_pct` and
+  `subnet_reserved` rules apply) and **Unused endpoint** ("possibly unused": an interface endpoint
+  without traffic in the flow log queries of the last 14 days, once those cover at least 24 hours
+  over at least 3 distinct days; the detail states the coverage). Checks that cannot be made
+  (short history, no or too little flow log data for a VPC) are listed as notes on the page, in
+  the report and in MCP.
+- MCP tool `suggestions` (redacted with `--redact` like every tool).
+
+### Changed
+
+- **Detached ENI** suggestions need the ENI detached in every snapshot of the last 7 days and
+  show "detached since <date>".
+- `iplens check` live mode reads `application-autoscaling:DescribeScalableTargets` for the ECS
+  services found, so their maximum matches the headroom model (they no longer count only up to
+  their desired count).
+- **Retry skipped** copies the other resource types from the snapshot of the job being retried,
+  not from whichever snapshot is the latest when it is clicked.
+- Headroom / fit check ALB assumption reads "8 IPs per ALB per subnet".
+- CI: GitHub Actions on their Node 24 majors (checkout v7, setup-python v7, upload-artifact v7,
+  download-artifact v8).
 
 ## 1.2.3 – 2026-10-21
 

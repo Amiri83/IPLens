@@ -222,6 +222,8 @@ class Report:
     allowed: list[sugg_mod.Suggestion]
     blocked: list[sugg_mod.Suggestion]
     totals: dict[str, int]
+    # Suggestion checks that could not be made (short history, no flow log data).
+    suggestion_notes: list[str]
     headroom: list[VpcHeadroom]
     ownership: ownership.OwnershipReport | None
     # Free IPs vs. demand at max scale per subnet (headroom.py).
@@ -402,6 +404,7 @@ def build(
         allowed=[s for s in items if not s.blocked],
         blocked=[s for s in items if s.blocked],
         totals=sugg_mod.totals(items),
+        suggestion_notes=ctx.notes,
         headroom=headroom,
         ownership=ownership.report(conn, snap_id, own),
         scale=scale,

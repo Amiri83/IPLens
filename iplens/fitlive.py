@@ -11,10 +11,12 @@ read-only guard) with the Refresh timeouts of :func:`iplens.aws.call_timeouts`:
 - ``autoscaling:DescribeAutoScalingGroups`` and ``ecs:ListClusters`` /
   ``ecs:ListServices`` / ``ecs:DescribeServices``, kept for the groups and services in
   those subnets (optional: an error is a note and that demand is not counted).
+- ``application-autoscaling:DescribeScalableTargets`` for those ECS services (only when
+  there are any): their ``MaxCapacity``, as in the headroom model of a snapshot (optional:
+  an error is a note and the services count up to their desired count).
 
-Not called: Application Auto Scaling (ECS services are assumed not to scale beyond their
-desired count) and ``lambda:ListFunctions`` (existing functions' combinations without an
-ENI are not counted); both are named in the notes.
+Not called: ``lambda:ListFunctions`` (existing functions' combinations without an ENI are
+not counted); named in the notes.
 """
 
 from __future__ import annotations
@@ -34,7 +36,14 @@ from . import headroom
 from .attribution import attribute_eni
 from .aws import AwsGateway, ReadOnlyViolation, call_timeouts
 from .cidrplan import SUBNET_RESERVED
-from .collector import _arn_name, _chunks, _ecs_service_row, _paginate, asg_rows
+from .collector import (
+    _arn_name,
+    _chunks,
+    _ecs_service_row,
+    _paginate,
+    asg_rows,
+    ecs_scalable_target_rows,
+)
 from .fitcheck import CheckError, Source
 from .headroom import Asg, EcsService, Inputs, LoadBalancer, Subnet
 from .settings import DEFAULT_RESOURCE_TIMEOUT, REQUIRED_RESOURCE_TIMEOUT
@@ -44,6 +53,8 @@ log = logging.getLogger(__name__)
 # EC2 filters take at most 200 values.
 _FILTER_VALUES = 200
 _ECS_SERVICE_BATCH = 10
+# DescribeScalableTargets takes at most 50 ResourceIds.
+_SCALABLE_TARGET_BATCH = 50
 _ALB_DESCRIPTION = re.compile(r"^ELB app/(?P<name>[^/]+)/")
 
 
@@ -134,6 +145,25 @@ def _ecs(gw: AwsGateway, timeout: float, wanted: set[str]) -> list[EcsService]:
     return out
 
 
+def _ecs_max(
+    gw: AwsGateway, timeout: float, services: list[EcsService]
+) -> dict[tuple[str, str], int]:
+    """(cluster, service) -> MaxCapacity of the services' ecs:service:DesiredCount targets."""
+    client = gw.client("application-autoscaling", config=call_timeouts(timeout))
+    ids = sorted({f"service/{s.cluster}/{s.service}" for s in services})
+    targets: list[dict[str, Any]] = []
+    for batch in _chunks(ids, _SCALABLE_TARGET_BATCH):
+        targets += _paginate(
+            client,
+            "describe_scalable_targets",
+            "ScalableTargets",
+            ServiceNamespace="ecs",
+            ResourceIds=batch,
+            ScalableDimension="ecs:service:DesiredCount",
+        )
+    return {(c, s): top for c, s, _lo, top in ecs_scalable_target_rows(targets)}
+
+
 def _from_enis(enis: Iterable[dict[str, Any]]) -> dict[str, Any]:
     instance_enis: dict[str, list[str]] = defaultdict(list)
     lb_eni_subnets: dict[str, set[str]] = defaultdict(set)
@@ -166,7 +196,7 @@ def load(
     required-resource one). CheckError when the required calls fail."""
     ids = sorted(set(subnet_ids))
     notes: list[str] = []
-    missing: set[str] = {headroom.SCALING_SOURCE, headroom.LAMBDA_SOURCE}
+    missing: set[str] = {headroom.LAMBDA_SOURCE}
     if not ids:
         return Inputs(subnets=[], missing=frozenset(missing)), _source(gw), notes
     core = gw.client("ec2", config=call_timeouts(max(timeout, REQUIRED_RESOURCE_TIMEOUT)))
@@ -190,8 +220,23 @@ def load(
     except (BotoCoreError, ClientError) as exc:
         missing.add(headroom.ECS_SOURCE)
         notes.append(f"ECS services could not be read ({_skipped('ECS', exc)}).")
+    ecs_max: dict[tuple[str, str], int] = {}
+    if ecs:
+        try:
+            ecs_max = _ecs_max(gw, timeout, ecs)
+        except (BotoCoreError, ClientError) as exc:
+            missing.add(headroom.SCALING_SOURCE)
+            notes.append(
+                "application-autoscaling:DescribeScalableTargets failed "
+                f"({_skipped('Application Auto Scaling', exc)})."
+            )
     inputs = Inputs(
-        subnets=subnets, asgs=asgs, ecs=ecs, missing=frozenset(missing), **_from_enis(enis)
+        subnets=subnets,
+        asgs=asgs,
+        ecs=ecs,
+        ecs_max=ecs_max,
+        missing=frozenset(missing),
+        **_from_enis(enis),
     )
     return inputs, _source(gw), notes
 

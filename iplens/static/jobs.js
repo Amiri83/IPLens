@@ -42,6 +42,7 @@
   let timer = null;
   let running = false;
   let skippedNames = [];  // resource types the last rendered Refresh skipped
+  let retrySource = null;  // the snapshot that Refresh's retry copies the rest from
 
   const url = (template, id) => template.replace("__ID__", encodeURIComponent(id));
 
@@ -107,6 +108,7 @@
     }));
     const skipped = items.filter((r) => r.status === "skipped");
     skippedNames = skipped.map((r) => r.name);
+    retrySource = job.source_snapshot || null;
     skippedBox.hidden = running || skipped.length === 0;
     skippedList.replaceChildren(...skipped.map((r) => {
       const li = document.createElement("li");
@@ -262,9 +264,12 @@
 
   // "Retry skipped": a new Refresh of the active account that collects only the skipped
   // resource types (plus VPCs, subnets and ENIs, which every snapshot needs); the server
-  // copies the other resource types from the latest snapshot, so the new one is complete.
+  // copies the other resource types from this job's own snapshot (not whatever is latest
+  // by the time of the click), so the new one is complete.
   retryBtn.addEventListener("click", () => {
-    startJob(modal.dataset.refreshUrl, { only: skippedNames }, [retryBtn]);
+    const fields = { only: skippedNames };
+    if (retrySource) fields.source = String(retrySource);
+    startJob(modal.dataset.refreshUrl, fields, [retryBtn]);
   });
 
   // Re-attach after a reload or on another page: the account's running job (kept hidden

@@ -185,7 +185,18 @@ mode `0700`). Delete it to reset IPLens completely.
    unmanaged; at most 50 unowned resources are looked up per Refresh. With the Terraform
    enrichment off, Refresh no longer re-syncs Terraform repos (the Sync buttons still work).
 6. Define **Rules** (GUI or YAML import/export) and review **Suggestions**; anything a rule forbids is
-   greyed out together with the IPs it would have saved.
+   greyed out together with the IPs it would have saved. Three suggestions use the snapshot
+   history and say so in a note when it cannot tell yet:
+   - **Detached ENI**: detached in *every* snapshot of the last 7 days (shown "detached since
+     <date>").
+   - **Underused subnet**: under 10% used in every snapshot of the last 30 days; suggests the
+     smallest prefix (/28 to /16) whose usable IPs fit twice the peak, saving the difference in
+     usable IPs (recreate the subnet at that size).
+   - **Unused endpoint**: an interface VPC endpoint whose ENIs had no traffic in the flow log
+     queries (Visual → Extended view → Flow logs) of the last 14 days, suggested as "possibly
+     unused" only once those queries cover at least 24 hours (overlapping windows counted once)
+     spread over at least 3 distinct days; otherwise skipped with a note giving the coverage so
+     far (or saying the VPC has no flow log data).
 7. **Logs** shows the application log file.
 
 ## Trends
@@ -222,7 +233,7 @@ here of 12 more over 2 subnets, 1 ENI per instance)":
   `maximumPercent` defaults to 200 when unset; blue/green (`CODE_DEPLOY`) and `EXTERNAL`
   deployments, and `maximumPercent` ≤ 100, add none. The page's **include deploy surge** toggle
   (on by default) leaves it out.
-- **ALB**: AWS needs at least 8 free IPs per ALB subnet to scale, so 8 are reserved per subnet.
+- **ALB**: 8 IPs per ALB per subnet (AWS needs at least 8 free IPs in each ALB subnet to scale).
 - **Lambda**: invocations take no IPs; only a subnet / security group combination without an ENI
   yet costs 1 IP.
 
@@ -271,7 +282,7 @@ resources count; each one is listed with its assumption:
 |---|---|
 | `aws_instance` | 1 per instance (primary ENI; instances attaching `network_interface` blocks are counted on the interface) |
 | `aws_network_interface` | 1 |
-| `aws_lb` application | 8 per subnet (AWS needs ≥ 8 free IPs per ALB subnet to scale) |
+| `aws_lb` application | 8 IPs per ALB per subnet (AWS needs them free to scale) |
 | `aws_lb` network / gateway | 1 per subnet |
 | `aws_vpc_endpoint` Interface / GatewayLoadBalancer | 1 per subnet (Gateway endpoints: none) |
 | `aws_nat_gateway` | 1 |
@@ -296,10 +307,11 @@ failure. A subnet id the data does not know is an error (a stale snapshot, anoth
   (`--timeout`, default 30 s; subnets / ENIs at least 120 s), and only for the subnets involved:
   `ec2:DescribeSubnets` and `ec2:DescribeNetworkInterfaces` filtered to them (required), then
   `autoscaling:DescribeAutoScalingGroups`, `ecs:ListClusters`, `ecs:ListServices` and
-  `ecs:DescribeServices` (optional: an error is a note and that demand is skipped). ALBs come from
-  their ENIs and Lambda combinations from the Lambda ENIs. Application Auto Scaling and Lambda are
-  not called, so ECS services count up to their desired count and existing functions' new
-  combinations are not counted; both are named in the notes.
+  `ecs:DescribeServices`, and `application-autoscaling:DescribeScalableTargets` for the ECS
+  services found, so their maximum is the same as in the headroom model (optional: an error is a
+  note and that demand is skipped, or for scalable targets, the services count up to their desired
+  count). ALBs come from their ENIs and Lambda combinations from the Lambda ENIs. Lambda is not
+  called, so existing functions' new combinations are not counted; that is named in the notes.
 
 **Rules.** **Rules → Export rules for CI** downloads the rules that apply to the active account
 (without the account limit). `--rules` also takes the full YAML export; a rule limited to another
@@ -409,6 +421,7 @@ writes anything; run a Refresh in the UI to update the data. Every result carrie
 | `lookup_ip(ip)` | ENI, owning resource, ownership and subnet; or free / reserved by AWS |
 | `changes(since="latest-1")` | snapshot diff summary; `since`: `latest-N`, a snapshot id or an ISO date |
 | `fit_check(subnet, need, min_free_pct?, include_surge?)` | exactly `iplens check --subnet --need` against the latest snapshot and the saved rules |
+| `suggestions(kind?, include_blocked?, endpoint_days?, limit?, offset?)` | the Suggestions page: IPs each saves, allowed / blocked by which rule, and notes on checks that could not be made |
 
 Subnets and VPCs can be given by id or by name. Options:
 
@@ -636,7 +649,7 @@ sources, simply not enabled).
 | Flow logs | `ec2:DescribeFlowLogs`, `logs:DescribeLogGroups`, `logs:StartQuery`, `logs:GetQueryResults`, `logs:StopQuery` | optional, **opt-in** per run |
 | Trends, Diff, CIDR planner, Report | none – computed from stored snapshots | – |
 | `iplens check` with `--snapshot` | none | – |
-| `iplens check` live mode | `ec2:DescribeSubnets`, `ec2:DescribeNetworkInterfaces`; optional `autoscaling:DescribeAutoScalingGroups`, `ecs:ListClusters`, `ecs:ListServices`, `ecs:DescribeServices` | EC2 ones **required** (error = exit 2); others optional (note, demand skipped) |
+| `iplens check` live mode | `ec2:DescribeSubnets`, `ec2:DescribeNetworkInterfaces`; optional `autoscaling:DescribeAutoScalingGroups`, `ecs:ListClusters`, `ecs:ListServices`, `ecs:DescribeServices`, `application-autoscaling:DescribeScalableTargets` | EC2 ones **required** (error = exit 2); others optional (note, demand skipped) |
 | Terraform sync | `sts:GetCallerIdentity`; S3 backends: `s3:ListBucket`, `s3:GetObject` on the state object, and `sts:AssumeRole` when the backend names a role; other backends: whatever `terraform init` needs to read their state | optional (enrichment off by default) |
 
 Besides the `Describe` / `List` / `Get` prefixes, the guard's explicit allowlist is exactly:
@@ -652,7 +665,7 @@ sources `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListSta
 | `lambda_vpc_required` | – | blocks "run Lambda outside VPC"; flags non-VPC functions |
 | `internal_only` | `scope`: `load_balancer` / `vpc_endpoint` / `both` | blocks public-path suggestions; flags internet-facing LBs |
 | `subnet_reserved` | `subnet_ids` | blocks any suggestion touching or targeting the subnets |
-| `min_free_pct` | `percent`, optional `subnet_ids` | blocks moves that drop a subnet below the threshold; flags subnets below it |
+| `min_free_pct` | `percent`, optional `subnet_ids` | blocks moves and subnet shrinks that drop a subnet below the threshold; flags subnets below it |
 | `protected_eni` | `pattern` (regex) | blocks suggestions that remove matching ENIs |
 
 `iplens check --rules` enforces the same rules on a Terraform plan; see

@@ -71,6 +71,9 @@ def test_finished_job_hides_cancel_and_hide(browser, server):  # noqa: F811
     page.close()
 
 
+SOURCE_SNAPSHOT = 7
+
+
 @pytest.fixture
 def skipped_server(home):
     """A finished Refresh-kind job in which one resource type was skipped at its timeout."""
@@ -88,6 +91,7 @@ def skipped_server(home):
         ctx.resource("ec2:DescribeVpcs", "done")
         ctx.resource("tag:GetResources", "running")
         ctx.resource("tag:GetResources", "skipped", "timeout after 120s")
+        ctx.set_source_snapshot(SOURCE_SNAPSHOT)  # the snapshot the job wrote
 
     job = app.extensions["iplens"]["jobs"].start(ref, "refresh", work, background=False)
     srv = serving.make_server("127.0.0.1", port, app, threaded=True)
@@ -138,6 +142,8 @@ def test_retry_skipped_requests_only_the_skipped_types(browser, skipped_server):
         page.click("#job-retry")
     form = parse_qs(req.value.post_data)
     assert form["only"] == ["tag:GetResources"]  # not the collected ec2:DescribeVpcs
+    # The job's own snapshot, not whichever is the latest at click time.
+    assert form["source"] == [str(SOURCE_SNAPSHOT)]
     assert form["background"] == ["1"]
     assert errors == []
     page.close()

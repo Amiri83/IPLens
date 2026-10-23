@@ -41,6 +41,7 @@ from .scope import UNSCOPED, ResolvedScope
 
 # AWS: "your load balancer subnets must have at least eight free IP addresses" to scale.
 ALB_RESERVE = 8
+ALB_ASSUMPTION = f"{ALB_RESERVE} IPs per ALB per subnet"
 # ECS's maximumPercent when a service's deploymentConfiguration does not set it.
 DEFAULT_MAX_PERCENT = 200
 # The deployment controller doing rolling updates (the others replace a whole task set).
@@ -432,9 +433,7 @@ def alb_demand(lb: LoadBalancer, inputs: Inputs) -> dict[str, Contributor]:
         return {}
     subnets = lb.subnet_ids if lb.subnet_ids is not None else inputs.lb_eni_subnets.get(lb.name)
     return {
-        sid: Contributor(
-            "alb", lb.name, ALB_RESERVE, f"AWS needs ≥ {ALB_RESERVE} free IPs per subnet to scale"
-        )
+        sid: Contributor("alb", lb.name, ALB_RESERVE, ALB_ASSUMPTION)
         for sid in sorted(set(subnets or ()))
     }
 

@@ -40,6 +40,7 @@ from .mcptools import (
     block_aws_sdk,
     open_readonly,
 )
+from .suggestions import UNUSED_ENDPOINT_DAYS
 
 if TYPE_CHECKING:
     from mcp.server.mcpserver import MCPServer
@@ -56,14 +57,16 @@ the data is when it matters. Subnets are given by id or by name. "Headroom" is t
 case demand if everything that can scale out does (ASG / ECS max, ALB reserve, Lambda
 ENIs); status ok / tight (< 20% left at max scale) / over. Use find_subnet to pick where N
 new IPs fit, fit_check to verify one subnet like the `iplens check` CI gate, changes for
-what changed between snapshots."""
+what changed between snapshots, suggestions for ways to free IPs (vetoed by the saved
+rules)."""
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="iplens mcp",
         description="Read-only MCP server over the local IPLens database: subnet usage, "
-        "headroom, IP lookup, snapshot diffs and the fit check. Never calls AWS, never "
+        "headroom, IP lookup, snapshot diffs, the fit check and suggestions. Never calls "
+        "AWS, never "
         "writes. stdio by default; --http serves Streamable HTTP with a bearer token "
         f"(${TOKEN_ENV}, else the token of Settings → MCP server).",
     )
@@ -225,6 +228,29 @@ def build_server(tools: Tools) -> MCPServer:
             need=need,
             min_free_pct=min_free_pct,
             include_surge=include_surge,
+        )
+
+    @server.tool(annotations=read_only)
+    def suggestions(
+        kind: str | None = None,
+        include_blocked: bool = True,
+        endpoint_days: int = UNUSED_ENDPOINT_DAYS,
+        limit: int = DEFAULT_LIMIT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Ways to free IPs, as on the Suggestions page: detached ENIs, underused
+        subnets, unused / duplicate endpoints, Lambda ENI sprawl, idle ECS services, ...
+        each with the IPs it saves and whether a saved rule blocks it. notes lists the
+        checks that could not be made (short snapshot history, no flow log data).
+        Optional: kind (e.g. unused_endpoint), include_blocked, endpoint_days (the
+        unused endpoint window, default 14). Paginated like list_subnets."""
+        return run(
+            "suggestions",
+            kind=kind,
+            include_blocked=include_blocked,
+            endpoint_days=endpoint_days,
+            limit=limit,
+            offset=offset,
         )
 
     return server

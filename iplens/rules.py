@@ -163,6 +163,13 @@ class Rule:
                 after = 100.0 * (st.free - added) / st.usable
                 if after < pct:
                     return f"{subnet_id} would drop to {after:.1f}% free (< {pct:g}%)"
+            for subnet_id, usable in s.resized.items():
+                st = ctx.subnets.get(subnet_id)
+                if st is None or not usable or not self._free_scope(st):
+                    continue
+                after = 100.0 * (usable - st.consumed) / usable
+                if after < pct:
+                    return f"{subnet_id} resized would have {after:.1f}% free (< {pct:g}%)"
         elif self.kind == "protected_eni":
             rx = _compile(p.get("pattern", ""))
             if rx is None:

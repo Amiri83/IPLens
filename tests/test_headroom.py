@@ -265,9 +265,7 @@ def test_alb_reserves_eight_ips_per_subnet_and_other_lbs_none():
     )
     result = analyze(inputs)
     assert _demand(result) == {SA: 8, SB: 8, SC: 8}
-    assert result.by_id[SA].contributors[0].text == (
-        "ALB alb-a: +8 (AWS needs ≥ 8 free IPs per subnet to scale)"
-    )
+    assert result.by_id[SA].contributors[0].text == ("ALB alb-a: +8 (8 IPs per ALB per subnet)")
 
 
 def test_lambda_only_needs_an_ip_for_a_new_subnet_security_group_combination():
