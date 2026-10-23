@@ -49,7 +49,7 @@ From a checkout (development):
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e ".[dev,mcp]"
+.venv/bin/pip install -e ".[dev]"
 ```
 
 ## Run
@@ -61,7 +61,7 @@ iplens --home /path/to/data    # another data directory (default: $IPLENS_HOME o
 iplens --no-browser            # do not open the browser
 iplens --debug                 # Flask development server with the debugger (development only)
 iplens check --help            # pre-deploy IP fit check for CI (no web UI, see below)
-iplens mcp --help              # read-only MCP server for AI assistants (extra: aws-iplens[mcp])
+iplens mcp --help              # read-only MCP server for AI assistants (enable it in Settings)
 ```
 
 IPLens is served by [waitress](https://docs.pylonsproject.org/projects/waitress/) and prints one
@@ -400,12 +400,14 @@ iplens-fit-check:
 
 `iplens mcp` is a read-only [MCP](https://modelcontextprotocol.io) server over stdio, so an AI
 assistant can answer "where do 40 more IPs fit?" or "who holds 10.1.2.3?" from your IPLens data.
-It is an optional extra built on the official MCP Python SDK:
+It is built on the official MCP Python SDK and included in a plain `pip install aws-iplens`
+(the former `aws-iplens[mcp]` extra still installs, as an empty alias).
 
-```bash
-pipx install 'aws-iplens[mcp]'        # or: python3 -m pip install 'aws-iplens[mcp]'
-iplens mcp --help
-```
+**Off by default.** MCP must first be switched on in **Settings → MCP server → Enable MCP
+server**. While it is off, `iplens mcp` (stdio and `--http`) exits with status 2 and
+"MCP is disabled in IPLens Settings", a server already running refuses every tool call, the
+Start / Restart buttons are disabled and the header badge is hidden. Turning it off and saving
+stops the server IPLens runs; no IPLens restart is needed either way.
 
 **Read-only, local only.** The server reads the local SQLite database (`--home`, default
 `$IPLENS_HOME` or `~/.iplens`) through a read-only connection, from the latest successful
@@ -477,7 +479,7 @@ protection, and plain HTTP is not encrypted.
 
 **Settings → MCP server** runs it as a child process of IPLens: Start / Stop / Restart, the status
 (running / stopped / error with the last error), PID, URL and uptime, with a status badge in the
-header. Settings: start with IPLens, host, port (it must be free), redact (on by default),
+header. Settings: enable MCP server (the master switch), start with IPLens, host, port (it must be free), redact (on by default),
 account, allow remote access. Saving restarts a running server. The token is generated on the first
 start (or with *Generate token*), shown once to copy, and can be regenerated. A crashed server is
 shown in the UI and retried at most 3 times; it is stopped when IPLens stops. Its output goes to

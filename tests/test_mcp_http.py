@@ -9,7 +9,6 @@ documentation account id and made-up resource ids / names.
 from __future__ import annotations
 
 import http.client
-import importlib.util
 import json
 import os
 import signal
@@ -24,8 +23,10 @@ import pytest
 from iplens import mcptools
 from iplens.crypto import SecretBox
 from iplens.db import closing
+from iplens.logging_setup import LOG_FILE
 from iplens.mcpconfig import (
     DEFAULT_PORT,
+    DISABLED_MESSAGE,
     MCP_PATH,
     TOKEN_ENV,
     McpSettings,
@@ -39,13 +40,10 @@ from iplens.mcpconfig import (
 from iplens.mcpcontrol import ERROR, RUNNING, STOPPED, McpController, McpStartError, port_free
 from iplens.mcphttp import Guard
 from iplens.web import create_app, shutdown_app
-from tests.test_mcp import LEAKS, db, mcp_home  # noqa: F401 - fixtures
+from tests.test_mcp import LEAKS, db, mcp_home, set_mcp_enabled  # noqa: F401 - fixtures
 
 TOKEN = "test-token-0123456789abcdef"
 WILDCARD = "0.0.0.0"  # noqa: S104 - a setting value, nothing is bound to it
-needs_mcp = pytest.mark.skipif(
-    importlib.util.find_spec("mcp") is None, reason="needs the mcp extra"
-)
 
 
 def free_port() -> int:
@@ -155,7 +153,6 @@ def http_server(mcp_home):  # noqa: F811
         proc.wait(10)
 
 
-@needs_mcp
 def test_http_requires_the_bearer_token(http_server):
     port, _ = http_server
     status, text, headers = post(port)
@@ -168,7 +165,6 @@ def test_http_requires_the_bearer_token(http_server):
     assert json.loads(text)["result"]["serverInfo"]["name"] == "iplens"
 
 
-@needs_mcp
 def test_http_rejects_a_foreign_origin(http_server):
     port, _ = http_server
     auth = {"Authorization": f"Bearer {TOKEN}"}
@@ -182,14 +178,12 @@ def test_http_rejects_a_foreign_origin(http_server):
     assert post(port, {"Origin": "https://evil.example"})[0] == 403
 
 
-@needs_mcp
 def test_http_rejects_a_foreign_host(http_server):
     port, _ = http_server
     status, _, _ = post(port, {"Authorization": f"Bearer {TOKEN}", "Host": f"evil.example:{port}"})
     assert status == 421
 
 
-@needs_mcp
 def test_http_end_to_end_with_an_mcp_client(http_server):
     """The SDK's Streamable HTTP client: same tools, same redaction as stdio."""
     import anyio
@@ -234,7 +228,6 @@ def _iplens_mcp(*args: str, env: dict[str, str] | None = None) -> subprocess.Com
     )
 
 
-@needs_mcp
 def test_cli_http_errors(mcp_home):  # noqa: F811
     home = str(mcp_home)
     proc = _iplens_mcp("--http", "--home", home, "--host", WILDCARD, env={TOKEN_ENV: TOKEN})
@@ -259,7 +252,6 @@ def test_cli_http_errors(mcp_home):  # noqa: F811
     assert proc.returncode == 2 and "at least 16" in proc.stderr
 
 
-@needs_mcp
 def test_cli_http_port_in_use(mcp_home):  # noqa: F811
     with socket.socket() as busy:
         busy.bind(("127.0.0.1", 0))
@@ -271,7 +263,6 @@ def test_cli_http_port_in_use(mcp_home):  # noqa: F811
     assert proc.returncode == 2 and f"cannot listen on 127.0.0.1:{port}" in proc.stderr
 
 
-@needs_mcp
 def test_cli_http_uses_the_stored_token(mcp_home):  # noqa: F811
     store = McpStore(mcp_home / "iplens.db", SecretBox.from_path(mcp_home / "secret.key"))
     token = store.regenerate_token()
@@ -305,7 +296,6 @@ print(json.dumps(sorted(m for m in sys.modules if m.split(".")[0] in AWS_SDK_MOD
 """
 
 
-@needs_mcp
 def test_http_code_path_never_imports_the_aws_sdk(db):  # noqa: F811
     proc = subprocess.run(  # noqa: S603
         [sys.executable, "-c", _NO_AWS_HTTP, str(db)],
@@ -326,13 +316,29 @@ def store(mcp_home) -> McpStore:  # noqa: F811
     return McpStore(mcp_home / "iplens.db", SecretBox.from_path(mcp_home / "secret.key"))
 
 
-def test_redact_is_on_by_default(store, mcp_home):  # noqa: F811
+def test_defaults_redact_on_and_mcp_disabled(tmp_path):
+    """A fresh install: MCP disabled, no autostart, redact on, local only."""
+    home = tmp_path / "fresh"
+    app = create_app(home, testing=True)
+    store = app.extensions["iplens"]["mcp_store"]
     s = store.load()
     assert s == McpSettings()
-    assert (s.redact, s.enabled, s.host, s.port) == (True, False, "127.0.0.1", DEFAULT_PORT)
-    assert "--redact" in s.server_args(mcp_home)
+    assert (s.enabled, s.autostart, s.redact, s.host, s.port) == (
+        False,
+        False,
+        True,
+        "127.0.0.1",
+        DEFAULT_PORT,
+    )
+    assert "--redact" in s.server_args(home)
     off = store.save(
-        enabled=False, host="", port=8765, redact=False, account="", allow_remote=False
+        enabled=True,
+        autostart=False,
+        host="",
+        port=8765,
+        redact=False,
+        account="",
+        allow_remote=False,
     )
     assert "--redact" not in off.server_args(mcp_home)
     assert store.load().redact is False
@@ -341,17 +347,37 @@ def test_redact_is_on_by_default(store, mcp_home):  # noqa: F811
 def test_settings_validation(store):
     with pytest.raises(ValueError, match="non-loopback"):
         store.save(
-            enabled=True, host=WILDCARD, port=8765, redact=True, account="", allow_remote=False
+            enabled=True,
+            autostart=False,
+            host=WILDCARD,
+            port=8765,
+            redact=True,
+            account="",
+            allow_remote=False,
         )
     with pytest.raises(ValueError, match="1024-65535"):
-        store.save(enabled=True, host="", port=80, redact=True, account="", allow_remote=False)
+        store.save(
+            enabled=True,
+            autostart=False,
+            host="",
+            port=80,
+            redact=True,
+            account="",
+            allow_remote=False,
+        )
     with pytest.raises(ValueError, match="whole number"):
         parse_port("http")
     with pytest.raises(ValueError, match="not an IP address"):
         parse_host("bad host!")
-    assert store.load() == McpSettings()  # nothing stored
+    assert store.load() == McpSettings(enabled=True)  # nothing stored (the fixture's switch)
     remote = store.save(
-        enabled=True, host=WILDCARD, port=9000, redact=True, account="1", allow_remote=True
+        enabled=True,
+        autostart=False,
+        host=WILDCARD,
+        port=9000,
+        redact=True,
+        account="1",
+        allow_remote=True,
     )
     assert remote.remote and store.load() == remote
     assert remote.server_args(Path("/h"))[-3:] == ["--account", "1", "--allow-remote"]
@@ -407,7 +433,6 @@ def _settings(**kw) -> McpSettings:
     return McpSettings(**{"port": free_port(), **kw})
 
 
-@needs_mcp
 def test_lifecycle_start_stop_restart(controller):
     s = _settings()
     assert controller.status()["state"] == STOPPED
@@ -450,7 +475,6 @@ def test_port_in_use(controller):
     assert st["state"] == ERROR and f"port {port}" in st["last_error"] and st["pid"] is None
 
 
-@needs_mcp
 def test_crash_is_shown_and_retried_at_most_three_times(controller):
     controller.start(_settings(account="nope"), TOKEN)  # the child exits: unknown account
     assert wait_for(lambda: "gave up" in controller.status()["last_error"], timeout=60)
@@ -489,7 +513,15 @@ def client(app):
 
 
 def _form(port: int, **kw) -> dict[str, str]:
-    return {"host": "127.0.0.1", "port": str(port), "redact": "1", "account": "", **kw}
+    """The Settings → MCP server form, MCP enabled unless ``enabled=""``."""
+    return {
+        "enabled": "1",
+        "host": "127.0.0.1",
+        "port": str(port),
+        "redact": "1",
+        "account": "",
+        **kw,
+    }
 
 
 def test_settings_page_mcp_section(client):
@@ -499,7 +531,7 @@ def test_settings_page_mcp_section(client):
     assert "type&#34;: &#34;http" in page or '"type": "http"' in page  # VS Code config
     assert "claude mcp add --transport http iplens" in page
     assert "claude mcp add iplens -- iplens mcp" in page  # stdio alternative
-    assert 'id="mcp-badge"' not in page  # stopped and not enabled: no header badge
+    assert 'id="mcp-badge"' not in page  # stopped and no autostart: no header badge
     assert "Remote access is enabled" not in page
 
 
@@ -511,16 +543,17 @@ def test_settings_save_validates(client, app):
     resp = _post(
         client,
         "/settings/mcp",
-        _form(9000, host=WILDCARD, allow_remote="1", enabled="1"),
+        _form(9000, host=WILDCARD, allow_remote="1", autostart="1"),
         follow_redirects=True,
     )
     page = resp.data.decode()
     assert "MCP settings saved" in page and "Remote access is enabled" in page
-    assert 'id="mcp-badge"' in page  # enabled: the badge shows (stopped)
+    assert 'id="mcp-badge"' in page  # enabled + autostart: the badge shows (stopped)
     saved = app.extensions["iplens"]["mcp_store"].load()
-    assert (saved.host, saved.port, saved.enabled, saved.allow_remote) == (
+    assert (saved.host, saved.port, saved.enabled, saved.autostart, saved.allow_remote) == (
         WILDCARD,
         9000,
+        True,
         True,
         True,
     )
@@ -537,7 +570,6 @@ def test_token_is_shown_once(client, app):
         assert token not in json.dumps(dict(s))  # never in the session cookie
 
 
-@needs_mcp
 def test_gui_start_stop_and_status(client, app):
     port = free_port()
     _post(client, "/settings/mcp", _form(port))
@@ -561,7 +593,6 @@ def test_gui_start_stop_and_status(client, app):
     assert client.get("/mcp/status").get_json()["state"] == STOPPED
 
 
-@needs_mcp
 def test_saving_settings_restarts_a_running_server(client, app):
     port = free_port()
     _post(client, "/settings/mcp", _form(port))
@@ -585,7 +616,7 @@ def test_saving_settings_restarts_a_running_server(client, app):
 
 
 def test_saving_settings_does_not_start_a_stopped_server(client, app):
-    _post(client, "/settings/mcp", _form(free_port(), enabled="1"))
+    _post(client, "/settings/mcp", _form(free_port(), autostart="1"))
     assert app.extensions["iplens"]["mcp"].status()["state"] == STOPPED
 
 
@@ -597,23 +628,134 @@ def test_gui_start_port_in_use(client, app):
         _post(client, "/settings/mcp", _form(port))
         resp = _post(client, "/mcp/start", follow_redirects=True)
     page = resp.data.decode()
-    if importlib.util.find_spec("mcp") is None:
-        assert "aws-iplens[mcp]" in page
-        return
     assert "MCP server not started" in page and "already in use" in page
     status = client.get("/mcp/status").get_json()
     assert status["state"] == ERROR and "already in use" in status["last_error"]
 
 
-@needs_mcp
+def _app_log(app) -> str:
+    return (app.extensions["iplens"]["log_dir"] / LOG_FILE).read_text()
+
+
+def _button_disabled(page: str, action: str) -> bool:
+    form = page.split(f'action="/mcp/{action}"', 1)[1].split("</form>", 1)[0]
+    return " disabled>" in form
+
+
+def test_fresh_install_has_mcp_disabled(tmp_path):
+    """Default settings: Start / Restart disabled, no badge, starting is refused."""
+    app = create_app(tmp_path / "fresh", testing=True)
+    try:
+        client = app.test_client()
+        client.get("/")
+        assert app.extensions["iplens"]["mcp_store"].load().enabled is False
+        page = client.get("/settings").data.decode()
+        assert "MCP is disabled" in page
+        assert 'name="enabled" value="1" >' in page  # the master switch, unticked
+        assert _button_disabled(page, "start") and _button_disabled(page, "restart")
+        assert 'id="mcp-badge"' not in page
+        resp = _post(client, "/mcp/start", follow_redirects=True)
+        assert DISABLED_MESSAGE in resp.data.decode()
+        assert client.get("/mcp/status").get_json()["state"] == STOPPED
+    finally:
+        shutdown_app(app)
+
+
+def test_autostart_and_badge_are_ignored_while_disabled(mcp_home):  # noqa: F811
+    port = free_port()
+    app = create_app(mcp_home, testing=True)
+    app.extensions["iplens"]["mcp_store"].save(
+        enabled=False,
+        autostart=True,
+        host="",
+        port=port,
+        redact=True,
+        account="",
+        allow_remote=False,
+    )
+    shutdown_app(app)
+    app = create_app(mcp_home, testing=True, mcp_autostart=True)
+    try:
+        assert app.extensions["iplens"]["mcp"].status()["state"] == STOPPED
+        assert port_free("127.0.0.1", port)
+        client = app.test_client()
+        assert 'id="mcp-badge"' not in client.get("/").data.decode()  # autostart, but off
+        assert "MCP is disabled in Settings" in _app_log(app)
+    finally:
+        shutdown_app(app)
+
+
+def test_enable_start_then_disable_stops_it_at_once(tmp_path, mcp_home):  # noqa: F811
+    """Off → on → Start works → off: the running server stops, the badge goes, the CLI
+    refuses to run; all without restarting IPLens, and logged."""
+    set_mcp_enabled(mcp_home / "iplens.db", False)
+    app = create_app(mcp_home, testing=True)
+    try:
+        client = app.test_client()
+        client.get("/")
+        ctl = app.extensions["iplens"]["mcp"]
+        port = free_port()
+        assert DISABLED_MESSAGE in _post(client, "/mcp/start", follow_redirects=True).data.decode()
+        # Enable: Start / Restart become available and Start works.
+        _post(client, "/settings/mcp", _form(port))
+        assert "mcp server enabled in Settings" in _app_log(app)
+        page = client.get("/settings").data.decode()
+        assert not _button_disabled(page, "start") and not _button_disabled(page, "restart")
+        resp = _post(client, "/mcp/start", follow_redirects=True)
+        assert "MCP server starting" in resp.data.decode()
+        assert ctl.wait_ready() == RUNNING
+        pid = ctl.status()["pid"]
+        assert 'id="mcp-badge"' in client.get("/").data.decode()
+        # Disable: saving stops the running server.
+        resp = _post(client, "/settings/mcp", _form(port, enabled=""), follow_redirects=True)
+        page = resp.data.decode()
+        assert "MCP server stopped: MCP is disabled" in page
+        assert ctl.status()["state"] == STOPPED
+        assert not pid_alive(pid) and port_free("127.0.0.1", port)
+        assert 'id="mcp-badge"' not in page
+        assert _button_disabled(page, "start") and _button_disabled(page, "restart")
+        log_text = _app_log(app)
+        assert "mcp server disabled in Settings" in log_text
+        assert "mcp server stopped: MCP disabled in Settings" in log_text
+        # ... and `iplens mcp` (stdio and HTTP) now exits 2.
+        for extra in ([], ["--http"]):
+            proc = _iplens_mcp("--home", str(mcp_home), *extra, env={TOKEN_ENV: TOKEN})
+            assert proc.returncode == 2 and DISABLED_MESSAGE in proc.stderr
+    finally:
+        shutdown_app(app)
+
+
+def test_mcp_extra_is_an_empty_alias():
+    """The SDK is a core dependency; ``aws-iplens[mcp]`` still resolves (to nothing more)."""
+    import importlib.metadata
+    import tomllib
+
+    project = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())["project"]
+    assert any(d.replace(" ", "").startswith("mcp>=") for d in project["dependencies"])
+    assert any(d.startswith("uvicorn") for d in project["dependencies"])
+    assert project["optional-dependencies"]["mcp"] == []
+    meta = importlib.metadata.metadata("aws-iplens")
+    assert "mcp" in meta.get_all("Provides-Extra")
+    requires = importlib.metadata.requires("aws-iplens") or []
+    core = [r for r in requires if "extra ==" not in r]
+    assert any(r.startswith("mcp") for r in core)
+    assert not any('extra == "mcp"' in r for r in requires)
+
+
 def test_iplens_shutdown_stops_the_child(mcp_home):  # noqa: F811
     port = free_port()
     app = create_app(mcp_home, testing=True)
     app.extensions["iplens"]["mcp_store"].save(
-        enabled=True, host="", port=port, redact=True, account="", allow_remote=False
+        enabled=True,
+        autostart=True,
+        host="",
+        port=port,
+        redact=True,
+        account="",
+        allow_remote=False,
     )
     shutdown_app(app)
-    # Autostart (enabled) with IPLens, then IPLens shuts down.
+    # Autostart (enabled, start with IPLens) with IPLens, then IPLens shuts down.
     app = create_app(mcp_home, testing=True, mcp_autostart=True)
     ctl = app.extensions["iplens"]["mcp"]
     assert ctl.wait_ready() == RUNNING
@@ -636,7 +778,6 @@ time.sleep(600)
 """
 
 
-@needs_mcp
 @pytest.mark.skipif(os.name != "posix", reason="POSIX signals")
 def test_child_stops_when_iplens_is_killed(mcp_home, tmp_path):  # noqa: F811
     """Even a SIGKILLed IPLens leaves no MCP server behind (the child watches its parent)."""

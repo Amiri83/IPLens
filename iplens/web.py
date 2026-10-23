@@ -77,6 +77,7 @@ from .jobs import KINDS as JOB_KINDS
 from .jobs import JobBusy, JobCancelled, JobContext, JobFailed, JobManager, Progress
 from .logging_setup import LEVELS, LOG_FILE, configure_logging, read_log
 from .mcpconfig import (
+    DISABLED_MESSAGE,
     TOKEN_ENV,
     McpSettings,
     McpStore,
@@ -264,7 +265,7 @@ def create_app(
     scheduled-Refresh thread (:mod:`iplens.scheduler`). ``allow_remote`` (``iplens
     --allow-remote``) also accepts IP-address Host headers (see :func:`host_allowed`).
     ``mcp_autostart`` (default: like ``scheduler_enabled``) starts the MCP HTTP server
-    child process when Settings → MCP server has it enabled."""
+    child process when Settings → MCP server has it enabled and set to start with IPLens."""
     paths = default_paths(home).ensure()
     init_db(paths.db_path)
     box = SecretBox.from_path(paths.key_path)
@@ -321,23 +322,14 @@ def create_app(
     return app
 
 
-def mcp_available() -> bool:
-    """True if the ``mcp`` extra (the MCP SDK) is installed."""
-    import importlib.util
-
-    return importlib.util.find_spec("mcp") is not None
-
-
-MCP_EXTRA_HINT = "the MCP server needs the mcp extra: pip install 'aws-iplens[mcp]'"
-
-
 def start_mcp(app: Flask, *, restart: bool = False) -> tuple[McpSettings, str | None]:
     """Start (or restart) the MCP server child with the saved settings: (settings, the
-    token when it was generated just now). McpStartError if it cannot start."""
+    token when it was generated just now). McpStartError if it cannot start (or MCP is
+    disabled)."""
     ext = app.extensions["iplens"]
     settings: McpSettings = ext["mcp_store"].load()
-    if not mcp_available():
-        raise McpStartError(MCP_EXTRA_HINT)
+    if not settings.enabled:
+        raise McpStartError(DISABLED_MESSAGE)
     if ext["port"] is not None and settings.port == ext["port"]:
         raise McpStartError(f"port {settings.port} is the port of IPLens itself")
     token, generated = ext["mcp_store"].ensure_token()
@@ -352,9 +344,14 @@ def start_mcp(app: Flask, *, restart: bool = False) -> tuple[McpSettings, str | 
 
 
 def autostart_mcp(app: Flask) -> None:
-    """Start the MCP server with IPLens when Settings → MCP server has it enabled; a
-    failure is logged and shown in the UI (the server's status), never raised."""
-    if not app.extensions["iplens"]["mcp_store"].load().enabled:
+    """Start the MCP server with IPLens when Settings → MCP server has it enabled and
+    set to start with IPLens; a failure is logged and shown in the UI (the server's
+    status), never raised."""
+    settings: McpSettings = app.extensions["iplens"]["mcp_store"].load()
+    if not settings.autostart:
+        return
+    if not settings.enabled:
+        log.info("mcp server not started with IPLens: MCP is disabled in Settings")
         return
     try:
         _, generated = start_mcp(app)
@@ -630,13 +627,17 @@ def _register(app: Flask) -> None:
             "header_snap": _snapshot_or_none(),
             "account_label": snapshot_label,
             "scope_count": _scope_config().count if active else 0,
-            # Header badge: the MCP server's status (when enabled or not stopped).
+            # Header badge: the MCP server's status (when enabled and autostarted or not
+            # stopped; never while MCP is disabled).
             "mcp_header": _mcp_header(),
         }
 
     def _mcp_header() -> dict[str, Any] | None:
+        settings: McpSettings = _ext()["mcp_store"].load()
+        if not settings.enabled:
+            return None
         status = _ext()["mcp"].status()
-        if status["state"] == "stopped" and not _ext()["mcp_store"].load().enabled:
+        if status["state"] == "stopped" and not settings.autostart:
             return None
         return status
 
@@ -1948,8 +1949,6 @@ def _register(app: Flask) -> None:
         return {
             "mcp": mcp_settings,
             "mcp_status": ext["mcp"].status(),
-            "mcp_available": mcp_available(),
-            "mcp_extra_hint": MCP_EXTRA_HINT,
             "mcp_has_token": ext["mcp_store"].has_token(),
             "mcp_new_token": new_token,
             "mcp_token_env": TOKEN_ENV,
@@ -1984,9 +1983,11 @@ def _register(app: Flask) -> None:
     @app.post("/settings/mcp")
     def mcp_save():
         f = request.form
+        was_enabled = _ext()["mcp_store"].load().enabled
         try:
             saved = _ext()["mcp_store"].save(
                 enabled=f.get("enabled") == "1",
+                autostart=f.get("autostart") == "1",
                 host=f.get("host", ""),
                 port=f.get("port", ""),
                 redact=f.get("redact") == "1",
@@ -1997,8 +1998,14 @@ def _register(app: Flask) -> None:
             flash(f"MCP settings not saved: {exc}", "error")
             return _mcp_back()
         log.info("mcp settings saved: %r", saved)
+        if saved.enabled != was_enabled:
+            log.info("mcp server %s in Settings", "enabled" if saved.enabled else "disabled")
         flash("MCP settings saved", "ok")
-        if _ext()["mcp"].running:  # apply them now
+        if not saved.enabled:
+            if _ext()["mcp"].stop():
+                log.info("mcp server stopped: MCP disabled in Settings")
+                flash("MCP server stopped: MCP is disabled", "ok")
+        elif _ext()["mcp"].running:  # apply them now
             _mcp_start(restart=True)
         return _mcp_back()
 

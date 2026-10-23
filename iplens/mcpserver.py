@@ -1,6 +1,7 @@
 """``iplens mcp``: a read-only MCP server over the local IPLens database.
 
-Needs the optional extra: ``pip install 'aws-iplens[mcp]'`` (the official ``mcp`` SDK).
+Built on the official ``mcp`` SDK. It runs only while Settings → MCP server → Enable MCP
+server is on: otherwise it exits (status 2) and a running one refuses every tool call.
 The tools (:mod:`iplens.mcptools`) read the local SQLite database only, through a
 read-only connection; the server never calls AWS (the process refuses to import the AWS
 SDK, see :func:`iplens.mcptools.block_aws_sdk`) and never writes anything.
@@ -16,18 +17,26 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
-from . import __version__
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp.types import ToolAnnotations
+
+from . import __version__, mcphttp
 from .config import default_paths
 from .mcpconfig import (
     DEFAULT_HOST,
     DEFAULT_PORT,
+    DISABLED_MESSAGE,
     TOKEN_ENV,
     check_token,
+    is_enabled,
     is_loopback,
     parse_port,
     read_token,
@@ -42,10 +51,6 @@ from .mcptools import (
 )
 from .suggestions import UNUSED_ENDPOINT_DAYS
 
-if TYPE_CHECKING:
-    from mcp.server.mcpserver import MCPServer
-
-INSTALL_HINT = "iplens mcp needs the mcp extra: pip install 'aws-iplens[mcp]'"
 # Set by IPLens for its child server: the server stops when that process is gone.
 PARENT_PID_ENV = "IPLENS_MCP_PARENT_PID"
 PARENT_POLL_SECONDS = 1.0
@@ -134,6 +139,21 @@ def resolve_token(home: Any) -> str:
     return token
 
 
+def mcp_enabled(db_path: Path) -> bool:
+    """True if Settings → MCP server has the server enabled (read-only; False if the
+    database cannot be read)."""
+    try:
+        conn = open_readonly(db_path)
+    except ToolInputError:
+        return False
+    try:
+        return is_enabled(conn)
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
 def watch_parent(pid: int, poll: float = PARENT_POLL_SECONDS) -> threading.Thread:
     """Stop this process (SIGTERM to itself, a graceful shutdown) once process ``pid``,
     IPLens, is gone: the server never outlives the app that started it."""
@@ -151,17 +171,16 @@ def watch_parent(pid: int, poll: float = PARENT_POLL_SECONDS) -> threading.Threa
 
 
 def build_server(tools: Tools) -> MCPServer:
-    """The MCP server exposing :data:`iplens.mcptools.TOOLS` (all read-only)."""
-    from mcp.server.mcpserver import MCPServer
-    from mcp.server.mcpserver.exceptions import ToolError
-    from mcp.types import ToolAnnotations
-
+    """The MCP server exposing :data:`iplens.mcptools.TOOLS` (all read-only); every call
+    is refused once the server is disabled in Settings (no restart needed)."""
     server = MCPServer("iplens", version=__version__, instructions=INSTRUCTIONS)
     read_only = ToolAnnotations(
         readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
     )
 
     def run(name: str, **arguments: Any) -> dict[str, Any]:
+        if not mcp_enabled(tools.db_path):
+            raise ToolError(DISABLED_MESSAGE)
         try:
             return tools.call(name, **arguments)
         except ToolInputError as exc:
@@ -274,16 +293,14 @@ def main(argv: list[str] | None = None) -> int:
         )
     # Before anything else is imported: the server process must never load the AWS SDK.
     block_aws_sdk()
-    try:
-        import mcp  # noqa: F401 - only checks that the extra is installed
-    except ImportError:
-        print(f"iplens mcp: error: {INSTALL_HINT}", file=sys.stderr)
-        return 2
     tools = Tools(default_paths(args.home).db_path, args.account, args.redact)
     try:
         tools.check()
     except ToolInputError as exc:
         print(f"iplens mcp: error: {exc}", file=sys.stderr)
+        return 2
+    if not mcp_enabled(tools.db_path):
+        print(f"iplens mcp: error: {DISABLED_MESSAGE}", file=sys.stderr)
         return 2
     if not args.http:
         build_server(tools).run("stdio")
@@ -292,8 +309,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _serve_http(args: argparse.Namespace, tools: Tools, host: str, port: int, remote: bool) -> int:
-    from . import mcphttp
-
     try:
         token = resolve_token(args.home)
     except ValueError as exc:
