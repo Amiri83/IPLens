@@ -81,6 +81,15 @@ def test_hanging_collector_is_skipped_and_the_others_complete(db_path, monkeypat
     _aws()
     _warm_up(db_path)
     monkeypatch.setattr(Collector, "_fetch_tagged_resources", _hang(release))
+    # Only the hanging resource type gets the 1s per-resource timeout; the real (moto)
+    # calls of the others get the overall limit, so a slow call on a loaded machine is
+    # not skipped as well.
+    real_limit = Collector._limit
+    monkeypatch.setattr(
+        Collector,
+        "_limit",
+        lambda self, what: real_limit(self, what) if what == "tag:GetResources" else 60,
+    )
     mgr = jobs.JobManager(db_path)
     out = {}
 
