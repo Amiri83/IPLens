@@ -42,6 +42,7 @@ from . import (
     ownership,
     queries,
     scheduler,
+    tagfilter,
     terraform,
     tfrepo,
     trends,
@@ -1358,6 +1359,7 @@ def _register(app: Flask) -> None:
             # Only the positions dragged in the chosen layout are restored.
             positions=viewstate.get_layout(_db(), ref, layout_key, layout) if has_state else {},
             expanded=viewstate.get_expanded(_db(), ref, mode, vpc) if has_state else [],
+            filter_presets=viewstate.list_presets(_db(), ref) if ref is not None else [],
             legend_icons=_legend_icons(),
         )
 
@@ -1443,6 +1445,29 @@ def _register(app: Flask) -> None:
             viewstate.reset_layout(conn, ref, vpc)
         log.info("visual layout reset (account=%s, %s)", ref, vpc)
         return "", 204
+
+    # Named tag filter presets; both answer with the account's presets after the change.
+    @app.post("/visual/filter-presets")
+    def visual_filter_preset_save():
+        ref = _active_or_400()
+        try:
+            name = viewstate.parse_preset_name(request.form.get("name"))
+            filters = tagfilter.parse_filters(request.form.get("filters", "")[:200_000])
+        except ValueError as exc:
+            abort(400, str(exc))
+        with closing(_paths().db_path) as conn:
+            viewstate.save_preset(conn, ref, name, filters, request.form.get("hide_empty") == "1")
+            presets = viewstate.list_presets(conn, ref)
+        log.info("visual filter preset saved (account=%s, %d filter(s))", ref, len(filters))
+        return jsonify(presets)
+
+    @app.post("/visual/filter-presets/delete")
+    def visual_filter_preset_delete():
+        ref = _active_or_400()
+        with closing(_paths().db_path) as conn:
+            viewstate.delete_preset(conn, ref, request.form.get("name", ""))
+            presets = viewstate.list_presets(conn, ref)
+        return jsonify(presets)
 
     def _export(ext: str, render: Callable[[diagram.View], str], mimetype: str) -> Response:
         try:

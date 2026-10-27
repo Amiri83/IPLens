@@ -232,6 +232,15 @@ table.job-resources td { padding: .15rem .5rem; }
 
 /* Visual: environment filter and the "not linked" side panel of the Extended view. */
 .env-filters label { white-space: nowrap; }
+/* Visual: tag filter panel (active filters as removable chips). */
+.tag-filters { align-items: center; }
+.tag-filters select[multiple] { min-width: 9rem; }
+.tf-chips:empty, .tf-counts:empty { display: none; }
+.tf-chips { display: inline-flex; flex-wrap: wrap; gap: .3rem; }
+.tf-chip { display: inline-flex; align-items: center; gap: .2rem; border: 1px solid var(--line);
+           border-radius: 999px; padding: .05rem .2rem .05rem .6rem; font-size: 12.5px; }
+.tf-chip button { padding: 0 .4rem; line-height: 1.2; }
+.tf-counts, .tf-presets { flex: 1 1 100%; }
 .visual-main { display: flex; gap: .8rem; align-items: flex-start; }
 .visual-main .cy-wrap { flex: 1 1 auto; min-width: 0; }
 .unlinked-panel { flex: 0 0 260px; max-height: 720px; overflow: auto; font-size: 12.5px; }

@@ -1,6 +1,6 @@
 """Per-account Visual page state: border/label/legend toggles, the Extended view's
-evidence filter, and per view ("ip" | "extended") the chosen layout, the expanded groups
-and the dragged node positions."""
+evidence filter, named tag filter presets, and per view ("ip" | "extended") the chosen
+layout, the expanded groups and the dragged node positions."""
 
 from __future__ import annotations
 
@@ -10,11 +10,13 @@ import sqlite3
 from typing import Any
 
 from .declutter import DEFAULT_EVIDENCE, parse_evidence
+from .tagfilter import TagFilter, parse_filters
 
 # Saved layouts are bounded: a VPC diagram with more nodes than this is not sensible.
 MAX_POSITIONS = 5000
 MAX_NODE_ID = 200
 MAX_COORD = 1e7
+MAX_PRESET_NAME = 64
 
 DEFAULT_PREFS = {
     "show_vpc": True,
@@ -230,3 +232,63 @@ def save_expanded(
         "ON CONFLICT(account_ref, view, vpc_id) DO UPDATE SET expanded=excluded.expanded",
         (account_ref, _view(view), vpc_id, json.dumps(sorted(set(groups)))),
     )
+
+
+# -- tag filter presets ----------------------------------------------------------------
+
+
+def parse_preset_name(raw: str | None) -> str:
+    name = (raw or "").strip()
+    if not name or len(name) > MAX_PRESET_NAME:
+        raise ValueError(f"a preset name is 1 to {MAX_PRESET_NAME} characters")
+    return name
+
+
+def list_presets(conn: sqlite3.Connection, account_ref: int) -> list[dict[str, Any]]:
+    """Named tag filter presets of the account, by name: ``{name, filters, hide_empty}``."""
+    out = []
+    for row in conn.execute(
+        "SELECT name, filters, hide_empty FROM visual_filter_presets WHERE account_ref=? "
+        "ORDER BY name COLLATE NOCASE, name",
+        (account_ref,),
+    ):
+        try:
+            filters = parse_filters(row["filters"])
+        except ValueError:  # written by a later version with other rules: skip it
+            continue
+        out.append(
+            {
+                "name": row["name"],
+                "filters": [f.as_dict() for f in filters],
+                "hide_empty": bool(row["hide_empty"]),
+            }
+        )
+    return out
+
+
+def save_preset(
+    conn: sqlite3.Connection,
+    account_ref: int,
+    name: str,
+    filters: list[TagFilter],
+    hide_empty: bool = False,
+) -> None:
+    """Store (or overwrite) the preset ``name``."""
+    conn.execute(
+        "INSERT INTO visual_filter_presets(account_ref, name, filters, hide_empty) "
+        "VALUES(?,?,?,?) ON CONFLICT(account_ref, name) DO UPDATE SET "
+        "filters=excluded.filters, hide_empty=excluded.hide_empty",
+        (
+            account_ref,
+            parse_preset_name(name),
+            json.dumps([f.as_dict() for f in filters]),
+            int(hide_empty),
+        ),
+    )
+
+
+def delete_preset(conn: sqlite3.Connection, account_ref: int, name: str) -> bool:
+    cur = conn.execute(
+        "DELETE FROM visual_filter_presets WHERE account_ref=? AND name=?", (account_ref, name)
+    )
+    return cur.rowcount > 0

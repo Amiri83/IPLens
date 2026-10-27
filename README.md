@@ -142,6 +142,14 @@ mode `0700`). Delete it to reset IPLens completely.
    + view until **Reset layout** (which also leaves focus mode). **Export SVG** / **Export
    draw.io** download the view exactly as shown (draw.io: `mxgraph.aws4` shapes, VPC and subnets
    as containers, edges kept). Data comes from `GET /visual/data.json?vpc=<vpc-id>`.
+   **Tag filters** (both views, in the browser over the loaded data, nothing is re-discovered):
+   pick a resource type, a tag key (suggested from the tags found on that type, any case) and one
+   or more values; only resources of that type with one of those values are drawn, other types
+   are untouched. Several filters on one type must all match; resources without the key are
+   hidden unless **Include untagged**. Active filters are removable chips, with "X of Y shown" per
+   type. VPC and subnet boxes always stay, unless **Hide empty containers**. Filters can be saved
+   as named presets (per account). Compliance rules, findings, suggestions and data exports are
+   never filtered.
    The **IP view** is the default; the **Extended view** tab adds regional services (SNS, SQS,
    DynamoDB, EventBridge, S3, API Gateway, Step Functions, Lambda, ECS, Secrets Manager names) and
    external nodes (Transit Gateway, peering, internet via IGW / NAT) around the VPC.

@@ -1,5 +1,6 @@
-"""Extended view in a real browser (Playwright + Chromium): changing the layout lays the
-diagram out afresh, Fit shows every visible node, and no layout raises. Playwright is part of
+"""Visual page in a real browser (Playwright + Chromium). Extended view: changing the layout
+lays the diagram out afresh, Fit shows every visible node, and no layout raises. Both views:
+the tag filter panel (scope, OR / AND, untagged, containers, presets). Playwright is part of
 the ``dev`` extras; its Chromium comes from ``python -m playwright install chromium``, from
 ``IPLENS_CHROMIUM`` (a Chromium / Chrome for Testing executable) or from
 ``/opt/pw-browsers/chromium``. Without a browser the test is skipped, unless
@@ -221,3 +222,157 @@ def test_extended_layout_change_and_fit(browser, server, query, lanes):
     # The saved Grid positions are kept on the server.
     with closing(server["db"]) as conn:
         assert viewstate.get_layout(conn, server["ref"], KEY, "grid")
+
+
+# -- tag filters (IP and Extended view) -----------------------------------------------------
+
+TF_VPC = "vpc-0abc1234"
+TF_SUBNETS = ("subnet-a", "subnet-b")
+# eni -> (subnet, owner type, tags)
+TF_ENIS = {
+    "eni-0abc0001": ("subnet-a", "ec2", {"Env": "prod", "Team": "team-a"}),
+    "eni-0abc0002": ("subnet-a", "ec2", {"env": "dev", "Team": "team-b"}),
+    "eni-0abc0003": ("subnet-a", "ec2", {}),
+    "eni-0abc0004": ("subnet-a", "lambda", {"Env": "dev"}),
+    "eni-0abc0005": ("subnet-b", "ec2", {"Env": "dev", "Team": "team-a"}),
+}
+
+
+@pytest.fixture
+def tf_server(home, snapshot_builder):
+    port = _free_port()
+    app = create_app(home, testing=True, port=port)
+    db = app.extensions["iplens"]["paths"].db_path
+    b = snapshot_builder(db)
+    b.vpc(TF_VPC, "192.0.2.0/24")
+    for i, subnet in enumerate(TF_SUBNETS):
+        b.subnet(subnet, TF_VPC, f"192.0.2.{64 * i}/26", name=f"test-subnet-{i}")
+    for n, (eni, (subnet, owner, tags)) in enumerate(TF_ENIS.items()):
+        lam = owner == "lambda"
+        b.eni(
+            eni,
+            subnet,
+            [f"192.0.2.{64 * TF_SUBNETS.index(subnet) + 10 + n}"],
+            owner_type=owner,
+            owner_ref="fn-a" if lam else "",
+            name=f"test-server-{n}",
+            instance_id=None if lam else f"i-0abc123{n}",
+        )
+        for k, v in tags.items():
+            b.tag("eni", eni, k, v)
+    srv = serving.make_server("127.0.0.1", port, app, threaded=True)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield {"url": f"http://127.0.0.1:{port}", "db": db, "ref": b.account_ref}
+    srv.shutdown()
+    thread.join(timeout=10)
+
+
+SHOWN = f"() => {CY}.nodes('.res').filter((n) => n.visible()).map((n) => n.data('eni')).sort()"
+
+
+def _options(page, selector):
+    return page.eval_on_selector_all(f"{selector} option", "os => os.map((o) => o.value)")
+
+
+def _add_filter(page, type_, key, values=(), untagged=False):
+    page.select_option("#tf-type", type_)
+    page.fill("#tf-key", key)
+    if values:
+        page.select_option("#tf-values", list(values))
+    if untagged:
+        page.check("#tf-untagged")
+    page.click("#tf-add")
+
+
+def _remove_filters(page):
+    while page.locator(".tf-chip button").count():
+        page.locator(".tf-chip button").first.click()
+
+
+def test_tag_filters_in_the_ip_view(browser, tf_server):
+    page, errors = _open(browser, f"{tf_server['url']}/visual?vpc={TF_VPC}")
+    every = sorted(TF_ENIS)
+    assert page.evaluate(SHOWN) == every
+    assert "EC2: 4 of 4 shown" in page.text_content("#tf-counts")
+
+    # Key suggestions and values come from the tags found on the chosen type.
+    page.select_option("#tf-type", "ec2")
+    assert _options(page, "#tf-keys") == ["Env", "Team"]  # Env / env are one key
+    page.fill("#tf-key", "ENV")
+    assert _options(page, "#tf-values") == ["dev", "prod"]
+
+    # Scope: only EC2 is filtered, the Lambda ENI stays; untagged EC2 is hidden.
+    _add_filter(page, "ec2", "env", ["prod"])
+    assert page.evaluate(SHOWN) == ["eni-0abc0001", "eni-0abc0004"]
+    assert page.locator(".tf-chip").count() == 1
+    counts = page.text_content("#tf-counts")
+    assert "EC2: 1 of 4 shown" in counts and "Lambda: 1 of 1 shown" in counts
+    # Containers stay, even subnet-b with nothing left inside.
+    for box in ("vpc", "subnet:subnet-a", "subnet:subnet-b"):
+        assert page.evaluate(VISIBLE, box), box
+    assert page.evaluate(f"() => {CY}.getElementById('subnet:subnet-b').width()") > 0
+    page.check("#tf-hide-empty")
+    assert not page.evaluate(VISIBLE, "subnet:subnet-b")
+    assert page.evaluate(VISIBLE, "subnet:subnet-a") and page.evaluate(VISIBLE, "vpc")
+    page.uncheck("#tf-hide-empty")
+    assert page.evaluate(VISIBLE, "subnet:subnet-b")
+
+    # OR within a filter, AND with a second filter on the same type.
+    _remove_filters(page)
+    assert page.evaluate(SHOWN) == every
+    _add_filter(page, "ec2", "Env", ["prod", "dev"])
+    assert page.evaluate(SHOWN) == ["eni-0abc0001", "eni-0abc0002", "eni-0abc0004", "eni-0abc0005"]
+    _add_filter(page, "ec2", "team", ["team-a"])
+    assert page.evaluate(SHOWN) == ["eni-0abc0001", "eni-0abc0004", "eni-0abc0005"]
+
+    # Untagged kept on request.
+    _remove_filters(page)
+    _add_filter(page, "ec2", "Env", ["prod"], untagged=True)
+    assert page.evaluate(SHOWN) == ["eni-0abc0001", "eni-0abc0003", "eni-0abc0004"]
+
+    # Hide empty: only subnet-a keeps a resource.
+    _remove_filters(page)
+    _add_filter(page, "ec2", "Team", ["team-b"])
+    _add_filter(page, "lambda", "Env", untagged=True)  # untagged only: hides the tagged one
+    assert page.evaluate(SHOWN) == ["eni-0abc0002"]
+    page.check("#tf-hide-empty")
+    assert page.evaluate(VISIBLE, "vpc") and not page.evaluate(VISIBLE, "subnet:subnet-b")
+
+    # Presets: save, reload the page, load, delete.
+    page.fill("#tf-preset-name", "team-b")
+    page.click("#tf-save")
+    page.wait_for_function("document.querySelectorAll('#tf-preset option').length === 2")
+    page.close()
+    with closing(tf_server["db"]) as conn:
+        (preset,) = viewstate.list_presets(conn, tf_server["ref"])
+    assert preset["name"] == "team-b" and preset["hide_empty"] is True
+    assert [f["resource_type"] for f in preset["filters"]] == ["ec2", "lambda"]
+
+    page, errors2 = _open(browser, f"{tf_server['url']}/visual?vpc={TF_VPC}")
+    assert page.evaluate(SHOWN) == every  # nothing is filtered until a preset is loaded
+    page.select_option("#tf-preset", "team-b")
+    page.click("#tf-load")
+    assert page.evaluate(SHOWN) == ["eni-0abc0002"]
+    assert page.is_checked("#tf-hide-empty") and page.locator(".tf-chip").count() == 2
+    page.click("#tf-delete")
+    page.wait_for_function("document.querySelectorAll('#tf-preset option').length === 1")
+    with closing(tf_server["db"]) as conn:
+        assert viewstate.list_presets(conn, tf_server["ref"]) == []
+    assert errors == [] and errors2 == []
+    page.close()
+
+
+def test_tag_filters_in_the_extended_view(browser, tf_server):
+    page, errors = _open(browser, f"{tf_server['url']}/visual?vpc={TF_VPC}&view=extended")
+    _add_filter(page, "ec2", "Env", ["dev"])
+    assert page.evaluate(SHOWN) == ["eni-0abc0002", "eni-0abc0004", "eni-0abc0005"]
+    _add_filter(page, "lambda", "Env", untagged=True)  # untagged only: hides the tagged one
+    _add_filter(page, "ec2", "Team", ["team-a"])
+    assert page.evaluate(SHOWN) == ["eni-0abc0005"]
+    assert page.evaluate(VISIBLE, "subnet:subnet-a")  # nothing left inside, still drawn
+    page.check("#tf-hide-empty")
+    assert not page.evaluate(VISIBLE, "subnet:subnet-a")
+    assert page.evaluate(VISIBLE, "subnet:subnet-b") and page.evaluate(VISIBLE, "vpc")
+    assert errors == []
+    page.close()

@@ -109,6 +109,26 @@
     <legend>Environment</legend>
     <span class="muted small" id="env-filters-empty">Loading…</span>
   </fieldset>
+  {# No "name" attributes: the tag filters never become part of the page URL. #}
+  <fieldset class="edge-filters tag-filters" id="tag-filters">
+    <legend>Tag filters</legend>
+    <select id="tf-type" aria-label="Resource type"><option value="">(resource type)</option></select>
+    <input id="tf-key" list="tf-keys" placeholder="tag key" aria-label="Tag key" autocomplete="off" maxlength="128" disabled>
+    <datalist id="tf-keys"></datalist>
+    <select id="tf-values" multiple size="3" aria-label="Tag values" disabled></select>
+    <label class="edge-filter" title="Also show resources of this type without the tag key"><input type="checkbox" id="tf-untagged"> Include untagged</label>
+    <button type="button" class="secondary" id="tf-add" disabled>Add filter</button>
+    <span class="tf-chips" id="tf-chips" aria-live="polite"></span>
+    <label class="edge-filter" title="Hide subnets (and the VPC) with no resource shown inside"><input type="checkbox" id="tf-hide-empty"> Hide empty containers</label>
+    <span class="muted small tf-counts" id="tf-counts"></span>
+    <span class="tf-presets">
+      <select id="tf-preset" aria-label="Filter preset"><option value="">(preset)</option></select>
+      <button type="button" class="secondary" id="tf-load">Load</button>
+      <button type="button" class="secondary" id="tf-delete">Delete</button>
+      <input id="tf-preset-name" placeholder="preset name" aria-label="Preset name" autocomplete="off" maxlength="64">
+      <button type="button" class="secondary" id="tf-save">Save preset</button>
+    </span>
+  </fieldset>
   <fieldset class="edge-filters">
     <legend>Group by</legend>
     <select id="group-by" name="group" aria-label="Group by">
@@ -164,6 +184,11 @@
     IaC tag, Terraform, CloudTrail creator or unmanaged — see the Ownership page) or a team (the team
     tag key of Settings → Ownership). <b>Environment</b> shows only the ticked environments
     (from the Terraform root × environment mapping, else the environment tag set in Settings).
+    <b>Tag filters</b> show only the resources of a type whose tag (key in any case) has one of
+    the chosen values; resources without the key are hidden unless <b>Include untagged</b>, other
+    types are not affected, and several filters on one type must all match. VPC and subnet boxes
+    stay unless <b>Hide empty containers</b>. Filters only change this diagram (findings,
+    suggestions and data exports always cover every resource); save them as a named preset.
     Exports contain the diagram as currently shown; with <b>Expand all groups</b> (default) every
     collapsed group is exported as its member resources.
     {% if extended %}<br><b>Extended view:</b> one line per pair of nodes, styled by its strongest
@@ -199,6 +224,8 @@
        data-prefs-url="{{ url_for('visual_prefs') }}"
        data-layout-url="{{ url_for('visual_layout_save') }}"
        data-reset-url="{{ url_for('visual_layout_reset') }}"
+       data-presets-url="{{ url_for('visual_filter_preset_save') }}"
+       data-presets-delete-url="{{ url_for('visual_filter_preset_delete') }}"
        data-export-svg="{{ url_for('visual_export_svg') }}"
        data-export-drawio="{{ url_for('visual_export_drawio') }}"></div>
   <div id="cy-tip" class="cy-tip" role="tooltip" hidden></div>
@@ -222,6 +249,7 @@
 {% endif %}
 <script type="application/json" id="visual-positions">{{ positions | tojson }}</script>
 <script type="application/json" id="visual-expanded">{{ expanded | tojson }}</script>
+<script type="application/json" id="visual-filter-presets">{{ filter_presets | tojson }}</script>
 <p class="flash error" id="cy-layout-error" role="alert" hidden></p>
 <p class="muted" id="cy-status"></p>
 <p class="muted small" id="cy-note" aria-live="polite"></p>
@@ -263,6 +291,7 @@
 <script src="{{ url_for('static', filename='vendor/cytoscape.min.js') }}"></script>
 <script src="{{ url_for('static', filename='vendor/dagre.min.js') }}"></script>
 <script src="{{ url_for('static', filename='declutter.js') }}"></script>
+<script src="{{ url_for('static', filename='tagfilter.js') }}"></script>
 <script src="{{ url_for('static', filename='visual.js') }}"></script>
 {% endif %}
 {% endblock %}

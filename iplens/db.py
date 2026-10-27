@@ -462,6 +462,15 @@ CREATE TABLE IF NOT EXISTS visual_groups (
     PRIMARY KEY (account_ref, view, vpc_id)
 );
 
+-- Named tag filter presets of the Visual page, per account (see tagfilter.py).
+CREATE TABLE IF NOT EXISTS visual_filter_presets (
+    account_ref INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    filters     TEXT NOT NULL,      -- JSON list of tag filters (tagfilter.TagFilter)
+    hide_empty  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_ref, name)
+);
+
 -- Background jobs (jobs.py): written when a job starts and ends, so a reloaded page can
 -- re-attach to it and show the outcome. messages / log: JSON lists (no secrets: result
 -- lines and the first line of each log record only).

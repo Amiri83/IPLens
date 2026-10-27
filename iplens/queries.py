@@ -845,6 +845,10 @@ def visual_data(
             for sg in sorted({g for n in resources.values() for g in n["sgs"]})
         },
         "tag_keys": sorted({k for n in resources.values() for k in n["tags"]}),
+        # Resource types of the tag filter panel.
+        "type_labels": {
+            t: labels.get(t, t) for t in sorted({n["type"] for n in resources.values()})
+        },
         "tf_roots": sorted({m["root"] for n in resources.values() for m in n["tf"]}),
         **visual_edges(conn, snap_id, vpc.vpc_id, resources, by_ip, edge_types, names),
     }

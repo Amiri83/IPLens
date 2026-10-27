@@ -71,6 +71,9 @@
   const focusHops = document.getElementById("focus-hops");
   const focusReset = document.getElementById("focus-reset");
   const D = window.IPLensDeclutter;
+  const TF = window.IPLensTagFilter;
+  const tagPanel = document.getElementById("tag-filters");
+  const hideEmptyBox = document.getElementById("tf-hide-empty");
   const GROUP_THRESHOLD = 10;  // mirrors iplens.queries.VISUAL_GROUP_THRESHOLD
   const COMPUTE_TYPES = new Set(["lambda", "ecs"]);
   const SHARED_LANE = "shared";
@@ -424,16 +427,196 @@
     window.history.replaceState(null, "", `${window.location.pathname}?${params}`);
   }
 
-  /* IP view: resources of unticked environments disappear, and a group whose members are
-     all gone with them (the Extended view folds this into applyServiceFilter). */
+  /* IP view: resources of unticked environments or left out by a tag filter disappear,
+     and a group whose members are all gone with them (the Extended view folds this into
+     applyServiceFilter). */
   function applyEnvFilterIp(cy) {
     const off = envOff();
     cy.batch(() => {
-      cy.nodes(".res").forEach((n) => { n.toggleClass("filtered", off.has(n.data("raw").environment || "")); });
+      cy.nodes(".res").forEach((n) => {
+        n.toggleClass("filtered", off.has(n.data("raw").environment || "") || tagGone(n));
+      });
       cy.nodes(".group").forEach((g) => {
         g.toggleClass("filtered", groupMembers(cy, g).every((m) => m.hasClass("filtered")));
       });
+      applyContainers(cy);
     });
+  }
+
+  // -- tag filters (both views; rules in tagfilter.js) -----------------------------------
+
+  // Active filters: [{resource_type, tag_key, values, include_untagged}].
+  let tagFilters = [];
+  let typeLabels = {};  // resource type -> label (visual data "type_labels")
+
+  function tagGone(n) {
+    return !TF.resourceVisible(n.data("raw"), tagFilters);
+  }
+
+  /* VPC and subnet boxes stay, unless "Hide empty containers": then a subnet without a
+     shown resource goes, and the VPC with its last subnet. Also refreshes "X of Y shown". */
+  function applyContainers(cy) {
+    const subnets = cy.nodes(".subnet").map((s) => ({ subnet_id: s.id(), resources: s.children(".res").toArray() }));
+    const gone = TF.hiddenContainers(subnets, (n) => !n.hasClass("filtered"), hideEmptyBox && hideEmptyBox.checked);
+    const hidden = new Set(gone.subnets);
+    cy.nodes(".subnet").forEach((s) => { s.toggleClass("filtered", hidden.has(s.id())); });
+    cy.nodes(".vpc").toggleClass("filtered", gone.vpc);
+    const counts = TF.typeCounts(cy.nodes(".res").map((n) => n.data("raw")), (r) => !cy.getElementById("res:" + r.eni_id).hasClass("filtered"));
+    const out = document.getElementById("tf-counts");
+    if (out) {
+      out.textContent = Object.entries(counts)
+        .map(([t, [shown, total]]) => `${typeLabels[t] || t}: ${shown} of ${total} shown`).join(" · ");
+    }
+  }
+
+  function tagChipText(f) {
+    const values = f.values.map((v) => (v === "" ? "(empty)" : v));
+    if (f.include_untagged) values.push("untagged");
+    return `${typeLabels[f.resource_type] || f.resource_type}: ${f.tag_key} = ${values.join(" | ")}`;
+  }
+
+  /* The filter panel: resource type, then tag key (suggested from the tags found on that
+     type), then values (found for that key); active filters as removable chips; named
+     presets saved per account. ``onChange`` redraws. */
+  function setupTagFilters(data, onChange) {
+    if (!tagPanel) return;
+    const typeSelect = document.getElementById("tf-type");
+    const keyInput = document.getElementById("tf-key");
+    const keyList = document.getElementById("tf-keys");
+    const valueSelect = document.getElementById("tf-values");
+    const untaggedBox = document.getElementById("tf-untagged");
+    const addBtn = document.getElementById("tf-add");
+    const chips = document.getElementById("tf-chips");
+    const presetSelect = document.getElementById("tf-preset");
+    const presetName = document.getElementById("tf-preset-name");
+    let presets = JSON.parse(document.getElementById("visual-filter-presets").textContent || "[]");
+    const found = TF.discoveredTags(allResources(data.vpc));
+    typeLabels = data.type_labels || {};
+
+    const option = (value, text) => {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      return opt;
+    };
+    typeSelect.append(...Object.entries(typeLabels).map(([t, label]) => option(t, label)));
+
+    const knownKey = () => {
+      const wanted = keyInput.value.trim().toLowerCase();
+      return Object.keys(found[typeSelect.value] || {}).find((k) => k.toLowerCase() === wanted);
+    };
+    const syncAdd = () => {
+      addBtn.disabled = !typeSelect.value || !keyInput.value.trim() ||
+        !(valueSelect.selectedOptions.length || untaggedBox.checked);
+    };
+    const syncValues = () => {
+      const key = knownKey();
+      const values = key ? found[typeSelect.value][key] : [];
+      valueSelect.replaceChildren(...values.map((v) => option(v, v === "" ? "(empty)" : v)));
+      valueSelect.disabled = !values.length;
+      syncAdd();
+    };
+    typeSelect.addEventListener("change", () => {
+      keyList.replaceChildren(...Object.keys(found[typeSelect.value] || {}).map((k) => option(k, k)));
+      keyInput.disabled = !typeSelect.value;
+      keyInput.value = "";
+      syncValues();
+    });
+    keyInput.addEventListener("input", syncValues);
+    [valueSelect, untaggedBox].forEach((el) => el.addEventListener("change", syncAdd));
+
+    const drawChips = () => {
+      chips.replaceChildren(...tagFilters.map((f, i) => {
+        const chip = document.createElement("span");
+        chip.className = "tf-chip";
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.textContent = "×";
+        remove.title = "Remove this filter";
+        remove.setAttribute("aria-label", "Remove filter " + tagChipText(f));
+        remove.addEventListener("click", () => {
+          tagFilters.splice(i, 1);
+          drawChips();
+          onChange();
+        });
+        chip.append(tagChipText(f) + " ", remove);
+        return chip;
+      }));
+    };
+    const add = () => {
+      if (addBtn.disabled) return;
+      tagFilters.push({
+        resource_type: typeSelect.value,
+        tag_key: knownKey() || keyInput.value.trim(),
+        values: Array.from(valueSelect.selectedOptions).map((o) => o.value),
+        include_untagged: untaggedBox.checked,
+      });
+      valueSelect.selectedIndex = -1;
+      untaggedBox.checked = false;
+      syncAdd();
+      drawChips();
+      onChange();
+    };
+    addBtn.addEventListener("click", add);
+    hideEmptyBox.addEventListener("change", onChange);
+
+    const drawPresets = (selected) => {
+      presetSelect.replaceChildren(option("", "(preset)"), ...presets.map((p) => option(p.name, p.name)));
+      presetSelect.value = selected || "";
+    };
+    const sendPreset = (url, fields) => {
+      const body = new URLSearchParams({ csrf_token: csrf, ...fields });
+      return fetch(url, { method: "POST", body: body, credentials: "same-origin" })
+        .then((r) => {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then((list) => { presets = list; });
+    };
+    const save = () => {
+      const name = presetName.value.trim();
+      if (!name) {
+        note.textContent = "Name the preset first.";
+        return;
+      }
+      sendPreset(container.dataset.presetsUrl, {
+        name: name, filters: JSON.stringify(tagFilters), hide_empty: hideEmptyBox.checked ? "1" : "0",
+      })
+        .then(() => {
+          drawPresets(name);
+          note.textContent = `Preset "${name}" saved.`;
+        })
+        .catch((err) => { note.textContent = `Could not save the preset (${err.message}).`; });
+    };
+    document.getElementById("tf-save").addEventListener("click", save);
+    document.getElementById("tf-load").addEventListener("click", () => {
+      const p = presets.find((x) => x.name === presetSelect.value);
+      if (!p) return;
+      tagFilters = p.filters.map((f) => ({ ...f, values: f.values.slice() }));
+      hideEmptyBox.checked = p.hide_empty;
+      presetName.value = p.name;
+      drawChips();
+      onChange();
+    });
+    document.getElementById("tf-delete").addEventListener("click", () => {
+      const name = presetSelect.value;
+      if (!name) return;
+      sendPreset(container.dataset.presetsDeleteUrl, { name: name })
+        .then(() => {
+          drawPresets("");
+          note.textContent = `Preset "${name}" deleted.`;
+        })
+        .catch((err) => { note.textContent = `Could not delete the preset (${err.message}).`; });
+    });
+    // Enter adds the filter / saves the preset instead of submitting the page form.
+    [[keyInput, add], [presetName, save]].forEach(([input, action]) => {
+      input.addEventListener("keydown", (evt) => {
+        if (evt.key !== "Enter") return;
+        evt.preventDefault();
+        action();
+      });
+    });
+    drawPresets("");
   }
 
   /* Rebuild the context boxes: one non-compound "ctx" node per SG / tag value / root,
@@ -806,8 +989,8 @@
     }
   }
 
-  // Service and environment filters: unticked services / environments disappear, and
-  // with them a group of only those.
+  // Service, environment and tag filters: unticked services / environments and resources
+  // left out by a tag filter disappear, and with them a group of only those.
   function applyServiceFilter(cy) {
     const off = new Set(Array.from(document.querySelectorAll('input[name="service"]'))
       .filter((b) => !b.checked).map((b) => b.value));
@@ -815,12 +998,13 @@
     const envGone = (n) => envs.has((n.data("raw") || {}).environment || "");
     cy.batch(() => {
       cy.nodes(".ext").forEach((n) => { n.toggleClass("filtered", off.has(n.data("service")) || envGone(n)); });
-      cy.nodes(".res").forEach((n) => { n.toggleClass("filtered", envGone(n)); });
+      cy.nodes(".res").forEach((n) => { n.toggleClass("filtered", envGone(n) || tagGone(n)); });
       cy.nodes(".group").forEach((g) => {
         const gone = groupMembers(cy, g).every((m) => m.hasClass("filtered"));
         g.toggleClass("filtered", gone);
         if (g.hasClass("svc")) cy.getElementById("box:" + g.id()).toggleClass("filtered", gone);
       });
+      applyContainers(cy);
     });
   }
 
@@ -1277,7 +1461,8 @@
     });
 
     const link = (a, b, weight) => g.setEdge(a, b, { weight: weight, minlen: 1 }, `${a}>${b}`);
-    const subnets = cy.nodes(".subnet").sort((a, b) => a.data("order") - b.data("order"));
+    const subnets = cy.nodes(".subnet").filter((n) => !n.hasClass("filtered"))
+      .sort((a, b) => a.data("order") - b.data("order"));
     const tops = [];     // first layout node of each subnet
     const bottoms = [];  // last layout node of each subnet
     subnets.forEach((sn) => {
@@ -1801,6 +1986,10 @@
       },
     );
     refreshEnvFilters();
+    setupTagFilters(data, () => {
+      if (ext) applyServiceFilter(cy);
+      relayout();
+    });
     if (ext) applyServiceFilter(cy);
     relayout();
     fitShown(true);

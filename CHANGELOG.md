@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.4.0 – 2026-10-27
+
+### Added
+
+- **Visual → Tag filters** (IP and Extended view): choose a resource type, a tag key (suggested
+  from the tags found on that type) and one or more of its values. A filter only affects its own
+  resource type; its values are OR'd, several filters on one type are AND'd; tag keys match in
+  any case, values exactly. Resources without the key are hidden unless **Include untagged**
+  (off by default). Active filters show as removable chips, with "X of Y shown" per resource
+  type. VPC and subnet boxes are always drawn, unless **Hide empty containers** (off by default)
+  is ticked. Filtering runs in the browser over the data already loaded (no new discovery).
+  Compliance rules, findings, suggestions and data exports always use every resource; the
+  diagram's SVG / draw.io export still contains the diagram as shown.
+- Named tag filter presets, saved per account in the database: save (overwrites a preset of the
+  same name, including its "Hide empty containers" choice), load and delete.
+
 ## 1.3.1 – 2026-10-22
 
 ### Changed
