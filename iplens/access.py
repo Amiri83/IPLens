@@ -24,6 +24,27 @@ resource policy of an SQS queue / SNS topic is evaluated by the crawl as well, t
 endpoint policy (collected with the endpoint) when the Visual page is built. A
 connection without simulation data (no crawl yet, a principal without a role) is "not
 checked" and does not block.
+
+Full path (1.6.1), from data the Extended crawl caches per snapshot:
+
+- **NACL**: the network ACLs of both subnets, stateless and in rule number order (first
+  match wins, the default rule ``*`` denies), in both directions: the request (outbound of
+  A's subnet, inbound of B's) and its return traffic on the ephemeral ports 1024-65535
+  (outbound of B's subnet, inbound of A's). Traffic inside one subnet is not filtered.
+- **route**: A's subnet's route table (explicit, else the VPC's main table) needs a route to
+  B: longest prefix match (local, NAT / internet gateway, transit gateway, peering, ...), a
+  blackhole route refuses. To a regional service (SQS, SNS): an interface VPC endpoint of
+  the service in the VPC, else a default route (an internet gateway only for an ENI with a
+  public IP).
+- **KMS**: for an encrypted SQS queue / SNS topic / ECR repository, ``kms:GenerateDataKey``
+  / ``kms:Decrypt`` on its key, simulated for the role, and the key policy when readable
+  (a statement naming the account root delegates to IAM).
+- **SCP**: the service control policies from the organization root down to the account
+  (every level must allow, none deny) when Organizations is readable; otherwise the
+  connection is marked "SCP not evaluated" and not blocked.
+
+A blocked connection's reasons start with the layer(s) that blocked it
+(:func:`reasons`): SG, NACL, route, IAM, endpoint policy, resource policy, KMS or SCP.
 """
 
 from __future__ import annotations
@@ -53,6 +74,22 @@ RECEIVE_ACTION = "sqs:ReceiveMessage"
 COMPUTE = ("lambda", "ecs")
 # Reasons listed per side of a network verdict.
 MAX_REASONS = 3
+# Return traffic of a TCP / UDP flow reaches the client on one of these ports.
+EPHEMERAL = (1024, PORT_MAX)
+# The KMS actions a connection to an encrypted target needs, by the connection's action.
+KMS_ACTIONS = {
+    "sqs:SendMessage": ("kms:GenerateDataKey", "kms:Decrypt"),
+    "sns:Publish": ("kms:GenerateDataKey", "kms:Decrypt"),
+    "sqs:ReceiveMessage": ("kms:Decrypt",),
+    "ecr:BatchGetImage": ("kms:Decrypt",),
+}
+# Key policy verdict: allowed through a statement naming the account root, so IAM decides.
+DELEGATED = "delegated"
+
+# The layers of the path, as a blocked connection's reason names them.
+SG, NACL, ROUTE, IAM = "SG", "NACL", "route", "IAM"
+ENDPOINT_POLICY, RESOURCE_POLICY, KMS, SCP = "endpoint policy", "resource policy", "KMS", "SCP"
+BLOCKED_AT = "Blocked at layer: "
 
 
 # -- ports --------------------------------------------------------------------------------
@@ -143,11 +180,36 @@ def _in(ip: str, net: Any) -> bool:
 
 @dataclass
 class Verdict:
-    """``allowed`` False: blocked. ``checked`` False: nothing to check it against."""
+    """``allowed`` False: blocked (by ``layers``). ``checked`` False: nothing to check it
+    against."""
 
     allowed: bool
     lines: list[str] = field(default_factory=list)
     checked: bool = True
+    layers: list[str] = field(default_factory=list)
+
+
+def combine(verdicts: Iterable[Verdict | None]) -> Verdict:
+    """All layers of one path: allowed only if every checked layer allows it."""
+    found = [v for v in verdicts if v is not None]
+    layers = [layer for v in found if not v.allowed for layer in v.layers]
+    return Verdict(
+        all(v.allowed for v in found),
+        [ln for v in found for ln in v.lines],
+        checked=any(v.checked for v in found),
+        layers=list(dict.fromkeys(layers)),
+    )
+
+
+def headline(layers: Iterable[str]) -> str:
+    return BLOCKED_AT + ", ".join(dict.fromkeys(layers))
+
+
+def reasons(verdict: Verdict) -> list[str]:
+    """The lines of a verdict, led by the blocking layer(s) when it is blocked."""
+    if verdict.allowed:
+        return list(verdict.lines)
+    return [headline(verdict.layers), *verdict.lines]
 
 
 class SgRules:
@@ -237,7 +299,9 @@ class SgRules:
         into, in_why = self._side("ingress", target, source, flow)
         if out == [] or into == []:
             return Verdict(
-                False, [*(out_why if out == [] else []), *(in_why if into == [] else [])]
+                False,
+                [*(out_why if out == [] else []), *(in_why if into == [] else [])],
+                layers=[SG],
             )
         common = [
             p
@@ -253,8 +317,384 @@ class SgRules:
                     f"blocked: egress of {source.name} allows {allowed_out}, ingress of "
                     f"{target.name} allows {allowed_in}: no port in common"
                 ],
+                layers=[SG],
             )
         return Verdict(True, [*out_why, *in_why], checked=out is not None or into is not None)
+
+
+# -- network ACLs -------------------------------------------------------------------------
+
+Spans = list[tuple[int, int]]
+
+
+def _cut(spans: Spans, lo: int, hi: int) -> tuple[Spans, Spans]:
+    """``(the parts of spans inside [lo, hi], the rest)``."""
+    inside: Spans = []
+    rest: Spans = []
+    for a, b in spans:
+        if b < lo or a > hi:
+            rest.append((a, b))
+            continue
+        inside.append((max(a, lo), min(b, hi)))
+        if a < lo:
+            rest.append((a, lo - 1))
+        if b > hi:
+            rest.append((hi + 1, b))
+    return inside, rest
+
+
+def _intersect(xs: Spans, ys: Spans) -> Spans:
+    return sorted((max(a, c), min(b, d)) for a, b in xs for c, d in ys if max(a, c) <= min(b, d))
+
+
+def _fmt(proto: str, spans: Spans) -> str:
+    return ", ".join(str(Ports(proto, lo, hi)) for lo, hi in sorted(spans))
+
+
+def _addr(peer: Peer) -> str:
+    return f" ({', '.join(peer.ips[:2])})" if peer.ips else ""
+
+
+@dataclass(frozen=True)
+class _AclEntry:
+    number: int
+    ports: Ports
+    net: Any  # ipaddress.IPv4Network
+    allow: bool
+
+
+class Nacls:
+    """The network ACL of each subnet of one snapshot (stored by the Extended crawl)."""
+
+    def __init__(self, conn: sqlite3.Connection, snap_id: int):
+        self.of_subnet = {
+            r["subnet_id"]: r["nacl_id"]
+            for r in conn.execute(
+                "SELECT subnet_id, nacl_id FROM nacl_subnets WHERE snapshot_id=?", (snap_id,)
+            )
+        }
+        self.entries: dict[tuple[str, bool], list[_AclEntry]] = {}
+        for r in conn.execute(
+            "SELECT * FROM nacl_entries WHERE snapshot_id=? ORDER BY nacl_id, egress, rule_number",
+            (snap_id,),
+        ):
+            try:
+                net = ipaddress.ip_network(r["cidr"], strict=False)
+            except ValueError:
+                continue
+            self.entries.setdefault((r["nacl_id"], bool(r["egress"])), []).append(
+                _AclEntry(
+                    r["rule_number"],
+                    rule_ports(r["protocol"], r["from_port"], r["to_port"]),
+                    net,
+                    r["action"] == "allow",
+                )
+            )
+
+    def _hop(
+        self, nacl: str, egress: bool, peer: Peer, proto: str, spans: Spans
+    ) -> tuple[Spans, list[tuple[_AclEntry, Spans]]]:
+        """Stateless evaluation in rule number order (the first matching rule decides each
+        port): the allowed port spans and the rules that decided."""
+        allowed: Spans = []
+        decided: list[tuple[_AclEntry, Spans]] = []
+        rest = list(spans)
+        for e in self.entries.get((nacl, egress), []):
+            if not rest:
+                break
+            if e.ports.proto not in (ALL, proto) or not any(_in(ip, e.net) for ip in peer.ips):
+                continue
+            inside, rest = _cut(rest, e.ports.lo, e.ports.hi)
+            if inside:
+                decided.append((e, inside))
+                if e.allow:
+                    allowed += inside
+        return allowed, decided
+
+    def check(
+        self, source: Peer, src_subnet: str, target: Peer, dst_subnet: str, flow: Ports
+    ) -> Verdict | None:
+        """May ``flow`` pass the NACLs from ``source`` to ``target`` and its return traffic
+        come back? None when a subnet's ACL is not in the snapshot."""
+        if src_subnet and src_subnet == dst_subnet:
+            return Verdict(True, [f"NACL: same subnet {src_subnet} (not filtered)"])
+        a, b = self.of_subnet.get(src_subnet), self.of_subnet.get(dst_subnet)
+        if not a or not b:
+            return None
+        failure: list[str] = []
+        for proto in [flow.proto] if flow.proto != ALL else ["tcp", "udp", "icmp"]:
+            request = [(flow.lo, flow.hi)]
+            back = [(0, PORT_MAX)] if proto == "icmp" else [EPHEMERAL]
+            hops = (
+                (a, src_subnet, True, target, request, ""),
+                (b, dst_subnet, False, source, request, ""),
+                (b, dst_subnet, True, source, back, "return traffic: "),
+                (a, src_subnet, False, target, back, "return traffic: "),
+            )
+            why: list[str] = []
+            for nacl, subnet, egress, peer, spans, what in hops:
+                allowed, decided = self._hop(nacl, egress, peer, proto, spans)
+                if what:
+                    back = _intersect(back, allowed)
+                else:
+                    request = _intersect(request, allowed)
+                if not allowed:
+                    denies = [
+                        f"rule {e.number} denies {_fmt(proto, s)}"
+                        for e, s in decided
+                        if not e.allow
+                    ]
+                    word = "to" if egress else "from"
+                    why.append(
+                        f"NACL: blocked: {what}{'outbound' if egress else 'inbound'} of {nacl} "
+                        f"({subnet}): "
+                        + ("; ".join(denies[:MAX_REASONS]) or "no rule allows it (rule * denies)")
+                        + f" – {_fmt(proto, spans)} {word} {peer.name}{_addr(peer)}"
+                    )
+                    break
+            if not why and not request:
+                why.append(f"NACL: blocked: {a} and {b} allow no {proto} port in common")
+            if not why and not back:
+                why.append(
+                    f"NACL: blocked: return traffic: {b} and {a} allow no ephemeral port in common"
+                )
+            if why:
+                failure = failure or why
+                continue
+            line = (
+                f"NACL: {a} ({src_subnet}) outbound and {b} ({dst_subnet}) inbound allow "
+                f"{_fmt(proto, request)}; return traffic allowed on {_fmt(proto, back)}"
+            )
+            if proto != "icmp" and back != [EPHEMERAL]:
+                line += " (not all ephemeral ports 1024-65535)"
+            return Verdict(True, [line])
+        return Verdict(False, failure, layers=[NACL])
+
+
+# -- routes -------------------------------------------------------------------------------
+
+ROUTE_KINDS = {
+    "local": "local",
+    "igw-": "internet gateway",
+    "nat-": "NAT gateway",
+    "tgw-": "transit gateway",
+    "pcx-": "VPC peering",
+    "vpce-": "VPC endpoint",
+    "vgw-": "virtual private gateway",
+    "eni-": "network interface",
+    "i-": "instance",
+}
+
+
+def route_kind(target: str) -> str:
+    return next((k for p, k in ROUTE_KINDS.items() if target.startswith(p)), "other")
+
+
+@dataclass(frozen=True)
+class _Route:
+    destination: str
+    net: Any  # ipaddress.IPv4Network, None for a prefix list
+    target: str
+    state: str
+
+    def __str__(self) -> str:
+        return f"{self.destination} → {self.target} ({route_kind(self.target)})"
+
+
+class Routes:
+    """The route tables of one snapshot's subnets (stored by the Extended crawl) and the
+    interface VPC endpoints (from the Refresh)."""
+
+    def __init__(self, conn: sqlite3.Connection, snap_id: int):
+        self.table: dict[str, str] = {}  # subnet -> explicitly associated route table
+        self.main: dict[str, str] = {}  # VPC -> main route table
+        for r in conn.execute(
+            "SELECT route_table_id, vpc_id, subnet_id FROM route_subnets WHERE snapshot_id=?",
+            (snap_id,),
+        ):
+            if r["subnet_id"]:
+                self.table[r["subnet_id"]] = r["route_table_id"]
+            else:
+                self.main[r["vpc_id"]] = r["route_table_id"]
+        self.routes: dict[str, list[_Route]] = {}
+        for r in conn.execute(
+            "SELECT * FROM route_entries WHERE snapshot_id=? ORDER BY route_table_id, destination",
+            (snap_id,),
+        ):
+            try:
+                net = ipaddress.ip_network(r["destination"], strict=False)
+            except ValueError:
+                net = None
+            self.routes.setdefault(r["route_table_id"], []).append(
+                _Route(r["destination"], net, r["target"], r["state"])
+            )
+        self.vpc_of = {
+            r[0]: r[1]
+            for r in conn.execute(
+                "SELECT subnet_id, vpc_id FROM subnets WHERE snapshot_id=?", (snap_id,)
+            )
+        }
+        self.endpoints: dict[str, list[tuple[str, str, list[str]]]] = {}
+        for r in conn.execute(
+            "SELECT endpoint_id, vpc_id, service_name, eni_ids FROM endpoints "
+            "WHERE snapshot_id=? AND endpoint_type='Interface' ORDER BY endpoint_id",
+            (snap_id,),
+        ):
+            self.endpoints.setdefault(r["vpc_id"], []).append(
+                (r["endpoint_id"], r["service_name"] or "", json.loads(r["eni_ids"] or "[]"))
+            )
+
+    def table_of(self, subnet: str) -> str | None:
+        """The subnet's route table, None when not in the snapshot."""
+        rtb = self.table.get(subnet) or self.main.get(self.vpc_of.get(subnet, ""))
+        return rtb if rtb in self.routes else None
+
+    def _best(self, rtb: str, ip: str) -> _Route | None:
+        return max(
+            (r for r in self.routes[rtb] if r.net is not None and _in(ip, r.net)),
+            key=lambda r: r.net.prefixlen,
+            default=None,
+        )
+
+    def to_ip(self, subnet: str, target: Peer) -> Verdict | None:
+        """A route from ``subnet`` to ``target`` (its first IP); None when not checked."""
+        rtb = self.table_of(subnet)
+        if rtb is None or not target.ips:
+            return None
+        ip = target.ips[0]
+        best = self._best(rtb, ip)
+        if best is None:
+            return Verdict(
+                False,
+                [f"route: blocked: no route in {rtb} of {subnet} to {target.name} ({ip})"],
+                layers=[ROUTE],
+            )
+        if best.state == "blackhole":
+            return Verdict(
+                False,
+                [f"route: blocked: {best} in {rtb} of {subnet} is a blackhole"],
+                layers=[ROUTE],
+            )
+        return Verdict(True, [f"route: {subnet} to {target.name} ({ip}) via {best} in {rtb}"])
+
+    def endpoint(self, subnet: str, service: str) -> tuple[str, list[str]] | None:
+        """``(endpoint id, ENI ids)`` of an interface endpoint of ``service`` ("sqs") in the
+        subnet's VPC."""
+        suffix = "." + service
+        return next(
+            (
+                (ep, enis)
+                for ep, name, enis in self.endpoints.get(self.vpc_of.get(subnet, ""), [])
+                if name.endswith(suffix)
+            ),
+            None,
+        )
+
+    def to_service(self, subnet: str, service: str, name: str, public_ip: bool) -> Verdict | None:
+        """A path from ``subnet`` to a regional AWS service: an interface endpoint in the
+        VPC, else a default route. None when not checked."""
+        rtb = self.table_of(subnet)
+        if rtb is None:
+            return None
+        ep = self.endpoint(subnet, service)
+        if ep is not None:
+            return Verdict(
+                True, [f"route: {subnet} to {service} through VPC endpoint {ep[0]} (local)"]
+            )
+        default = max(
+            (r for r in self.routes[rtb] if r.net is not None and r.net.prefixlen == 0),
+            key=lambda r: r.state != "blackhole",
+            default=None,
+        )
+        why = ""
+        if default is None:
+            why = f"no VPC endpoint for {service} and no default route in {rtb} of {subnet}"
+        elif default.state == "blackhole":
+            why = f"{default} in {rtb} of {subnet} is a blackhole"
+        elif default.target.startswith("igw-") and not public_ip:
+            why = (
+                f"{default} in {rtb} of {subnet}: {name} has no public IP (needs a NAT "
+                f"gateway or a VPC endpoint for {service})"
+            )
+        elif default.target.startswith("pcx-"):
+            why = f"{default} in {rtb} of {subnet}: VPC peering does not reach {service}"
+        if why:
+            return Verdict(False, [f"route: blocked: {why}"], layers=[ROUTE])
+        note = " (beyond the transit gateway not evaluated)" if "tgw-" in default.target else ""
+        return Verdict(True, [f"route: {subnet} to {service} via {default} in {rtb}{note}"])
+
+
+@dataclass(frozen=True)
+class _Eni:
+    name: str
+    sgs: tuple[str, ...]
+    ips: tuple[str, ...]
+    subnet: str
+    public: bool
+
+
+class PathCheck:
+    """The network layers of a flow between two ENIs (SG, NACL, route), and of a VPC
+    ENI's path to a regional AWS service (route, and the NACLs to its VPC endpoint)."""
+
+    def __init__(self, conn: sqlite3.Connection, snap_id: int, names: dict[str, str] | None):
+        self.sgs = SgRules(conn, snap_id, names)
+        self.nacls = Nacls(conn, snap_id)
+        self.routes = Routes(conn, snap_id)
+        self._conn, self._snap_id = conn, snap_id
+        self._enis: dict[str, _Eni] | None = None
+
+    def check(
+        self, source: Peer, src_subnet: str, target: Peer, dst_subnet: str, flow: Ports
+    ) -> Verdict:
+        nacl = self.nacls.check(source, src_subnet, target, dst_subnet, flow)
+        route = self.routes.to_ip(src_subnet, target)
+        verdict = combine([self.sgs.check(source, target, flow), nacl, route])
+        missing = [what for what, v in ((NACL, nacl), (ROUTE, route)) if v is None]
+        if missing:
+            verdict.lines.append(f"{' and '.join(missing)} not checked (run the Extended crawl)")
+        return verdict
+
+    def eni(self, eni_id: str) -> _Eni | None:
+        if self._enis is None:
+            self._enis = {}
+            rows = self._conn.execute(
+                "SELECT e.eni_id, e.subnet_id, e.security_groups, i.ip, i.public_ip FROM enis e "
+                "LEFT JOIN ips i ON i.snapshot_id=e.snapshot_id AND i.eni_id=e.eni_id "
+                "WHERE e.snapshot_id=? ORDER BY e.eni_id, i.is_primary DESC, i.ip",
+                (self._snap_id,),
+            )
+            for r in rows:
+                old = self._enis.get(r["eni_id"])
+                ips = (*(old.ips if old else ()), *((r["ip"],) if r["ip"] else ()))
+                self._enis[r["eni_id"]] = _Eni(
+                    r["eni_id"],
+                    tuple(json.loads(r["security_groups"] or "[]")),
+                    ips,
+                    r["subnet_id"] or "",
+                    bool(r["public_ip"]) or bool(old and old.public),
+                )
+        return self._enis.get(eni_id)
+
+    def to_service(self, eni_id: str, service: str) -> Verdict | None:
+        """VPC ENI -> a regional service: a route (endpoint or default route) and, through
+        an interface endpoint, the NACLs on tcp/443 to one of its ENIs. None: not checked."""
+        src = self.eni(eni_id)
+        if src is None:
+            return None
+        route = self.routes.to_service(src.subnet, service, src.name, src.public)
+        ep = self.routes.endpoint(src.subnet, service) if route is not None else None
+        if ep is None:
+            return route
+        https = Ports("tcp", 443, 443)
+        nacls = [
+            v
+            for e in ep[1]
+            if (dst := self.eni(e)) is not None
+            and (v := self.nacls.check(src, src.subnet, dst, dst.subnet, https)) is not None
+        ]
+        allowed = [v for v in nacls if v.allowed]
+        return combine([route, *(allowed[:1] or nacls[:1])])
 
 
 # -- resource / endpoint policies (evaluated locally, never stored) -------------------------
@@ -270,14 +710,18 @@ def _any_match(patterns: Any, value: str, ignore_case: bool = False) -> bool:
     return any(isinstance(p, str) and _pattern(p, ignore_case).match(value) for p in values)
 
 
-def _principal_matches(principal: Any, arn: str) -> bool:
+def account_of(arn: str) -> str:
+    return arn.split(":")[4] if arn.count(":") >= 5 else ""
+
+
+def _principal_matches(principal: Any, arn: str, account_root: bool = True) -> bool:
     if principal is None or principal == "*":
         return True
     if not isinstance(principal, dict):
         return False
     aws = principal.get("AWS")
     values = aws if isinstance(aws, list) else [aws]
-    account = arn.split(":")[4] if arn.count(":") >= 5 else ""
+    account = account_of(arn) if account_root else ""
     return any(
         v == "*" or v == arn or (account and v in (account, f"arn:aws:iam::{account}:root"))
         for v in values
@@ -285,11 +729,14 @@ def _principal_matches(principal: Any, arn: str) -> bool:
     )
 
 
-def policy_decision(doc: Any, principal: str, action: str, resource: str) -> tuple[str, str]:
+def policy_decision(
+    doc: Any, principal: str, action: str, resource: str, account_root: bool = True
+) -> tuple[str, str]:
     """``(decision, statement)`` of a resource or VPC endpoint policy for ``principal``
     doing ``action`` on ``resource``: an explicit Deny wins, else an Allow is needed.
     Conditions are not evaluated: a conditional Allow counts, a conditional Deny does not
-    block (noted in ``statement``)."""
+    block (noted in ``statement``). ``account_root`` False: a statement naming the
+    principal's account does not match it."""
     if isinstance(doc, str):
         try:
             doc = json.loads(doc)
@@ -303,7 +750,9 @@ def policy_decision(doc: Any, principal: str, action: str, resource: str) -> tup
         if not isinstance(st, dict):
             continue
         sid = st.get("Sid") or f"statement {i + 1}"
-        if "NotPrincipal" in st or not _principal_matches(st.get("Principal"), principal):
+        if "NotPrincipal" in st or not _principal_matches(
+            st.get("Principal"), principal, account_root
+        ):
             continue
         if "Action" in st and not _any_match(st["Action"], action, ignore_case=True):
             continue
@@ -320,6 +769,38 @@ def policy_decision(doc: Any, principal: str, action: str, resource: str) -> tup
         elif st.get("Effect") == "Allow" and not allow:
             allow = sid + conditional
     return (ALLOWED, allow) if allow else (IMPLICIT_DENY, "no statement allows it")
+
+
+def key_policy_decision(doc: Any, role: str, action: str, key: str) -> tuple[str, str]:
+    """A KMS key policy for ``role`` doing ``action``: an explicit Deny wins; a statement
+    naming the role (or ``*``) allows it, one naming only the account root is
+    :data:`DELEGATED` (the role's IAM policies must allow it too)."""
+    decision, statement = policy_decision(doc, role, action, key)
+    if decision != ALLOWED:
+        return decision, statement
+    direct, direct_statement = policy_decision(doc, role, action, key, account_root=False)
+    return (ALLOWED, direct_statement) if direct == ALLOWED else (DELEGATED, statement)
+
+
+def scp_decision(
+    levels: Iterable[tuple[str, Iterable[tuple[str, Any]]]], action: str, resource: str
+) -> tuple[str, str]:
+    """``(decision, detail)`` of the SCPs on the way from the organization root down to an
+    account (``levels``: ``(target id, [(policy name, document), ...])``): every level
+    needs an SCP allowing ``action``, and no SCP may deny it."""
+    allowed_by = []
+    for target, policies in levels:
+        allow = ""
+        for name, doc in policies:
+            decision, statement = policy_decision(doc, "", action, resource)
+            if decision == EXPLICIT_DENY:
+                return EXPLICIT_DENY, f"SCP {name} ({statement}) attached to {target} denies it"
+            if decision == ALLOWED and not allow:
+                allow = name
+        if not allow:
+            return IMPLICIT_DENY, f"no SCP attached to {target} allows it"
+        allowed_by.append(f"{allow} on {target}")
+    return ALLOWED, ("allowed by " + ", ".join(allowed_by))[:400]
 
 
 # -- identity check -----------------------------------------------------------------------
@@ -382,6 +863,26 @@ class IamIndex:
                 (snap_id,),
             )
         }
+        # Encrypted targets: resource ARN -> keys; ECS service -> (ECR repository, key).
+        self.keys: dict[str, list[str]] = {}
+        self.pulled: dict[str, list[tuple[str, str]]] = {}
+        for r in conn.execute(
+            "SELECT resource, holder, key_arn FROM kms_targets WHERE snapshot_id=? "
+            "ORDER BY resource, holder",
+            (snap_id,),
+        ):
+            if r["holder"]:
+                self.pulled.setdefault(r["holder"], []).append((r["resource"], r["key_arn"]))
+            else:
+                self.keys.setdefault(r["resource"], []).append(r["key_arn"])
+        self.kms = {
+            (r["role_arn"], r["key_arn"], r["action"]): r
+            for r in conn.execute("SELECT * FROM kms_sims WHERE snapshot_id=?", (snap_id,))
+        }
+        self.scps = {
+            (r["account"], r["action"], r["resource"]): r
+            for r in conn.execute("SELECT * FROM scp_checks WHERE snapshot_id=?", (snap_id,))
+        }
 
     def role(self, holder: str, action: str) -> str | None:
         return next(
@@ -400,11 +901,16 @@ class IamIndex:
         sim = self.sims.get((role, action, resource)) if role else None
         if sim is None:
             return None
-        who = f"role {role_name(role or '')} of {holder.partition(':')[2]}"
+        role = role or ""
+        who = f"role {role_name(role)} of {holder.partition(':')[2]}"
         what = f"{action} on {_short(resource)}"
+        # The simulation reports an SCP that refuses the action (OrganizationsDecisionDetail).
+        iam_layer = SCP if "not allowed by an SCP" in sim["detail"] else IAM
         if sim["decision"] == EXPLICIT_DENY:
             return Verdict(
-                False, [f"IAM: blocked: {who}: {what} explicitly denied by {sim['detail']}"]
+                False,
+                [f"IAM: blocked: {who}: {what} explicitly denied by {sim['detail']}"],
+                layers=[iam_layer],
             )
         if sim["resource_decision"] == EXPLICIT_DENY:
             return Verdict(
@@ -413,6 +919,7 @@ class IamIndex:
                     f"IAM: blocked: the resource policy of {_short(resource)} denies {who} "
                     f"{action} ({sim['resource_detail']})"
                 ],
+                layers=[RESOURCE_POLICY],
             )
         if sim["decision"] == ALLOWED:
             lines = [f"IAM: {who} allows {what} ({sim['detail']})"]
@@ -422,17 +929,94 @@ class IamIndex:
                 f"({sim['resource_detail']})"
             ]
         else:
-            return Verdict(False, [f"IAM: blocked: no policy of {who} allows {what}"])
+            return Verdict(
+                False, [f"IAM: blocked: no policy of {who} allows {what}"], layers=[iam_layer]
+            )
         _service, policy = self.endpoints.get(endpoint, ("", None))
         if policy:
-            decision, statement = policy_decision(policy, role or "", action, resource)
+            decision, statement = policy_decision(policy, role, action, resource)
             if decision != ALLOWED:
                 return Verdict(
                     False,
                     [*lines, f"IAM: blocked by the endpoint policy of {endpoint} ({statement})"],
+                    layers=[ENDPOINT_POLICY],
                 )
             lines.append(f"IAM: the endpoint policy of {endpoint} allows it ({statement})")
-        return Verdict(True, lines)
+        keys = self._keys(holder, action, resource)
+        kms = [self._kms(role, key, a) for key in keys for a in KMS_ACTIONS.get(action, ())]
+        actions = [(action, resource)] + [
+            (a, key) for key in keys for a in KMS_ACTIONS.get(action, ())
+        ]
+        return combine([Verdict(True, lines), *kms, self._scp(role, actions)])
+
+    def _keys(self, holder: str, action: str, resource: str) -> list[str]:
+        """The KMS keys of the encrypted target(s) of a connection."""
+        if action == "ecr:BatchGetImage":
+            return sorted({key for _repo, key in self.pulled.get(holder, [])})
+        return self.keys.get(resource, [])
+
+    def _kms(self, role: str, key: str, action: str) -> Verdict:
+        """``action`` on ``key``: the simulated IAM decision and the key policy."""
+        row = self.kms.get((role, key, action))
+        who, short = f"role {role_name(role)}", _short(key)
+        if row is None:
+            return Verdict(True, [f"KMS: {action} on key {short} not checked"], checked=False)
+        if row["decision"] == EXPLICIT_DENY:
+            line = (
+                f"KMS: blocked: {who}: {action} on key {short} explicitly denied by {row['detail']}"
+            )
+        elif row["policy_decision"] == EXPLICIT_DENY:
+            line = (
+                f"KMS: blocked: the key policy of {short} denies {who} {action} "
+                f"({row['policy_detail']})"
+            )
+        elif row["policy_decision"] == IMPLICIT_DENY:
+            line = (
+                f"KMS: blocked: the key policy of {short} allows {action} to neither {who} "
+                "nor its account"
+            )
+        elif row["policy_decision"] == ALLOWED:
+            return Verdict(
+                True,
+                [f"KMS: the key policy of {short} allows {who} {action} ({row['policy_detail']})"],
+            )
+        elif row["decision"] == ALLOWED:
+            policy = (
+                f"the key policy delegates to IAM ({row['policy_detail']})"
+                if row["policy_decision"] == DELEGATED
+                else "key policy not readable"
+            )
+            return Verdict(
+                True, [f"KMS: {who} allows {action} on key {short} ({row['detail']}; {policy})"]
+            )
+        else:
+            line = f"KMS: blocked: no policy of {who} allows {action} on key {short}"
+        return Verdict(False, [line], layers=[KMS])
+
+    def _scp(self, role: str, actions: list[tuple[str, str]]) -> Verdict:
+        """The service control policies of ``role``'s account for every ``(action,
+        resource)``; not evaluated (not blocking) without Organizations data."""
+        account = account_of(role)
+        rows = [self.scps.get((account, a, r)) for a, r in actions]
+        denied = [
+            (a, row)
+            for (a, _), row in zip(actions, rows, strict=True)
+            if row is not None and row["decision"] != ALLOWED
+        ]
+        if denied:
+            action, row = denied[0]
+            return Verdict(
+                False,
+                [f"SCP: blocked: {action} for account {account}: {row['detail']}"],
+                layers=[SCP],
+            )
+        if not rows or any(row is None for row in rows):
+            return Verdict(
+                True,
+                ["SCP not evaluated (no Organizations read access in the Extended crawl)"],
+                checked=False,
+            )
+        return Verdict(True, [f"SCP: account {account}: {rows[0]['detail']}"])
 
     def check_any(
         self, holders: Iterable[str], action: str, resource: str, endpoint: str = ""
@@ -442,7 +1026,7 @@ class IamIndex:
         if not verdicts:
             return None
         allowed = [v for v in verdicts if v.allowed]
-        return Verdict(bool(allowed), [ln for v in (allowed or verdicts) for ln in v.lines])
+        return combine(allowed or verdicts)
 
 
 # -- simulation (Extended crawl) ----------------------------------------------------------

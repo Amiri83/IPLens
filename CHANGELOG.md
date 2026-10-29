@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.6.1 – 2026-10-29
+
+### Added
+
+- **Effective access, full path**, on top of the security group and IAM checks (data read by the
+  Extended crawl, cached per snapshot):
+  - **NACL**: the network ACLs of both subnets, stateless, in rule number order (first match wins,
+    the default rule `*` denies), for the request and its return traffic on the ephemeral ports
+    1024-65535, in both directions. Traffic inside one subnet is not filtered.
+  - **route**: the source subnet's route table (explicit, else the VPC's main table) needs a route
+    to the target – longest prefix match over local, VPC endpoint, NAT / internet gateway, transit
+    gateway, peering; no route or a blackhole blocks. To SQS / SNS: an interface VPC endpoint in
+    the VPC (its NACLs checked on tcp/443), else a default route.
+  - **KMS**: for encrypted SQS queues, SNS topics and ECR repositories, `kms:GenerateDataKey` /
+    `kms:Decrypt` on the key simulated for the role, and the key policy evaluated when readable
+    (a statement naming the account root delegates to IAM).
+  - **SCP**: when Organizations is readable, the SCPs from the root down to the account (every
+    level must allow, none may deny); otherwise the connection is marked "SCP not evaluated" and
+    not blocked.
+- A blocked connection's reason starts with the layer that blocked it (`Blocked at layer: SG`,
+  `NACL`, `route`, `IAM`, `endpoint policy`, `resource policy`, `KMS` or `SCP`), followed by the
+  layer's detail; edges carry `blocked_by`.
+
+### Changed
+
+- New per-snapshot tables `nacl_subnets`, `nacl_entries`, `route_subnets`, `route_entries`,
+  `kms_targets`, `kms_sims`, `scp_checks`; a crawl reuses the cached KMS / SCP results, and
+  *Retry skipped* copies all of them.
+- New read-only calls (all `Describe` / `List` / `Get`, covered by the guard's prefixes):
+  `kms:DescribeKey`, `kms:GetKeyPolicy`, `ecr:DescribeRepositories`,
+  `organizations:DescribeOrganization`, `organizations:ListParents`,
+  `organizations:ListPoliciesForTarget`, `organizations:DescribePolicy`.
+
 ## 1.6.0 – 2026-10-29
 
 ### Added

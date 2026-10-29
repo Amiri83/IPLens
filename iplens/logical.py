@@ -158,6 +158,7 @@ def logical_edges(edges: Iterable[dict[str, Any]], of_eni: dict[str, str]) -> li
                 "source": s,
                 "target": t,
                 "blocked": blocked,
+                "blocked_by": [],
                 "access": [],
                 "labels": [],
                 "titles": [],
@@ -169,6 +170,7 @@ def logical_edges(edges: Iterable[dict[str, Any]], of_eni: dict[str, str]) -> li
             m["labels"].append(e["label"])
         m["titles"].extend(ln for ln in e["title"].split("\n") if ln not in m["titles"])
         m["access"].extend(ln for ln in e.get("access") or [] if ln not in m["access"])
+        m["blocked_by"].extend(x for x in e.get("blocked_by") or [] if x not in m["blocked_by"])
     out = []
     for m in merged.values():
         labels, titles = m.pop("labels"), m.pop("titles")

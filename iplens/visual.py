@@ -15,11 +15,13 @@ ENI. An edge picks the far-side ENI in the same AZ when there is one, so a two-A
 ALB with four targets yields four edges rather than eight.
 
 Effective access (:mod:`iplens.access`): every edge is checked against the security
-groups of both ends (the flow's egress and ingress side) and, for a Lambda / ECS ENI ->
-ECR endpoint, against the cached IAM simulation and the endpoint policy. An edge either
-check refuses is ``blocked``; ``access`` lists the reasons either way. A resource whose
-egress security group rule names an endpoint's group is a ``reach`` candidate too, so that
-an endpoint refusing it shows up as a blocked edge.
+groups of both ends (the flow's egress and ingress side), the network ACLs of both
+subnets (request and return traffic) and the source subnet's route to the target and,
+for a Lambda / ECS ENI -> ECR endpoint, against the cached IAM simulation, the endpoint
+policy, KMS and SCPs. An edge a layer refuses is ``blocked`` (``blocked_by``: the
+layers); ``access`` lists the reasons either way, a blocked edge's led by its layers. A
+resource whose egress security group rule names an endpoint's group is a ``reach``
+candidate too, so that an endpoint refusing it shows up as a blocked edge.
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from .access import IamIndex, Ports, SgRules, Verdict, ecr_action, parse_ports
+from .access import IamIndex, PathCheck, Ports, Verdict, ecr_action, headline, parse_ports
 
 EDGE_TYPES = ("targets", "ecs_lb", "reach", "sg")
 EDGE_TYPE_LABELS = {
@@ -119,6 +121,7 @@ class _Node:
     name: str
     ips: tuple[str, ...]
     owners: tuple[str, ...] = ()
+    subnet: str = ""
 
     @property
     def resource_key(self) -> tuple[str, str]:
@@ -167,13 +170,19 @@ class _EdgeSet:
             ends = (target, source) if reverse else (source, target)
             self._flows.setdefault(key, []).append((*ends, flow))
 
-    def check(self, rules: SgRules) -> None:
-        """Network check of every edge: allowed when one of its flows is."""
+    def check(self, path: PathCheck) -> None:
+        """Network check of every edge (SG, NACL, route): allowed when one of its flows is."""
         for key, edge in self._edges.items():
-            verdicts = [rules.check(a, b, flow) for a, b, flow in self._flows.get(key, [])]
+            verdicts = [
+                path.check(a, a.subnet, b, b.subnet, flow)
+                for a, b, flow in self._flows.get(key, [])
+            ]
             allowed = [v for v in verdicts if v.allowed]
             chosen = allowed or verdicts
             edge["blocked"] = bool(verdicts) and not allowed
+            edge["blocked_by"] = list(
+                dict.fromkeys(layer for v in chosen if not v.allowed for layer in v.layers)
+            )
             edge["access"] = list(dict.fromkeys(ln for v in chosen for ln in v.lines))
 
     def count(self, etype: str, blocked: bool = False) -> int:
@@ -192,7 +201,7 @@ def _load_nodes(
 ) -> dict[str, _Node]:
     nodes = {}
     for r in conn.execute(
-        "SELECT eni_id, az, instance_id, security_groups FROM enis "
+        "SELECT eni_id, subnet_id, az, instance_id, security_groups FROM enis "
         "WHERE snapshot_id=? AND vpc_id=? ORDER BY eni_id",
         (snap_id, vpc_id),
     ):
@@ -209,6 +218,7 @@ def _load_nodes(
             name=res["name"],
             ips=tuple(res["ips"]),
             owners=tuple(res.get("owners") or ()),
+            subnet=r["subnet_id"] or "",
         )
     return nodes
 
@@ -543,6 +553,8 @@ def _iam_check(edges: _EdgeSet, nodes: dict[str, _Node], iam: IamIndex) -> None:
             continue
         e["access"] += verdict.lines
         e["blocked"] = e["blocked"] or not verdict.allowed
+        if not verdict.allowed:
+            e["blocked_by"] = list(dict.fromkeys([*e["blocked_by"], *verdict.layers]))
 
 
 def visual_edges(
@@ -576,8 +588,11 @@ def visual_edges(
         "reach": _reach_edges(conn, snap_id, nodes, edges, sg_names),
         "sg": _sg_edges(conn, snap_id, nodes, edges),
     }
-    edges.check(SgRules(conn, snap_id, sg_names))
+    edges.check(PathCheck(conn, snap_id, sg_names))
     _iam_check(edges, nodes, IamIndex(conn, snap_id))
+    for e in edges.values():
+        if e["blocked"]:
+            e["access"].insert(0, headline(e["blocked_by"]))
 
     selected = set(edge_types)
     return {

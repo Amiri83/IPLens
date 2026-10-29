@@ -27,6 +27,16 @@ from iplens.diff import diff_snapshots
 
 REGION = "us-east-1"
 ACCOUNT = "123456789012"
+# Effective access, full path: cached by the Extended crawl, always copied by a retry.
+PATH_TABLES = (
+    "nacl_subnets",
+    "nacl_entries",
+    "route_subnets",
+    "route_entries",
+    "kms_targets",
+    "kms_sims",
+    "scp_checks",
+)
 SNAPSHOT_TABLES = (
     "vpcs",
     "subnets",
@@ -45,6 +55,7 @@ SNAPSHOT_TABLES = (
     "security_groups",
     "iam_principals",
     "iam_sims",
+    *PATH_TABLES,
     "resource_tags",
     "own_resources",
     "own_tags",
@@ -249,11 +260,38 @@ def test_retry_snapshot_has_the_source_rows_of_the_other_types(
             "VALUES(?, ?, 'ecr:GetAuthorizationToken', '*', 'allowed', 'policy-a')",
             (source, role),
         )
+        # ... and its full path data (NACLs, routes, KMS, SCPs).
+        key = f"arn:aws:kms:{REGION}:{ACCOUNT}:key/key-a"
+        queue = f"arn:aws:sqs:{REGION}:{ACCOUNT}:sqs-a"
+        for sql, row in (
+            ("nacl_subnets VALUES(?,?,?)", ("subnet-0000000a", "acl-0000000a")),
+            (
+                "nacl_entries VALUES(?,?,?,?,?,?,?,?,?)",
+                ("acl-0000000a", 0, 100, "-1", "0.0.0.0/0", None, None, "allow"),
+            ),
+            ("route_subnets VALUES(?,?,?,?)", ("rtb-0000000a", "vpc-0example0000001", "")),
+            (
+                "route_entries VALUES(?,?,?,?,?)",
+                ("rtb-0000000a", "192.0.2.0/24", "local", "active"),
+            ),
+            ("kms_targets VALUES(?,?,?,?)", (queue, "", key)),
+            (
+                "kms_sims VALUES(?,?,?,?,?,?,?,?)",
+                (role, key, "kms:Decrypt", "allowed", "policy-a", "delegated", "s1"),
+            ),
+            (
+                "scp_checks VALUES(?,?,?,?,?,?)",
+                (ACCOUNT, "sqs:SendMessage", queue, "allowed", "scp-a"),
+            ),
+        ):
+            conn.execute(f"INSERT INTO {sql}", (source, *row))  # noqa: S608
     expected = _rows(db_path, source)
     for table in ("enis", "ips", "lambdas", "endpoints", "load_balancers", "security_groups"):
         assert expected[table], table  # the source has rows of every kind
     assert expected["sg_cidr_rules"] and expected["resource_tags"] and expected["own_tags"]
     assert expected["sg_egress_cidr_rules"] and expected["iam_sims"]
+    for table in PATH_TABLES:
+        assert expected[table], table
     assert expected["asgs"] and expected["ecs_scalable_targets"]
     with closing(db_path) as conn:
         enis = conn.execute(

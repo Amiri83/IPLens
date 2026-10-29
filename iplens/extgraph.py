@@ -279,14 +279,26 @@ def annotate_base_edges(edges: list[dict[str, Any]]) -> None:
 
 
 def _ext_access(
-    iam: access.IamIndex, arns: dict[str, str], source: str, target: str
+    iam: access.IamIndex,
+    path: access.PathCheck,
+    arns: dict[str, str],
+    source: str,
+    target: str,
+    drawn_source: str,
 ) -> access.Verdict | None:
-    """The IAM verdict of a crawled connection (e.g. a function sending to a queue)."""
+    """The verdict of a crawled connection (e.g. a function sending to a queue): IAM, KMS
+    and SCPs and, when the sender is drawn as one of its VPC ENIs, the route (and the
+    NACLs to the VPC endpoint) to the service. An event source mapping (queue ->
+    function) is polled by the Lambda service, not over the function's ENI."""
     req = access.ext_request(source, target)
     if req is None or not arns.get(req[2]):
         return None
     holder, action, resource = req
-    return iam.check(holder, action, arns[resource])
+    identity = iam.check(holder, action, arns[resource])
+    network = None
+    if holder == source and not drawn_source.startswith(EXT_PREFIX):
+        network = path.to_service(drawn_source, resource.partition(":")[0])
+    return None if identity is None and network is None else access.combine([identity, network])
 
 
 class _Resolver:
@@ -376,6 +388,7 @@ def extended_data(
     rows += list(_flow_lines(conn, snap_id, vpc_id, run))
 
     iam = access.IamIndex(conn, snap_id)
+    path = access.PathCheck(conn, snap_id, None)
     arns = {
         r["node_id"]: r["arn"]
         for r in conn.execute("SELECT node_id, arn FROM ext_nodes WHERE snapshot_id=?", (snap_id,))
@@ -390,11 +403,12 @@ def extended_data(
             (s, t),
             {"id": f"ext:{len(merged)}", "type": "ext", "source": s, "target": t, "lines": []},
         )
-        verdict = _ext_access(iam, arns, source, target)
+        verdict = _ext_access(iam, path, arns, source, target, s)
         line = {"evidence": evidence, "label": label, "text": detail, "blocked": False}
         if verdict is not None:
             line["blocked"] = not verdict.allowed
-            line["text"] += " · " + "; ".join(verdict.lines)
+            line["blocked_by"] = verdict.layers
+            line["text"] += " · " + "; ".join(access.reasons(verdict))
         edge["lines"].append(line)
         used.update(x[len(EXT_PREFIX) :] for x in (s, t) if x.startswith(EXT_PREFIX))
     edges = []
@@ -404,6 +418,11 @@ def extended_data(
         edge["evidence"] = best["evidence"]
         edge["label"] = best["label"]
         edge["blocked"] = all(ln["blocked"] for ln in edge["lines"])
+        edge["blocked_by"] = list(
+            dict.fromkeys(
+                x for ln in edge["lines"] if edge["blocked"] for x in ln.get("blocked_by") or []
+            )
+        )
         edge["title"] = "\n".join(f"[{ln['evidence']}] {ln['text']}" for ln in edge["lines"])
         edges.append(edge)
 

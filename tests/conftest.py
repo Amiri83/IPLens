@@ -398,6 +398,83 @@ class SnapshotBuilder:
             )
         return self
 
+    def nacl(self, nacl_id: str, subnet_ids, entries) -> SnapshotBuilder:
+        """``entries``: ``(egress, rule number, protocol, cidr, from, to, action)``."""
+        with closing(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO nacl_subnets(snapshot_id, subnet_id, nacl_id) VALUES(?,?,?)",
+                [(self.id, s, nacl_id) for s in subnet_ids],
+            )
+            conn.executemany(
+                "INSERT INTO nacl_entries(snapshot_id, nacl_id, egress, rule_number, protocol, "
+                "cidr, from_port, to_port, action) VALUES(?,?,?,?,?,?,?,?,?)",
+                [(self.id, nacl_id, int(e[0]), *e[1:]) for e in entries],
+            )
+        return self
+
+    def route_table(
+        self, rtb: str, vpc_id: str, subnet_ids=(), routes=(), main: bool = False
+    ) -> SnapshotBuilder:
+        """``routes``: ``(destination, target)`` or ``(destination, target, state)``."""
+        with closing(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO route_subnets(snapshot_id, route_table_id, vpc_id, subnet_id) "
+                "VALUES(?,?,?,?)",
+                [(self.id, rtb, vpc_id, s) for s in [*subnet_ids, *([""] if main else [])]],
+            )
+            conn.executemany(
+                "INSERT INTO route_entries(snapshot_id, route_table_id, destination, target, "
+                "state) VALUES(?,?,?,?,?)",
+                [(self.id, rtb, *r, *(() if len(r) > 2 else ("active",))) for r in routes],
+            )
+        return self
+
+    def kms_target(self, resource: str, key_arn: str, holder: str = "") -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO kms_targets(snapshot_id, resource, holder, key_arn) VALUES(?,?,?,?)",
+                (self.id, resource, holder, key_arn),
+            )
+        return self
+
+    def kms_sim(
+        self,
+        role_arn: str,
+        key_arn: str,
+        action: str,
+        decision: str,
+        detail: str = "",
+        policy_decision: str = "",
+        policy_detail: str = "",
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO kms_sims(snapshot_id, role_arn, key_arn, action, decision, detail, "
+                "policy_decision, policy_detail) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    self.id,
+                    role_arn,
+                    key_arn,
+                    action,
+                    decision,
+                    detail,
+                    policy_decision,
+                    policy_detail,
+                ),
+            )
+        return self
+
+    def scp_check(
+        self, account: str, action: str, resource: str, decision: str, detail: str = ""
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO scp_checks(snapshot_id, account, action, resource, decision, "
+                "detail) VALUES(?,?,?,?,?,?)",
+                (self.id, account, action, resource, decision, detail),
+            )
+        return self
+
     def tag(self, resource_type: str, resource_id: str, key: str, value: str) -> SnapshotBuilder:
         with closing(self.db_path) as conn:
             conn.execute(

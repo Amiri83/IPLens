@@ -301,6 +301,77 @@ CREATE TABLE IF NOT EXISTS iam_sims (
     PRIMARY KEY (snapshot_id, role_arn, action, resource)
 );
 
+-- Effective access, full path (1.6.1), also written by the Extended crawl: the subnets'
+-- network ACL entries (the default rule * is implicit) and routes, the KMS keys of
+-- encrypted targets with kms:* simulations and key policy verdicts, and SCP verdicts.
+CREATE TABLE IF NOT EXISTS nacl_subnets (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    subnet_id   TEXT NOT NULL,
+    nacl_id     TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, subnet_id)
+);
+
+CREATE TABLE IF NOT EXISTS nacl_entries (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    nacl_id     TEXT NOT NULL,
+    egress      INTEGER NOT NULL,   -- 1 outbound, 0 inbound
+    rule_number INTEGER NOT NULL,
+    protocol    TEXT NOT NULL,      -- "-1" | "6" | "17" | "1" | ...
+    cidr        TEXT NOT NULL,
+    from_port   INTEGER,
+    to_port     INTEGER,
+    action      TEXT NOT NULL,      -- allow | deny
+    PRIMARY KEY (snapshot_id, nacl_id, egress, rule_number)
+);
+
+CREATE TABLE IF NOT EXISTS route_subnets (
+    snapshot_id    INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    route_table_id TEXT NOT NULL,
+    vpc_id         TEXT NOT NULL,
+    subnet_id      TEXT NOT NULL,   -- '' = the VPC's main route table
+    PRIMARY KEY (snapshot_id, route_table_id, subnet_id)
+);
+
+CREATE TABLE IF NOT EXISTS route_entries (
+    snapshot_id    INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    route_table_id TEXT NOT NULL,
+    destination    TEXT NOT NULL,   -- IPv4 CIDR or prefix list id
+    target         TEXT NOT NULL,   -- local | igw-… | nat-… | tgw-… | pcx-… | vpce-… | eni-…
+    state          TEXT NOT NULL DEFAULT 'active',  -- active | blackhole
+    PRIMARY KEY (snapshot_id, route_table_id, destination)
+);
+
+CREATE TABLE IF NOT EXISTS kms_targets (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    resource    TEXT NOT NULL,      -- queue / topic / ECR repository ARN
+    holder      TEXT NOT NULL DEFAULT '',  -- ECR: the ECS service pulling it ('' = anyone)
+    key_arn     TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, resource, holder)
+);
+
+CREATE TABLE IF NOT EXISTS kms_sims (
+    snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    role_arn        TEXT NOT NULL,
+    key_arn         TEXT NOT NULL,
+    action          TEXT NOT NULL,  -- kms:Decrypt | kms:GenerateDataKey
+    decision        TEXT NOT NULL,  -- iam:SimulatePrincipalPolicy
+    detail          TEXT NOT NULL DEFAULT '',
+    policy_decision TEXT NOT NULL DEFAULT '',  -- the key policy's ('' = not readable)
+    policy_detail   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (snapshot_id, role_arn, key_arn, action)
+);
+
+-- No row for an account / action: SCPs not evaluated (no Organizations read access).
+CREATE TABLE IF NOT EXISTS scp_checks (
+    snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    account     TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    resource    TEXT NOT NULL,      -- ARN, or "*"
+    decision    TEXT NOT NULL,      -- allowed | explicitDeny | implicitDeny
+    detail      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (snapshot_id, account, action, resource)
+);
+
 -- Managed-service resources (managed.py), one table per service: rds_resources,
 -- redshift_clusters, elasticache_resources, opensearch_domains, msk_clusters (see
 -- MANAGED_TABLE below).

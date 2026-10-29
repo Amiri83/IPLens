@@ -168,9 +168,24 @@ _MERGED: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
         ("sg_refs", "sg_cidr_rules", "sg_egress_cidr_rules", "security_groups"),
         ("sg",),
     ),
-    # Effective access: the Extended crawl's cached IAM simulations. No Refresh collects
-    # them, so a retry always keeps the source snapshot's.
-    (frozenset({SIMULATION_RESOURCE}), ("iam_principals", "iam_sims"), ()),
+    # Effective access: the Extended crawl's cached IAM simulations and path data (NACLs,
+    # routes, KMS, SCPs). No Refresh collects them, so a retry always keeps the source
+    # snapshot's.
+    (
+        frozenset({SIMULATION_RESOURCE}),
+        (
+            "iam_principals",
+            "iam_sims",
+            "nacl_subnets",
+            "nacl_entries",
+            "route_subnets",
+            "route_entries",
+            "kms_targets",
+            "kms_sims",
+            "scp_checks",
+        ),
+        (),
+    ),
     (
         frozenset({"tag:GetResources", "cloudformation:ListStacks"}),
         ("own_resources", "own_tags"),

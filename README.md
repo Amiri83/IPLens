@@ -613,6 +613,15 @@ execution role for ECR pulls), the actions a connection needs (`sqs:SendMessage`
 VPC endpoint policy. Results are cached per snapshot (a crawl does not simulate again; *Retry
 skipped* keeps them); only decisions and policy ids are stored. A connection without data to
 check against (no crawl yet, a snapshot from before 1.6.0 without egress rules) is not blocked.
+**Full path** (1.6.1, from the Extended crawl, cached per snapshot): the **network ACLs** of both
+subnets, stateless and in rule order, for the request and its return traffic on the ephemeral
+ports 1024-65535; a **route** from the source subnet to the target (local, VPC endpoint, NAT /
+internet gateway, transit gateway, peering; none or a blackhole blocks); **KMS** for encrypted
+SQS / SNS / ECR targets (`kms:Decrypt` / `kms:GenerateDataKey` simulated for the role, plus the key
+policy when readable); and **SCPs** when Organizations is readable – otherwise the connection is
+marked "SCP not evaluated" and not blocked. A blocked connection's reason starts with the layer
+that blocked it (`Blocked at layer: SG`, `NACL`, `route`, `IAM`, `endpoint policy`,
+`resource policy`, `KMS` or `SCP`), followed by that layer's detail.
 **Show blocked** draws the refused ones dashed red; click one for the security group rule or IAM
 policy that blocked it. Resources spanning several Availability Zones carry an AZ count badge
 (`3 AZ`) in the IP view as in the Logical view.
@@ -675,7 +684,10 @@ warning): `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:Lis
 `config:DescribeConfigurationRecorderStatus`, `config:GetResourceConfigHistory`,
 `resource-explorer-2:GetIndex`, `resource-explorer-2:ListResources`, `xray:GetServiceGraph`,
 `kafka:ListClustersV2` (the MSK list call that covers provisioned and serverless clusters),
-and for effective access `iam:SimulatePrincipalPolicy` and `sns:GetTopicAttributes`.
+and for effective access `iam:SimulatePrincipalPolicy`, `sns:GetTopicAttributes`,
+`kms:DescribeKey`, `kms:GetKeyPolicy`, `ecr:DescribeRepositories`,
+`organizations:DescribeOrganization`, `organizations:ListParents`,
+`organizations:ListPoliciesForTarget` and `organizations:DescribePolicy`.
 Flow logs: `ec2:DescribeFlowLogs`, `logs:DescribeLogGroups`, `logs:StartQuery`,
 `logs:GetQueryResults`, `logs:StopQuery`.
 
@@ -699,6 +711,7 @@ sources, simply not enabled).
 | Extended view: services | `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:ListTables`, `dynamodb:DescribeTable`, `events:List*`, `s3:ListAllMyBuckets`, `s3:GetBucketNotification`, `apigateway:GET`, `states:List*`, `states:DescribeStateMachine`, `secretsmanager:ListSecrets`, `lambda:ListEventSourceMappings`, `ecs:List*`, `ecs:Describe*`, `kafka:ListClustersV2` | optional, each source skipped with warning |
 | Extended view: IAM evidence | `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, `iam:GetRolePolicy`, `iam:GetPolicy`, `iam:GetPolicyVersion` | optional, skipped with warning |
 | Effective access: IAM check (run by the Extended crawl, cached per snapshot) | `iam:SimulatePrincipalPolicy` (a simulation, changes nothing; allowlisted by name), `sns:GetTopicAttributes` (topic policy); the SQS queue policy comes with `sqs:GetQueueAttributes`. The security group check needs no extra permission (it uses the Refresh's `ec2:DescribeSecurityGroups`) | optional (missing permission = crawl warning; connections not simulated are not IAM-checked) |
+| Effective access: full path (NACL, route, KMS, SCP; run by the Extended crawl, cached per snapshot) | `ec2:DescribeNetworkAcls`, `ec2:DescribeRouteTables`; KMS: `kms:DescribeKey`, `kms:GetKeyPolicy`, `ecr:DescribeRepositories` (the key of an encrypted repository; the queue / topic key comes with `sqs:GetQueueAttributes` / `sns:GetTopicAttributes`); SCPs: `organizations:DescribeOrganization`, `organizations:ListParents`, `organizations:ListPoliciesForTarget`, `organizations:DescribePolicy`. All `Describe` / `List` / `Get`, no allowlist entry needed | optional (NACLs / routes missing = "not checked"; key policy unreadable = simulation alone decides; no Organizations access = "SCP not evaluated", never blocked) |
 | Extended view: network | `ec2:DescribeRouteTables`, `ec2:DescribeNetworkAcls`, `ec2:DescribeTransitGateway*`, `ec2:GetTransitGatewayRouteTablePropagations`, `ec2:DescribeVpcPeeringConnections`, `ec2:DescribeManagedPrefixLists`, `route53:ListHostedZones`, `route53:GetHostedZone`, `route53resolver:List*` | optional, skipped with warning |
 | Extended view: AWS Config | `config:DescribeConfigurationRecorderStatus`, `config:GetResourceConfigHistory` | optional, skipped with warning |
 | Extended view: Resource Explorer | `resource-explorer-2:GetIndex`, `resource-explorer-2:ListResources` | optional, skipped with warning |
