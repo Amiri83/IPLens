@@ -27,7 +27,7 @@ import sqlite3
 from collections.abc import Iterator, Sequence
 from typing import Any
 
-from . import environment
+from . import access, environment
 from .extended import (
     EVIDENCE_HELP,
     EVIDENCE_LABELS,
@@ -265,14 +265,28 @@ def _iter_resources(data: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 
 def annotate_base_edges(edges: list[dict[str, Any]]) -> None:
-    """Give the IP view's edges an evidence level and evidence lines (in place)."""
+    """Give the IP view's edges an evidence level and evidence lines (in place); the
+    lines of a blocked edge are ``blocked`` and carry its access reasons."""
     for e in edges:
         level = BASE_EVIDENCE.get(e["type"], "configured")
         e["evidence"] = level
+        blocked = bool(e.get("blocked"))
+        why = " · " + "; ".join(e.get("access") or []) if blocked else ""
         e["lines"] = [
-            {"evidence": level, "label": e["label"], "text": line}
+            {"evidence": level, "label": e["label"], "text": line + why, "blocked": blocked}
             for line in (e.get("title") or e["label"]).split("\n")
         ]
+
+
+def _ext_access(
+    iam: access.IamIndex, arns: dict[str, str], source: str, target: str
+) -> access.Verdict | None:
+    """The IAM verdict of a crawled connection (e.g. a function sending to a queue)."""
+    req = access.ext_request(source, target)
+    if req is None or not arns.get(req[2]):
+        return None
+    holder, action, resource = req
+    return iam.check(holder, action, arns[resource])
 
 
 class _Resolver:
@@ -361,6 +375,11 @@ def extended_data(
     run = latest_run(conn, snap_id, vpc_id)
     rows += list(_flow_lines(conn, snap_id, vpc_id, run))
 
+    iam = access.IamIndex(conn, snap_id)
+    arns = {
+        r["node_id"]: r["arn"]
+        for r in conn.execute("SELECT node_id, arn FROM ext_nodes WHERE snapshot_id=?", (snap_id,))
+    }
     merged: dict[tuple[str, str], dict[str, Any]] = {}
     used: set[str] = set()
     for source, target, evidence, label, detail in rows:
@@ -371,7 +390,12 @@ def extended_data(
             (s, t),
             {"id": f"ext:{len(merged)}", "type": "ext", "source": s, "target": t, "lines": []},
         )
-        edge["lines"].append({"evidence": evidence, "label": label, "text": detail})
+        verdict = _ext_access(iam, arns, source, target)
+        line = {"evidence": evidence, "label": label, "text": detail, "blocked": False}
+        if verdict is not None:
+            line["blocked"] = not verdict.allowed
+            line["text"] += " · " + "; ".join(verdict.lines)
+        edge["lines"].append(line)
         used.update(x[len(EXT_PREFIX) :] for x in (s, t) if x.startswith(EXT_PREFIX))
     edges = []
     for edge in merged.values():
@@ -379,6 +403,7 @@ def extended_data(
         best = edge["lines"][0]
         edge["evidence"] = best["evidence"]
         edge["label"] = best["label"]
+        edge["blocked"] = all(ln["blocked"] for ln in edge["lines"])
         edge["title"] = "\n".join(f"[{ln['evidence']}] {ln['text']}" for ln in edge["lines"])
         edges.append(edge)
 

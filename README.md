@@ -599,6 +599,24 @@ missing permission becomes a crawl warning. Each connection carries its stronges
 shows the estimated scan size first and stores only aggregates. See
 [Using IPLens](#using-iplens) step 4 for details.
 
+## Effective access
+
+The Visual page (IP, Logical and Extended view) draws only connections that are actually
+allowed. **Network**: the source's security groups must allow the egress and the target's the
+ingress (by security group reference or a CIDR covering the peer's IP, all groups of an ENI as a
+union, with a port both allow) – VPC endpoints included, so a Lambda is not linked to an ECR
+endpoint whose group admits only ECS tasks. This uses the Refresh's security group data, no extra
+call. **Identity**: the Extended crawl simulates, per Lambda execution role / ECS task role (task
+execution role for ECR pulls), the actions a connection needs (`sqs:SendMessage`, `sns:Publish`,
+`sqs:ReceiveMessage`, `ecr:GetAuthorizationToken`, `ecr:BatchGetImage`) with
+`iam:SimulatePrincipalPolicy`, evaluates the SQS / SNS resource policy and, at display time, the
+VPC endpoint policy. Results are cached per snapshot (a crawl does not simulate again; *Retry
+skipped* keeps them); only decisions and policy ids are stored. A connection without data to
+check against (no crawl yet, a snapshot from before 1.6.0 without egress rules) is not blocked.
+**Show blocked** draws the refused ones dashed red; click one for the security group rule or IAM
+policy that blocked it. Resources spanning several Availability Zones carry an AZ count badge
+(`3 AZ`) in the IP view as in the Logical view.
+
 ## Terraform (optional)
 
 Terraform is **not required**: ownership is AWS-first, and the Terraform enrichment is off by
@@ -656,7 +674,8 @@ warning): `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:Lis
 `route53:ListHostedZones`, `route53:GetHostedZone`, `route53resolver:List*`,
 `config:DescribeConfigurationRecorderStatus`, `config:GetResourceConfigHistory`,
 `resource-explorer-2:GetIndex`, `resource-explorer-2:ListResources`, `xray:GetServiceGraph`,
-`kafka:ListClustersV2` (the MSK list call that covers provisioned and serverless clusters).
+`kafka:ListClustersV2` (the MSK list call that covers provisioned and serverless clusters),
+and for effective access `iam:SimulatePrincipalPolicy` and `sns:GetTopicAttributes`.
 Flow logs: `ec2:DescribeFlowLogs`, `logs:DescribeLogGroups`, `logs:StartQuery`,
 `logs:GetQueryResults`, `logs:StopQuery`.
 
@@ -679,6 +698,7 @@ sources, simply not enabled).
 | Ownership: CloudTrail creator | `cloudtrail:LookupEvents` | optional, **opt-in** in Settings |
 | Extended view: services | `sns:List*`, `sqs:ListQueues`, `sqs:GetQueueAttributes`, `dynamodb:ListTables`, `dynamodb:DescribeTable`, `events:List*`, `s3:ListAllMyBuckets`, `s3:GetBucketNotification`, `apigateway:GET`, `states:List*`, `states:DescribeStateMachine`, `secretsmanager:ListSecrets`, `lambda:ListEventSourceMappings`, `ecs:List*`, `ecs:Describe*`, `kafka:ListClustersV2` | optional, each source skipped with warning |
 | Extended view: IAM evidence | `iam:ListAttachedRolePolicies`, `iam:ListRolePolicies`, `iam:GetRolePolicy`, `iam:GetPolicy`, `iam:GetPolicyVersion` | optional, skipped with warning |
+| Effective access: IAM check (run by the Extended crawl, cached per snapshot) | `iam:SimulatePrincipalPolicy` (a simulation, changes nothing; allowlisted by name), `sns:GetTopicAttributes` (topic policy); the SQS queue policy comes with `sqs:GetQueueAttributes`. The security group check needs no extra permission (it uses the Refresh's `ec2:DescribeSecurityGroups`) | optional (missing permission = crawl warning; connections not simulated are not IAM-checked) |
 | Extended view: network | `ec2:DescribeRouteTables`, `ec2:DescribeNetworkAcls`, `ec2:DescribeTransitGateway*`, `ec2:GetTransitGatewayRouteTablePropagations`, `ec2:DescribeVpcPeeringConnections`, `ec2:DescribeManagedPrefixLists`, `route53:ListHostedZones`, `route53:GetHostedZone`, `route53resolver:List*` | optional, skipped with warning |
 | Extended view: AWS Config | `config:DescribeConfigurationRecorderStatus`, `config:GetResourceConfigHistory` | optional, skipped with warning |
 | Extended view: Resource Explorer | `resource-explorer-2:GetIndex`, `resource-explorer-2:ListResources` | optional, skipped with warning |
@@ -693,7 +713,8 @@ Besides the `Describe` / `List` / `Get` prefixes, the guard's explicit allowlist
 `logs:StartQuery`, `logs:GetQueryResults`, `logs:StopQuery`, `logs:FilterLogEvents` (CloudWatch
 Logs reads for flow logs), `sts:AssumeRole` (Terraform S3 backends with a role), and the ownership
 sources `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources` and
-`cloudtrail:LookupEvents`.
+`cloudtrail:LookupEvents`, and `iam:SimulatePrincipalPolicy` (effective access: evaluates a
+role's policies without changing anything).
 
 ## Rules
 

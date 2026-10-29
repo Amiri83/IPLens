@@ -40,6 +40,7 @@ from urllib.parse import unquote
 
 from botocore.exceptions import ClientError
 
+from . import access
 from .aws import AwsGateway, ReadOnlyViolation
 from .db import closing
 from .jobs import NullProgress, Progress
@@ -370,6 +371,16 @@ class ExtendedCrawler:
         self._vpcs: set[str] = set()
         self._nat_enis: dict[str, str] = {}  # NAT gateway id -> ENI id
         self._prefix_lists: dict[str, str] = {}
+        # Effective access (iplens.access): (holder node id, purpose) -> role ARN, the
+        # simulations already cached for this snapshot, new results and the verdicts of
+        # resource policies (the policies themselves stay in memory, in _policies).
+        self._principals: dict[tuple[str, str], str] = {}
+        self._cached_sims: set[access.SimRequest] = set()
+        self._sims: dict[access.SimRequest, tuple[str, str]] = {}
+        self._resource_checks: dict[access.SimRequest, tuple[str, str]] = {}
+        self._policies: dict[str, str | None] = {}
+        self._ecr_actions: list[str] = []  # the snapshot has ECR interface endpoints
+        self._vpc_holders: set[str] = set()  # Lambda functions / ECS services with VPC ENIs
 
     # -- plumbing ---------------------------------------------------------------------
 
@@ -434,6 +445,7 @@ class ExtendedCrawler:
             ("states:DescribeStateMachine", self._state_machines),
             ("ecs:DescribeTaskDefinition", self._task_definitions),
             ("iam:GetRolePolicy", self._iam),
+            ("iam:SimulatePrincipalPolicy", self._simulate),
             ("ec2:DescribeManagedPrefixLists", self._prefix_list_names),
             ("ec2:DescribeRouteTables", self._route_tables),
             ("ec2:DescribeNetworkAcls", self._nacls),
@@ -449,6 +461,7 @@ class ExtendedCrawler:
             self.progress.step(f"crawl · {name}", done=i, total=len(sources) + 1)
             self._source(name, fn)
         self._functions.clear()
+        self._policies.clear()
         self.progress.check()
         self.progress.step("crawl · saving", done=len(sources), total=len(sources) + 1)
         self._save()
@@ -471,6 +484,30 @@ class ExtendedCrawler:
         ):
             if r["owner_ref"]:
                 self._nat_enis.setdefault(r["owner_ref"], r["eni_id"])
+        self._cached_sims = {
+            access.SimRequest(r["role_arn"], r["action"], r["resource"])
+            for r in conn.execute(
+                "SELECT role_arn, action, resource FROM iam_sims WHERE snapshot_id=?", (sid,)
+            )
+        }
+        services = {
+            r[0]
+            for r in conn.execute("SELECT service_name FROM endpoints WHERE snapshot_id=?", (sid,))
+        }
+        self._ecr_actions = sorted({a for s in services if (a := access.ecr_action(s))})
+        self._vpc_holders = {
+            node_id("lambda", r[0])
+            for r in conn.execute(
+                "SELECT name FROM lambdas WHERE snapshot_id=? AND vpc_id IS NOT NULL", (sid,)
+            )
+        } | {
+            node_id("ecs", f"{r[0]}/{r[1]}")
+            for r in conn.execute(
+                "SELECT DISTINCT cluster, service FROM ecs_task_enis "
+                "WHERE snapshot_id=? AND service != ''",
+                (sid,),
+            )
+        }
 
     def _save(self) -> None:
         g, sid = self.graph, self.snapshot_id
@@ -493,6 +530,29 @@ class ExtendedCrawler:
             conn.executemany(
                 "INSERT OR IGNORE INTO ext_facts(snapshot_id, subject, detail) VALUES(?,?,?)",
                 [(sid, *f) for f in sorted(g.facts)],
+            )
+            # Effective access: simulations stay cached; the roles are the crawl's.
+            conn.execute("DELETE FROM iam_principals WHERE snapshot_id=?", (sid,))
+            conn.executemany(
+                "INSERT INTO iam_principals(snapshot_id, holder, purpose, role_arn) "
+                "VALUES(?,?,?,?)",
+                [(sid, h, p, role) for (h, p), role in sorted(self._principals.items())],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO iam_sims(snapshot_id, role_arn, action, resource, "
+                "decision, detail) VALUES(?,?,?,?,?,?)",
+                [
+                    (sid, r.role_arn, r.action, r.resource, d, detail)
+                    for r, (d, detail) in sorted(self._sims.items())
+                ],
+            )
+            conn.executemany(
+                "UPDATE iam_sims SET resource_decision=?, resource_detail=? WHERE snapshot_id=? "
+                "AND role_arn=? AND action=? AND resource=?",
+                [
+                    (d, detail[:400], sid, r.role_arn, r.action, r.resource)
+                    for r, (d, detail) in sorted(self._resource_checks.items())
+                ],
             )
             conn.execute(
                 "INSERT INTO ext_crawls(snapshot_id, crawled_at, warnings, sources) "
@@ -540,6 +600,7 @@ class ExtendedCrawler:
             nid = self.graph.node("lambda", fn["FunctionName"], fn.get("FunctionArn", ""))
             if fn.get("Role"):
                 self._role_holders.setdefault(fn["Role"], set()).add(nid)
+                self._principals[(nid, "lambda")] = fn["Role"]
         return len(self._functions)
 
     def _sns_topics(self) -> int:
@@ -560,12 +621,14 @@ class ExtendedCrawler:
         for url in urls:
             try:
                 attrs[url] = sqs.get_queue_attributes(
-                    QueueUrl=url, AttributeNames=["QueueArn", "RedrivePolicy"]
+                    QueueUrl=url, AttributeNames=["QueueArn", "RedrivePolicy", "Policy"]
                 ).get("Attributes", {})
             except ClientError:
                 attrs[url] = {}
             name = _last(url, "/")
-            self.graph.node("sqs", name, attrs[url].get("QueueArn", ""), url)
+            nid = self.graph.node("sqs", name, attrs[url].get("QueueArn", ""), url)
+            # The queue policy: evaluated by _simulate, never stored.
+            self._policies[nid] = attrs[url].pop("Policy", None)
         for url, a in attrs.items():
             policy = _policy_doc(a.get("RedrivePolicy") or "{}")
             dlq = policy.get("deadLetterTargetArn")
@@ -918,9 +981,13 @@ class ExtendedCrawler:
         for td_arn, services in self._task_defs.items():
             td = ecs.describe_task_definition(taskDefinition=td_arn).get("taskDefinition", {})
             family = td.get("family", _last(td_arn, "/"))
-            for role in (td.get("taskRoleArn"), td.get("executionRoleArn")):
+            for purpose, role in (
+                ("task", td.get("taskRoleArn")),
+                ("execution", td.get("executionRoleArn")),
+            ):
                 if role:
                     self._role_holders.setdefault(role, set()).update(services)
+                    self._principals.update({(svc, purpose): role for svc in services})
             for c in td.get("containerDefinitions", []):
                 where = f"task definition {family} container {c.get('name', '?')}"
                 env = [(e.get("name", ""), e.get("value")) for e in c.get("environment", [])]
@@ -1000,6 +1067,60 @@ class ExtendedCrawler:
                             f'Resource "*" (not expanded)',
                         )
         return len(self._role_holders)
+
+    def _role_for(self, holder: str, action: str) -> str | None:
+        return next(
+            (
+                self._principals[(holder, p)]
+                for p in access.purposes(holder, action)
+                if (holder, p) in self._principals
+            ),
+            None,
+        )
+
+    def _resource_policy(self, nid: str) -> str | None:
+        """An SQS queue's policy (read with its attributes) or an SNS topic's (read here)."""
+        if nid not in self._policies and nid.startswith("sns:"):
+            arn = self.graph.nodes[nid].arn
+            try:
+                attrs = self._client("sns").get_topic_attributes(TopicArn=arn)["Attributes"]
+                self._policies[nid] = attrs.get("Policy")
+            except ClientError:
+                self._policies[nid] = None
+        return self._policies.get(nid)
+
+    def _simulate(self) -> int:
+        """Effective access: ``iam:SimulatePrincipalPolicy`` for the actions the crawled
+        connections need (a function / service sending to a queue or topic, a queue feeding
+        a function) and, when the snapshot has ECR interface endpoints, the image pull of
+        every function / service with VPC ENIs. Results cached for the snapshot are not
+        simulated again; resource policies are evaluated here (see iplens.access)."""
+        requests: dict[access.SimRequest, str] = {}  # -> resource node id ("" for "*")
+        for source, target, *_ in sorted(self.graph.edges):
+            req = access.ext_request(source, target)
+            if req is None:
+                continue
+            holder, action, res_node = req
+            rec, role = self.graph.nodes.get(res_node), self._role_for(holder, action)
+            if rec is not None and rec.arn and role:
+                requests[access.SimRequest(role, action, rec.arn)] = res_node
+        for holder in sorted(self._vpc_holders):
+            for action in self._ecr_actions:
+                role = self._role_for(holder, action)
+                if role:
+                    requests[access.SimRequest(role, action, "*")] = ""
+        wanted = self._cap("IAM simulations", sorted(requests), MAX_PER_SOURCE)
+        for req in wanted:
+            policy = self._resource_policy(requests[req]) if requests[req] else None
+            if policy:
+                self._resource_checks[req] = access.policy_decision(
+                    policy, req.role_arn, req.action, req.resource
+                )
+        for req, decision, detail in access.simulate(
+            self._client("iam"), wanted, self._cached_sims
+        ):
+            self._sims[req] = (decision, detail)
+        return len(wanted)
 
     def _prefix_list_names(self) -> int:
         lists = _pages(self._client("ec2"), "describe_managed_prefix_lists", "PrefixLists")

@@ -64,6 +64,7 @@
   const groupBySelect = document.getElementById("group-by");
   const groupTagSelect = document.getElementById("group-tag");
   const expandExportBox = document.getElementById("export-expand");
+  const showBlockedBox = document.getElementById("show-blocked");
   const envFilters = document.getElementById("env-filters");
   // Per-view state key (iplens.viewstate.VIEWS).
   const view = extended ? "extended" : logical ? "logical" : "ip";
@@ -167,14 +168,21 @@
     return lines.join("\n");
   }
 
-  // Logical view nodes (iplens.logical) carry their AZs ("zones") instead of IPs.
+  // The "3 AZ" badge: the AZs of the logical resource (iplens.logical).
+  function azBadge(zones) {
+    return zones && zones.length ? `${zones.length} AZ` : "";
+  }
+
+  // Logical view nodes (iplens.logical) carry their AZs ("zones") instead of IPs; an
+  // IP view ENI of a Multi-AZ resource shows its resource's AZ count ("zones_all").
   function resourceLabel(r) {
     const lines = [wrapLine(resourceName(r), "res")];
     if (r.name !== r.type_label) lines.push(r.type_label);
     if (r.zones) {
-      if (r.zones.length) lines.push(`${r.zones.length} AZ`);
+      if (r.zones.length) lines.push(azBadge(r.zones));
       return lines.join("\n");
     }
+    if (r.zones_all && r.zones_all.length > 1) lines.push(azBadge(r.zones_all));
     lines.push(...r.ips.slice(0, MAX_IPS_IN_LABEL));
     if (r.ips.length > MAX_IPS_IN_LABEL) lines.push(`+${r.ips.length - MAX_IPS_IN_LABEL} more`);
     return lines.join("\n");
@@ -188,8 +196,11 @@
     } else if (r.ref && r.ref !== r.name) {
       lines.push(r.ref);
     }
-    if (r.zones) lines.push(`${r.zones.length} AZ: ${r.zones.join(", ")}`);
-    else lines.push(r.eni_id, ...r.ips);
+    if (r.zones) lines.push(`${azBadge(r.zones)}: ${r.zones.join(", ")}`);
+    else {
+      if (r.zones_all && r.zones_all.length > 1) lines.push(`${azBadge(r.zones_all)}: ${r.zones_all.join(", ")}`);
+      lines.push(r.eni_id, ...r.ips);
+    }
     return lines.join("\n");
   }
 
@@ -781,22 +792,33 @@
     return n.hasClass("hidden") && !expandAll ? n.data("memberOf") : n.id();
   }
 
+  // Effective access (iplens.access): blocked connections only under "Show blocked".
+  function showBlocked() {
+    return !!(showBlockedBox && showBlockedBox.checked);
+  }
+
   /* IP view edges as drawn: endpoints mapped onto visible nodes, edges of one type
-     between the same two nodes merged. */
+     between the same two nodes merged (blocked ones apart). */
   function visibleEdges(cy, edges, types, expandAll) {
     const merged = new Map();
+    const withBlocked = showBlocked();
     edges.forEach((e) => {
-      if (!types.has(e.type)) return;
+      if (!types.has(e.type) || (e.blocked && !withBlocked)) return;
       const s = endpointId(cy, e.source, expandAll);
       const t = endpointId(cy, e.target, expandAll);
       if (!s || !t || s === t) return;
-      const key = `${e.type}|${s}|${t}`;
+      const key = `${e.type}|${s}|${t}|${e.blocked ? 1 : 0}`;
+      const access = e.access || [];
       const m = merged.get(key);
       if (m) {
         m.n += 1;
         if (m.titles.length < MAX_TITLE_LINES) m.titles.push(e.title);
+        access.forEach((ln) => { if (!m.access.includes(ln)) m.access.push(ln); });
       } else {
-        merged.set(key, { type: e.type, source: s, target: t, label: e.label, titles: [e.title], n: 1 });
+        merged.set(key, {
+          type: e.type, source: s, target: t, label: e.label, titles: [e.title], n: 1,
+          blocked: !!e.blocked, access: access.slice(),
+        });
       }
     });
     return Array.from(merged.values());
@@ -850,10 +872,13 @@
           etype: m.type,
           source: m.source,
           target: m.target,
-          label: edgeLabel(m),
-          title: m.titles.join("\n") + (m.n > m.titles.length ? `\n… +${m.n - m.titles.length} more` : ""),
+          label: (m.blocked ? "blocked: " : "") + edgeLabel(m),
+          title: (m.blocked ? "BLOCKED (click for the reason)\n" : "") + m.titles.join("\n") +
+            (m.n > m.titles.length ? `\n… +${m.n - m.titles.length} more` : ""),
+          blocked: m.blocked,
+          access: m.access,
         },
-        classes: "edge-" + m.type,
+        classes: "edge-" + m.type + (m.blocked ? " blocked" : ""),
       })));
       cy.add(visibleTgwEdges(cy, tgwEdges).map((e) => ({
         group: "edges",
@@ -1160,7 +1185,11 @@
 
   function drawnEdges(cy, edges) {
     const types = enabledEdgeTypes();
-    const input = edges.filter((e) => e.type === "ext" || types.has(e.type));
+    const withBlocked = showBlocked();
+    const input = edges
+      .filter((e) => e.type === "ext" || types.has(e.type))
+      .map((e) => (withBlocked ? e : { ...e, lines: (e.lines || []).filter((ln) => !ln.blocked) }))
+      .filter((e) => (e.lines || []).length);
     return D.mergeEdges(input, Array.from(enabledEvidence()), (id) => extEndpoint(cy, id));
   }
 
@@ -1227,7 +1256,8 @@
           evidence: m.evidence, lines: m.lines, count: m.count, extra: m.extra,
           width: m.width, bidir: m.bidir, label: extEdgeLabel(m), title: extEdgeTitle(m),
         },
-        classes: `edge-ext ev-${m.evidence}` + (m.count > 1 ? " agg" : "") + (m.bidir ? " bidir" : ""),
+        classes: `edge-ext ev-${m.evidence}` + (m.count > 1 ? " agg" : "") + (m.bidir ? " bidir" : "") +
+          (m.lines.every((ln) => ln.blocked) ? " blocked" : ""),
       })));
     });
     return drawn;
@@ -1469,6 +1499,8 @@
     params.delete("edges");
     params.append("edges", "");
     edgeBoxes.filter((b) => b.checked).forEach((b) => params.append("edges", b.value));
+    params.delete("blocked");
+    if (showBlocked()) params.set("blocked", "1");
     window.history.replaceState(null, "", `${window.location.pathname}?${params}`);
   }
 
@@ -2016,6 +2048,11 @@
     // Evidence in both directions: an arrow at each end.
     { selector: "edge.bidir.ev-observed, edge.bidir.ev-configured", style: { "source-arrow-shape": "triangle" } },
     { selector: "edge.bidir.ev-permitted, edge.bidir.ev-referenced", style: { "source-arrow-shape": "vee" } },
+    // Effective access: a blocked connection ("Show blocked"), whatever its type / evidence.
+    { selector: "edge.blocked", style: {
+      "line-color": "#c62828", "target-arrow-color": "#c62828", "source-arrow-color": "#c62828",
+      "line-style": "dashed", "line-dash-pattern": [6, 4], "color": "#9b1c1c", "opacity": 1,
+    } },
     { selector: "node.dim", style: { "opacity": 0.2 } },
     { selector: "edge.dim", style: { "opacity": 0.08, "text-opacity": 0 } },
     { selector: "node.focus", style: { "overlay-color": "#2457c5", "overlay-opacity": 0.12 } },
@@ -2247,6 +2284,18 @@
       });
       // Touch screens have no hover: a tap on a Transit Gateway edge shows its lines.
       cy.on("onetap", "edge.edge-tgw", showTip);
+      // A connection lists why it is effective or blocked (which SG rule / IAM policy).
+      cy.on("onetap", "edge", (evt) => {
+        const e = evt.target;
+        if (e.hasClass("edge-tgw")) return;
+        const access = e.data("access") || [];
+        showDetail(
+          `${nodeName(cy, e.source().id())} → ${nodeName(cy, e.target().id())}: ` +
+            (e.data("blocked") ? "blocked" : "effective access"),
+          (access.length ? access : ["No security group or IAM data to check it against."])
+            .map((text) => ({ text: text })),
+        );
+      });
       showTgwNote(data.tgw);
       cy.on("onetap", (evt) => {
         if (evt.target !== cy || !focused) return;
@@ -2365,11 +2414,21 @@
       if (ext) relayout(); else refreshEdges();
       rememberEdgeFilter();
     }));
+    if (showBlockedBox) {
+      showBlockedBox.addEventListener("change", () => {
+        if (ext) relayout(); else refreshEdges();
+        rememberEdgeFilter();
+      });
+    }
 
     (data.edge_types || []).forEach((t) => {
       const el = document.querySelector(`[data-edge-count="${t.type}"]`);
-      if (el) el.textContent = `(${t.count})`;
+      if (el) el.textContent = `(${t.count}` + (t.blocked ? ` · ${t.blocked} blocked` : "") + ")";
     });
+    const blockedCount = document.querySelector("[data-blocked-count]");
+    if (blockedCount) {
+      blockedCount.textContent = `(${edges.filter((e) => e.blocked).length})`;
+    }
     function updateStatus() {
       const nRes = data.vpc.subnets.reduce((a, s) => a + s.resource_count, 0);
       const cut = (data.edge_types || []).filter((t) => t.truncated).map((t) => t.label);
@@ -2377,7 +2436,8 @@
       status.textContent = (lg
         ? `${lg.resources} logical resource(s) from ${lg.enis} ENI(s) in ${lg.zones} AZ(s) · `
         : `${data.vpc.subnets.length} subnet(s) · ${nRes} resource ENI(s) · `) +
-        `${edges.length} connection(s) · snapshot #${data.snapshot_id}` +
+        `${edges.filter((e) => !e.blocked).length} connection(s)` +
+        ` (${edges.filter((e) => e.blocked).length} blocked) · snapshot #${data.snapshot_id}` +
         (cut.length ? ` · truncated: ${cut.join(", ")}` : "") +
         (ext ? ` · ${shownExtNodes(ext).length} regional / external node(s)` +
           (ext.hidden_nodes ? ` (${ext.hidden_nodes} crawled node(s) not linked to this VPC: see Not linked)` : "") +

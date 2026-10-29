@@ -111,6 +111,8 @@ RESOURCES = (
     "cloudformation:ListStacks",
 )
 CLOUDTRAIL_RESOURCE = "cloudtrail:LookupEvents"
+# Written by the Extended crawl (iplens.access), never by a Refresh.
+SIMULATION_RESOURCE = "iam:SimulatePrincipalPolicy"
 # Who the snapshot belongs to: collected by every Refresh, a retry included.
 IDENTITY_RESOURCES = ("sts:GetCallerIdentity", "iam:ListAccountAliases")
 # Snapshot write of the ownership sources (a resource row of the progress box).
@@ -163,9 +165,12 @@ _MERGED: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
     ),
     (
         frozenset({"ec2:DescribeSecurityGroups"}),
-        ("sg_refs", "sg_cidr_rules", "security_groups"),
+        ("sg_refs", "sg_cidr_rules", "sg_egress_cidr_rules", "security_groups"),
         ("sg",),
     ),
+    # Effective access: the Extended crawl's cached IAM simulations. No Refresh collects
+    # them, so a retry always keeps the source snapshot's.
+    (frozenset({SIMULATION_RESOURCE}), ("iam_principals", "iam_sims"), ()),
     (
         frozenset({"tag:GetResources", "cloudformation:ListStacks"}),
         ("own_resources", "own_tags"),
@@ -399,12 +404,13 @@ def sg_ref_rows(groups: Iterable[dict[str, Any]]) -> list[tuple[str, str, str, s
 
 
 def sg_cidr_rows(
-    groups: Iterable[dict[str, Any]],
+    groups: Iterable[dict[str, Any]], key: str = "IpPermissions"
 ) -> list[tuple[str, str, str, int | None, int | None]]:
-    """``(group_id, cidr, ip_protocol, from_port, to_port)`` for every IPv4 CIDR ingress rule."""
+    """``(group_id, cidr, ip_protocol, from_port, to_port)`` for every IPv4 CIDR ingress rule
+    (``key="IpPermissionsEgress"``: every egress rule)."""
     out: set[tuple[str, str, str, int | None, int | None]] = set()
     for g in groups:
-        for perm in g.get("IpPermissions", []):
+        for perm in g.get(key, []):
             proto = str(perm.get("IpProtocol", "-1"))
             lo, hi = perm.get("FromPort"), perm.get("ToPort")
             if lo == -1:
@@ -1096,7 +1102,7 @@ class Collector:
             for ep in endpoints:
                 conn.execute(
                     "INSERT INTO endpoints(snapshot_id, endpoint_id, vpc_id, service_name, "
-                    "endpoint_type, subnet_ids, eni_ids) VALUES(?,?,?,?,?,?,?)",
+                    "endpoint_type, subnet_ids, eni_ids, policy) VALUES(?,?,?,?,?,?,?,?)",
                     (
                         snap_id,
                         ep["VpcEndpointId"],
@@ -1105,6 +1111,7 @@ class Collector:
                         ep.get("VpcEndpointType"),
                         json.dumps(ep.get("SubnetIds", [])),
                         json.dumps(ep.get("NetworkInterfaceIds", [])),
+                        ep.get("PolicyDocument") or None,
                     ),
                 )
 
@@ -1210,10 +1217,16 @@ class Collector:
                     "ip_protocol, from_port, to_port) VALUES(?,?,?,?,?,?)",
                     (snap_id, *row),
                 )
+            for row in sg_cidr_rows(security_groups, "IpPermissionsEgress"):
+                conn.execute(
+                    "INSERT OR IGNORE INTO sg_egress_cidr_rules(snapshot_id, group_id, cidr, "
+                    "ip_protocol, from_port, to_port) VALUES(?,?,?,?,?,?)",
+                    (snap_id, *row),
+                )
             for g in security_groups:
                 conn.execute(
                     "INSERT OR IGNORE INTO security_groups(snapshot_id, group_id, name, "
-                    "group_name, vpc_id) VALUES(?,?,?,?,?)",
+                    "group_name, vpc_id, egress_collected) VALUES(?,?,?,?,?,1)",
                     (
                         snap_id,
                         g["GroupId"],

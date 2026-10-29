@@ -161,6 +161,8 @@
     <label class="edge-filter"><input type="checkbox" name="edges" value="{{ t }}" {{ 'checked' if t in edges_on }}>
       <i class="edge-swatch edge-{{ t }}"></i> {{ edge_labels[t] }} <span class="muted" data-edge-count="{{ t }}"></span></label>
     {% endfor %}
+    <label class="edge-filter" title="Effective access: only connections the security groups (egress and ingress) and IAM allow are drawn. Tick to also draw the blocked ones, dashed red; click one for the reason."><input type="checkbox" name="blocked" value="1" id="show-blocked" {{ 'checked' if show_blocked }}>
+      <i class="edge-swatch edge-blocked"></i> Show blocked <span class="muted" data-blocked-count></span></label>
   </fieldset>
   {% if extended %}
   <fieldset class="edge-filters">
@@ -265,12 +267,10 @@
 </aside>
 {% endif %}
 </div>
-{% if extended %}
 <aside class="card edge-detail" id="edge-detail" aria-live="polite" hidden>
   <h2 id="edge-detail-title">Evidence</h2>
   <ul id="edge-detail-lines"></ul>
 </aside>
-{% endif %}
 <script type="application/json" id="visual-positions">{{ positions | tojson }}</script>
 <script type="application/json" id="visual-expanded">{{ expanded | tojson }}</script>
 <script type="application/json" id="visual-filter-presets">{{ filter_presets | tojson }}</script>
@@ -296,6 +296,8 @@
       <span class="legend-item"><i class="edge-swatch edge-{{ t }}"></i> {{ edge_labels[t] }}</span>
     {% endfor %}
     {% endif %}
+    <span class="legend-item"><i class="edge-swatch edge-blocked"></i> Blocked by a security group or IAM (Show blocked)</span>
+    <span class="legend-item">3 AZ: the resource has ENIs in 3 Availability Zones</span>
   </div>
   {% if extended %}
   <div class="legend-grid" aria-label="Evidence levels">

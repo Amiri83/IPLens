@@ -240,11 +240,12 @@ class SnapshotBuilder:
         subnet_ids,
         eni_ids,
         endpoint_type: str = "Interface",
+        policy: str | None = None,
     ) -> SnapshotBuilder:
         with closing(self.db_path) as conn:
             conn.execute(
                 "INSERT INTO endpoints(snapshot_id, endpoint_id, vpc_id, service_name, "
-                "endpoint_type, subnet_ids, eni_ids) VALUES(?,?,?,?,?,?,?)",
+                "endpoint_type, subnet_ids, eni_ids, policy) VALUES(?,?,?,?,?,?,?,?)",
                 (
                     self.id,
                     endpoint_id,
@@ -253,6 +254,7 @@ class SnapshotBuilder:
                     endpoint_type,
                     json.dumps(list(subnet_ids)),
                     json.dumps(list(eni_ids)),
+                    policy,
                 ),
             )
         return self
@@ -332,13 +334,67 @@ class SnapshotBuilder:
         return self
 
     def security_group(
-        self, group_id: str, name: str = "", group_name: str = "", vpc_id: str | None = None
+        self,
+        group_id: str,
+        name: str = "",
+        group_name: str = "",
+        vpc_id: str | None = None,
+        egress_collected: bool = False,
     ) -> SnapshotBuilder:
         with closing(self.db_path) as conn:
             conn.execute(
-                "INSERT INTO security_groups(snapshot_id, group_id, name, group_name, vpc_id) "
-                "VALUES(?,?,?,?,?)",
-                (self.id, group_id, name, group_name, vpc_id),
+                "INSERT INTO security_groups(snapshot_id, group_id, name, group_name, vpc_id, "
+                "egress_collected) VALUES(?,?,?,?,?,?)",
+                (self.id, group_id, name, group_name, vpc_id, int(egress_collected)),
+            )
+        return self
+
+    def sg_egress_cidr(
+        self,
+        group_id: str,
+        cidr: str,
+        ip_protocol: str = "-1",
+        from_port: int | None = None,
+        to_port: int | None = None,
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO sg_egress_cidr_rules(snapshot_id, group_id, cidr, ip_protocol, "
+                "from_port, to_port) VALUES(?,?,?,?,?,?)",
+                (
+                    self.id,
+                    group_id,
+                    cidr,
+                    ip_protocol,
+                    from_port,
+                    from_port if to_port is None else to_port,
+                ),
+            )
+        return self
+
+    def iam_principal(self, holder: str, purpose: str, role_arn: str) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO iam_principals(snapshot_id, holder, purpose, role_arn) "
+                "VALUES(?,?,?,?)",
+                (self.id, holder, purpose, role_arn),
+            )
+        return self
+
+    def iam_sim(
+        self,
+        role_arn: str,
+        action: str,
+        resource: str,
+        decision: str,
+        detail: str = "",
+        resource_decision: str = "",
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO iam_sims(snapshot_id, role_arn, action, resource, decision, "
+                "detail, resource_decision) VALUES(?,?,?,?,?,?,?)",
+                (self.id, role_arn, action, resource, decision, detail, resource_decision),
             )
         return self
 

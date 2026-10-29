@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.6.0 – 2026-10-29
+
+### Added
+
+- **Effective access** on the Visual page (IP, Logical and Extended view): only connections that
+  are really allowed are drawn. Network check (from the snapshot's security group rules, no new
+  AWS call): the source's groups must allow the egress and the target's groups the ingress, by
+  security group reference or a CIDR covering the peer's IP, every group of an ENI evaluated as a
+  union, with at least one port both sides allow; VPC endpoint edges included (a resource whose
+  egress names an endpoint's group is a candidate, and the endpoint's ingress decides). IAM check:
+  the Extended crawl calls `iam:SimulatePrincipalPolicy` for each Lambda execution role / ECS task
+  role (task execution role for ECR image pulls) and the actions its connections need
+  (`sqs:SendMessage`, `sns:Publish`, `sqs:ReceiveMessage`, `ecr:GetAuthorizationToken`,
+  `ecr:BatchGetImage`), and evaluates SQS / SNS resource policies; the VPC endpoint policy is
+  evaluated when the page is built. A connection is drawn only if both checks allow it;
+  connections without data to check against (no crawl yet, rules not collected) are not blocked.
+- **Show blocked** toggle (URL `blocked=1`): blocked connections drawn dashed red; clicking a
+  connection lists why it is effective or blocked (the security group side and groups, or the IAM
+  role / resource / endpoint policy). Per-type counts show the blocked ones.
+- Multi-AZ badge (`3 AZ`) in the IP view too: an ENI of a resource spanning several AZs shows its
+  resource's AZ count, as in the Logical view.
+- The read-only guard allowlists `iam:SimulatePrincipalPolicy` by name (a simulation, it changes
+  nothing; it carries no `Describe` / `List` / `Get` prefix).
+
+### Changed
+
+- A Refresh also stores the security groups' egress CIDR rules (`sg_egress_cidr_rules`) and the
+  VPC endpoint policy. Snapshots from before 1.6.0 lack the egress CIDR rules: their egress side
+  is not checked.
+- Simulation results and principal roles are cached per snapshot (`iam_principals`, `iam_sims`;
+  only ids and decisions, never policy documents); a crawl reuses them, and *Retry skipped*
+  copies them (and the egress rules) into the new snapshot.
+
 ## 1.5.0 – 2026-10-29
 
 ### Added
