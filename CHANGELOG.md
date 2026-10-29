@@ -17,8 +17,11 @@
 
 ### Changed
 
-- The comma-separated **name filter** (`dev, uat`: OR'd, trimmed, any case, empty terms ignored)
-  applies the same way in the IP, Logical and Extended view.
+- The **name filter** takes `,` = OR and `+` = AND, AND binding tighter (`dev+lambda, uat`:
+  (dev AND lambda) OR uat; trimmed, any case, empty terms ignored, so `+dev` / `dev+` is `dev`).
+  A term matches the name, an owner's name, the ENI id, a tag value or the type (or its label);
+  a hint `, = OR  + = AND` sits under the input. It applies the same way in the IP, Logical and
+  Extended view.
 - Diagram exports of the Logical view are named `iplens-<vpc>-logical.svg` / `.drawio`.
 
 ## 1.4.0 – 2026-10-27

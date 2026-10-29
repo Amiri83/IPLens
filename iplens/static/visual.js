@@ -464,7 +464,7 @@
   // -- tag filters (both views; rules in tagfilter.js) -----------------------------------
 
   // Active tag filters (every resource type): [{tag_key, values, include_untagged}], and
-  // the applied name filter (comma-separated terms).
+  // the applied name filter ("," = OR, "+" = AND).
   let tagFilters = [];
   let nameFilter = "";
   let typeLabels = {};  // resource type -> label (visual data "type_labels")
@@ -585,7 +585,7 @@
     const drawChips = () => {
       const terms = TF.nameTerms(nameFilter);
       chips.replaceChildren(
-        ...(terms.length ? [chip(`name: ${terms.join(" | ")}`, () => setName(""))] : []),
+        ...(terms.length ? [chip(`name: ${terms.map((g) => g.join(" + ")).join(" | ")}`,() => setName(""))] : []),
         ...tagFilters.map((f, i) => chip(tagChipText(f), () => {
           tagFilters.splice(i, 1);
           drawChips();

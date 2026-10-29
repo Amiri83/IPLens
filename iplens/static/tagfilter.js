@@ -31,17 +31,23 @@
     return found.some((v) => flt.values.includes(v));
   }
 
-  // Lower-cased, non-empty comma-separated terms of the name filter.
+  // OR'd groups (",") of AND'd terms ("+") of the name filter: lower-cased, trimmed,
+  // empty terms and groups dropped.
   function nameTerms(text) {
-    return (text || "").split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
+    return (text || "").split(",")
+      .map((g) => g.split("+").map((p) => p.trim().toLowerCase()).filter(Boolean))
+      .filter((g) => g.length);
   }
 
-  // A term is part of the name, an owner's name or the ENI id (no term: true).
+  // Every term of one group is part of the name, an owner's name, the ENI id, a tag
+  // value, the type or type label (no group: true).
   function nameMatches(resource, terms) {
     if (!terms.length) return true;
-    const texts = [resource.name, ...(resource.owners || []), resource.eni_id]
+    const values = Object.values(filterTags(resource)).flatMap((v) => (Array.isArray(v) ? v : [v]));
+    const texts = [resource.name, ...(resource.owners || []), resource.eni_id, ...values,
+      resource.type, resource.type_label]
       .filter(Boolean).map((f) => f.toLowerCase());
-    return terms.some((t) => texts.some((f) => f.includes(t)));
+    return terms.some((group) => group.every((t) => texts.some((f) => f.includes(t))));
   }
 
   // Every tag filter (any resource type) and the name filter must match.

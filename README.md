@@ -148,10 +148,11 @@ mode `0700`). Delete it to reset IPLens completely.
    resource node, whatever its type, and only resources with one of those values are drawn. An
    ENI shared by several Lambda functions matches the values of any of them (its displayed tags
    stay the first function's). Several filters must all match; resources without the key are
-   hidden unless **Include untagged**. The **name filter** takes comma-separated terms
-   (`dev, uat`: spaces trimmed, empty terms such as in `dev,,` ignored) and keeps resources whose
-   name, any owner's name (every function of a shared Lambda ENI) or ENI id contains one of them,
-   in any case – the same in the IP, Logical and Extended view; it combines with the tag filters
+   hidden unless **Include untagged**. The **name filter** takes terms with `,` = OR and
+   `+` = AND, AND binding tighter (`dev+lambda, uat` is (dev AND lambda) OR uat; spaces trimmed,
+   empty terms such as in `dev,,` or `+dev` ignored); a term matches when the resource's name, any
+   owner's name (every function of a shared Lambda ENI), ENI id, a tag value or its type contains
+   it, in any case – the same in the IP, Logical and Extended view; it combines with the tag filters
    (both must match). Active filters are removable chips, with "X of Y shown" in total and per
    type. VPC and subnet boxes always stay, unless **Hide empty containers**. Filters (tag and name)
    can be saved as named presets (per account). Compliance rules, findings, suggestions and data

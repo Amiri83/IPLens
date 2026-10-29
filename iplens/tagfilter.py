@@ -17,9 +17,11 @@ node, whatever its type:
   ``include_untagged`` (default false);
 - every filter must match (filters are AND'd).
 
-The name filter is a text of comma-separated terms: a resource matches when one term
-(OR'd) is a case-insensitive substring of its name, of one of its owners' names (every
-function of a shared Lambda ENI) or of its ENI id. It is AND'd with the tag filters.
+The name filter is a text of terms, ``,`` = OR and ``+`` = AND (AND binds tighter:
+``dev+lambda,uat`` is (dev AND lambda) OR uat): a term matches when it is a
+case-insensitive substring of the resource's name, of one of its owners' names (every
+function of a shared Lambda ENI), of its ENI id, of one of its tag values or of its type
+(or type label). It is AND'd with the tag filters.
 
 VPC and subnet boxes are always drawn, unless "hide empty containers" is on: then a
 subnet without a shown resource is hidden, and the VPC when none of its subnets is shown.
@@ -131,19 +133,34 @@ def matches(flt: TagFilter, tags: Tags | None) -> bool:
     return any(v in flt.values for v in found)
 
 
-def name_terms(text: str | None) -> list[str]:
-    """The lower-cased, non-empty comma-separated terms of a name filter."""
-    return [t for t in (p.strip().lower() for p in (text or "").split(",")) if t]
+def name_terms(text: str | None) -> list[list[str]]:
+    """The OR'd groups (``,``) of AND'd terms (``+``) of a name filter: lower-cased,
+    trimmed, empty terms and groups dropped. ``"dev+lambda,uat"``: ``[["dev", "lambda"],
+    ["uat"]]``."""
+    groups = (
+        [t for t in (p.strip().lower() for p in g.split("+")) if t] for g in (text or "").split(",")
+    )
+    return [g for g in groups if g]
 
 
-def name_matches(resource: Mapping[str, Any], terms: list[str]) -> bool:
-    """True if a term is part of the resource's name, an owner's name or its ENI id (no
-    term: True)."""
+def name_matches(resource: Mapping[str, Any], terms: list[list[str]]) -> bool:
+    """True if every term of one group is part of the resource's name, an owner's name,
+    its ENI id, a tag value, its type or type label (no group: True)."""
     if not terms:
         return True
-    fields = [resource.get("name"), *(resource.get("owners") or []), resource.get("eni_id")]
+    values = [
+        v for vs in filter_tags(resource).values() for v in (vs if isinstance(vs, list) else [vs])
+    ]
+    fields = [
+        resource.get("name"),
+        *(resource.get("owners") or []),
+        resource.get("eni_id"),
+        *values,
+        resource.get("type"),
+        resource.get("type_label"),
+    ]
     texts = [f.lower() for f in fields if f]
-    return any(t in f for t in terms for f in texts)
+    return any(all(any(t in f for f in texts) for t in group) for group in terms)
 
 
 def resource_visible(

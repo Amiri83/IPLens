@@ -216,17 +216,22 @@ def test_no_vpc_data_is_returned_unchanged():
     assert logical_view(data) is data
 
 
-# -- multi-term name filter (both views) ---------------------------------------------------
+# -- multi-term name filter (every view): "," = OR, "+" = AND --------------------------------
 
 
 @pytest.mark.parametrize(
     "text, terms",
     [
-        ("dev, uat", ["dev", "uat"]),
-        ("dev,,", ["dev"]),
-        ("dev", ["dev"]),
-        (" DEV , ,UAT ", ["dev", "uat"]),
+        ("dev, uat", [["dev"], ["uat"]]),
+        ("dev,,", [["dev"]]),
+        ("dev", [["dev"]]),
+        (" DEV , ,UAT ", [["dev"], ["uat"]]),
         (",, ,", []),
+        ("dev+lambda", [["dev", "lambda"]]),
+        ("dev + Lambda, uat", [["dev", "lambda"], ["uat"]]),
+        ("+dev", [["dev"]]),
+        ("dev+", [["dev"]]),
+        ("+, +", []),
     ],
 )
 def test_name_filter_parsing(text, terms):
@@ -237,17 +242,36 @@ FILTER_NODES = [
     {"id": "lambda:fn-dev-a", "type": "lambda", "name": "fn-dev-a", "owners": ["fn-dev-a"]},
     {"id": "lambda:fn-uat-a", "type": "lambda", "name": "fn-uat-a", "owners": ["fn-uat-a"]},
     {"id": "nat:nat-a", "type": "nat", "name": "nat-prod-a", "owners": ["nat-a"]},
+    # dev by tag only, not a Lambda function.
+    {
+        "id": "elb:lb-a",
+        "type": "elb",
+        "type_label": "Load balancer",
+        "name": "lb-a",
+        "tags": {"Env": "dev"},
+    },
 ]
 
 
 @pytest.mark.parametrize(
     "text, shown",
     [
-        ("dev, uat", ["lambda:fn-dev-a", "lambda:fn-uat-a"]),
-        ("dev,,", ["lambda:fn-dev-a"]),
+        ("fn-dev, uat", ["lambda:fn-dev-a", "lambda:fn-uat-a"]),
+        ("fn-dev,,", ["lambda:fn-dev-a"]),
         ("UAT", ["lambda:fn-uat-a"]),
-        ("", ["lambda:fn-dev-a", "lambda:fn-uat-a", "nat:nat-a"]),
+        ("", ["lambda:fn-dev-a", "lambda:fn-uat-a", "nat:nat-a", "elb:lb-a"]),
         ("nat-a", ["nat:nat-a"]),  # an owner reference matches too
+        ("dev", ["lambda:fn-dev-a", "elb:lb-a"]),  # a tag value matches too
+        ("load BALANCER", ["elb:lb-a"]),  # the type label too
+        # "+" = AND: dev (name or tag) and lambda (type).
+        ("dev+lambda", ["lambda:fn-dev-a"]),
+        # AND binds tighter than OR: (dev AND lambda) OR uat.
+        ("dev+lambda,uat", ["lambda:fn-dev-a", "lambda:fn-uat-a"]),
+        ("dev+elb, nat", ["nat:nat-a", "elb:lb-a"]),
+        # A leading / trailing "+" leaves a group of one term: just dev.
+        ("+dev", ["lambda:fn-dev-a", "elb:lb-a"]),
+        ("dev+", ["lambda:fn-dev-a", "elb:lb-a"]),
+        ("dev+uat", []),
     ],
 )
 def test_name_filter_on_logical_nodes(text, shown):

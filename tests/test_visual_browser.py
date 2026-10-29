@@ -484,9 +484,16 @@ def test_logical_view(browser, logical_server):
     ]
     assert "7 logical resource(s) from 12 ENI(s) in 3 AZ(s)" in page.text_content("#cy-status")
 
-    # The multi-term name filter: OR'd, trimmed, any case, empty terms ignored.
+    # The multi-term name filter: "," = OR, "+" = AND, trimmed, any case, empty terms ignored.
     _name_filter(page, "FN-A , nat-a")
     assert page.evaluate(SHOWN_IDS) == ["res:lambda:fn-a", "res:nat:nat-a"]
+    # "+" = AND, binding tighter than ",": (Env=dev AND Lambda) OR nat-a.
+    assert page.text_content("#tf-name-hint") == ", = OR\xa0\xa0+ = AND"
+    _name_filter(page, "dev + LAMBDA, nat-a")
+    assert page.evaluate(SHOWN_IDS) == ["res:lambda:fn-a", "res:nat:nat-a"]
+    assert "name: dev + lambda | nat-a" in page.text_content("#tf-chips")
+    _name_filter(page, "dev+nat")
+    assert page.evaluate(SHOWN_IDS) == []
     _name_filter(page, "fn-a,,")
     assert page.evaluate(SHOWN_IDS) == ["res:lambda:fn-a"]
     assert page.evaluate(f"() => {CY}.edges(':visible').length") == 0  # its LB is hidden

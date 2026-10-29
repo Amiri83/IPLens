@@ -112,7 +112,10 @@
   {# No "name" attributes: the tag filters never become part of the page URL. #}
   <fieldset class="edge-filters tag-filters" id="tag-filters">
     <legend>Tag filters</legend>
-    <input id="tf-name" placeholder="name contains, e.g. dev, nonprod" aria-label="Name filter: comma-separated terms" title="Shows resources whose name, owner name or ENI id contains one of the comma-separated terms (any case)" autocomplete="off" maxlength="512">
+    <span style="display: inline-flex; flex-direction: column">
+      <input id="tf-name" placeholder="name contains, e.g. dev+lambda, uat" aria-label="Name filter: , = OR, + = AND" aria-describedby="tf-name-hint" title="Shows resources whose name, owner name, ENI id, tag value or type contains the terms (any case): , = OR, + = AND (AND binds tighter)" autocomplete="off" maxlength="512">
+      <span class="muted small" id="tf-name-hint">, = OR&nbsp;&nbsp;+ = AND</span>
+    </span>
     <input id="tf-key" list="tf-keys" placeholder="tag key" aria-label="Tag key" autocomplete="off" maxlength="128">
     <datalist id="tf-keys"></datalist>
     {# One checkbox per value found for the key: a plain click / tap toggles it. #}
@@ -193,8 +196,9 @@
     (from the Terraform root × environment mapping, else the environment tag set in Settings).
     <b>Tag filters</b> show only the resources (of every type) whose tag (key in any case) has one
     of the chosen values; resources without the key are hidden unless <b>Include untagged</b>, and
-    several filters must all match. The <b>name filter</b> (comma-separated terms, any case) keeps
-    the resources whose name, owner name or ENI id contains one of the terms, together with the
+    several filters must all match. The <b>name filter</b> (any case; <code>,</code> = OR,
+    <code>+</code> = AND, AND binds tighter: <code>dev+lambda, uat</code>) keeps the resources
+    whose name, owner name, ENI id, tag value or type contains the terms, together with the
     tag filters. VPC and subnet boxes stay unless <b>Hide empty containers</b>. Filters only
     change this diagram (findings, suggestions and data exports always cover every resource);
     save them as a named preset.
