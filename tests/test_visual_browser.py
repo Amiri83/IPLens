@@ -1,5 +1,6 @@
 """Visual page in a real browser (Playwright + Chromium). Extended view: changing the layout
-lays the diagram out afresh, Fit shows every visible node, and no layout raises. Both views:
+lays the diagram out afresh, Fit shows every visible node, and no layout raises. Logical view:
+one node per resource, no IPs, merged edges, the comma-separated name filter. Every view:
 the tag filter panel (scope, OR / AND, untagged, containers, presets). Playwright is part of
 the ``dev`` extras; its Chromium comes from ``python -m playwright install chromium``, from
 ``IPLENS_CHROMIUM`` (a Chromium / Chrome for Testing executable) or from
@@ -422,6 +423,93 @@ def test_tag_filters_in_the_extended_view(browser, tf_server):
     page.check("#tf-hide-empty")
     assert not page.evaluate(VISIBLE, "subnet:subnet-a")
     assert page.evaluate(VISIBLE, "subnet:subnet-b") and page.evaluate(VISIBLE, "vpc")
+    assert errors == []
+    page.close()
+
+
+# -- Logical view ------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def logical_server(home, snapshot_builder):
+    from tests.test_logical import seed
+
+    port = _free_port()
+    app = create_app(home, testing=True, port=port)
+    db = app.extensions["iplens"]["paths"].db_path
+    seed(db, snapshot_builder)
+    srv = serving.make_server("127.0.0.1", port, app, threaded=True)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}"
+    srv.shutdown()
+    thread.join(timeout=10)
+
+
+SHOWN_IDS = f"() => {CY}.nodes('.res').filter((n) => n.visible()).map((n) => n.id()).sort()"
+LABEL = f"(id) => {CY}.getElementById(id).data('label')"
+
+
+def test_logical_view(browser, logical_server):
+    from tests.test_logical import VPC as LG_VPC
+
+    page, errors = _open(browser, f"{logical_server}/visual?vpc={LG_VPC}&view=logical")
+    every = sorted(
+        f"res:{n}"
+        for n in (
+            "elb:lb-a",
+            "nat:nat-a",
+            "lambda:fn-a",
+            "ecs:cluster-a/svc-a",
+            "ec2:i-0abc1234",
+            "eni:eni-0abc0051",
+            "eni:eni-0abc0052",
+        )
+    )
+    assert page.evaluate(SHOWN_IDS) == every
+    assert page.evaluate(f"() => {CY}.nodes('.subnet').length") == 0
+    # Name, type and AZ count; no IPs.
+    assert page.evaluate(LABEL, "res:lambda:fn-a") == "fn-a\nLambda\n3 AZ"
+    assert page.evaluate(LABEL, "res:nat:nat-a") == "nat-a\nNAT gateway\n1 AZ"
+    no_ips = "(n) => !/192\\.0\\.2\\./.test(n.data('label') + n.data('title'))"
+    assert page.evaluate(f"() => {CY}.nodes('.res').every({no_ips})")
+    # One line per merged connection (LB→targets, ECS→LB ticked by default).
+    edges = page.evaluate(
+        f"() => {CY}.edges().map((e) => [e.data('etype'), e.source().id(), e.target().id()]).sort()"
+    )
+    assert edges == [
+        ["ecs_lb", "res:ecs:cluster-a/svc-a", "res:elb:lb-a"],
+        ["targets", "res:elb:lb-a", "res:ec2:i-0abc1234"],
+        ["targets", "res:elb:lb-a", "res:lambda:fn-a"],
+    ]
+    assert "7 logical resource(s) from 12 ENI(s) in 3 AZ(s)" in page.text_content("#cy-status")
+
+    # The multi-term name filter: "," = OR, "+" = AND, trimmed, any case, empty terms ignored.
+    _name_filter(page, "FN-A , nat-a")
+    assert page.evaluate(SHOWN_IDS) == ["res:lambda:fn-a", "res:nat:nat-a"]
+    # "+" = AND, binding tighter than ",": (Env=dev AND Lambda) OR nat-a.
+    assert page.text_content("#tf-name-hint") == ", = OR\xa0\xa0+ = AND"
+    _name_filter(page, "dev + LAMBDA, nat-a")
+    assert page.evaluate(SHOWN_IDS) == ["res:lambda:fn-a", "res:nat:nat-a"]
+    assert "name: dev + lambda | nat-a" in page.text_content("#tf-chips")
+    _name_filter(page, "dev+nat")
+    assert page.evaluate(SHOWN_IDS) == []
+    _name_filter(page, "fn-a,,")
+    assert page.evaluate(SHOWN_IDS) == ["res:lambda:fn-a"]
+    assert page.evaluate(f"() => {CY}.edges(':visible').length") == 0  # its LB is hidden
+    assert "All: 1 of 7 shown" in page.text_content("#tf-counts")
+    page.check("#tf-hide-empty")
+    assert page.evaluate(VISIBLE, "vpc")
+    _name_filter(page, "nothing-matches")
+    assert not page.evaluate(VISIBLE, "vpc")
+    _name_filter(page, "")
+    # The children of a box shown again can take a frame to report visible.
+    page.wait_for_function(f"() => ({SHOWN_IDS})().length === {len(every)}", timeout=3000)
+    assert page.evaluate(SHOWN_IDS) == every
+
+    for name in ("dagre", "circle", "grid"):
+        _select_layout(page, name)
+        _fit_shows_everything(page)
     assert errors == []
     page.close()
 

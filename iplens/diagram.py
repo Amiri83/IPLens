@@ -48,7 +48,7 @@ CONTAINER_KINDS = ("vpc", "subnet", "area", "lane")
 # Extended view edges are drawn by their strongest evidence level.
 EXT_EDGE_TYPES = tuple(f"ev_{level}" for level in EVIDENCE_LEVELS)
 ALL_EDGE_TYPES = EDGE_TYPES + EXT_EDGE_TYPES
-VIEW_MODES = ("ip", "extended")
+VIEW_MODES = ("ip", "logical", "extended")
 LEAF_KINDS = ("res", "group")
 
 MAX_NODES = 5000
@@ -146,7 +146,7 @@ class ViewEdge:
 @dataclass
 class View:
     vpc_id: str = ""
-    mode: str = "ip"  # ip | extended
+    mode: str = "ip"  # ip | logical | extended
     show_vpc: bool = True
     show_subnets: bool = True
     expand_groups: bool = False
@@ -357,7 +357,7 @@ def _refit_context_boxes(view: View) -> None:
 
 def export_filename(view: View, ext: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "", view.vpc_id) or "diagram"
-    suffix = "-extended" if view.mode == "extended" else ""
+    suffix = "" if view.mode == "ip" else f"-{view.mode}"
     return f"iplens-{safe}{suffix}.{ext}"
 
 

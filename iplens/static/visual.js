@@ -8,7 +8,9 @@
      - one left-to-right dagre layout (sources -> compute -> targets), edges routed
        along dagre's paths; swimlanes per app when grouping by tag / Terraform root;
      - focus mode: a clicked or searched node and its 1- or 2-hop neighbourhood only.
-   Both views share the toolbar: the Layout choice (grid by default; dagre, or a
+   The Logical view (data-mode="logical") is drawn like the IP view, from one node per
+   logical resource (iplens.logical): straight in the VPC box, no IPs, an AZ count.
+   Every view shares the toolbar: the Layout choice (grid by default; dagre, or a
    cytoscape.js layout applied box by box) and the expanded groups are remembered per
    account and view, dragged positions per account, VPC and view. */
 (function () {
@@ -29,6 +31,7 @@
   const container = document.getElementById("cy");
   if (!container || typeof cytoscape === "undefined") return;
   const extended = container.dataset.mode === "extended";
+  const logical = container.dataset.mode === "logical";
   // The Extended view draws bigger icons and labels so that it stays readable; its first
   // fit when the page loads stops at MIN_READABLE_ZOOM (pan or zoom out to see the rest),
   // while the Fit button always shows every visible node.
@@ -62,7 +65,8 @@
   const groupTagSelect = document.getElementById("group-tag");
   const expandExportBox = document.getElementById("export-expand");
   const envFilters = document.getElementById("env-filters");
-  const view = extended ? "extended" : "ip";  // per-view state key (iplens.viewstate.VIEWS)
+  // Per-view state key (iplens.viewstate.VIEWS).
+  const view = extended ? "extended" : logical ? "logical" : "ip";
   const iconRoot = container.dataset.iconRoot;
   const evidenceBoxes = Array.from(document.querySelectorAll('input[type="checkbox"][name="evidence"]'));
   const serviceFilters = document.getElementById("service-filters");
@@ -163,9 +167,14 @@
     return lines.join("\n");
   }
 
+  // Logical view nodes (iplens.logical) carry their AZs ("zones") instead of IPs.
   function resourceLabel(r) {
     const lines = [wrapLine(resourceName(r), "res")];
     if (r.name !== r.type_label) lines.push(r.type_label);
+    if (r.zones) {
+      if (r.zones.length) lines.push(`${r.zones.length} AZ`);
+      return lines.join("\n");
+    }
     lines.push(...r.ips.slice(0, MAX_IPS_IN_LABEL));
     if (r.ips.length > MAX_IPS_IN_LABEL) lines.push(`+${r.ips.length - MAX_IPS_IN_LABEL} more`);
     return lines.join("\n");
@@ -179,7 +188,8 @@
     } else if (r.ref && r.ref !== r.name) {
       lines.push(r.ref);
     }
-    lines.push(r.eni_id, ...r.ips);
+    if (r.zones) lines.push(`${r.zones.length} AZ: ${r.zones.join(", ")}`);
+    else lines.push(r.eni_id, ...r.ips);
     return lines.join("\n");
   }
 
@@ -256,7 +266,7 @@
     return {
       group: "nodes",
       data: {
-        id: "res:" + r.eni_id,
+        id: "res:" + r.id,  // the ENI id (IP view), the logical node id (Logical view)
         parent: parent,
         order: order,
         label: resourceLabel(r),
@@ -317,6 +327,8 @@
         }
       });
     });
+    // Logical view: no subnets, the logical resources sit in the VPC box.
+    (vpc.items || []).forEach((item, i) => els.push(resourceElement(item, "vpc", i, {})));
     // Transit Gateways (Extended crawl): top-level nodes, outside the VPC box.
     ((data.tgw && data.tgw.nodes) || []).forEach((n) => {
       const el = extElement(n, undefined, {});
@@ -452,7 +464,7 @@
   // -- tag filters (both views; rules in tagfilter.js) -----------------------------------
 
   // Active tag filters (every resource type): [{tag_key, values, include_untagged}], and
-  // the applied name filter (comma-separated terms).
+  // the applied name filter ("," = OR, "+" = AND).
   let tagFilters = [];
   let nameFilter = "";
   let typeLabels = {};  // resource type -> label (visual data "type_labels")
@@ -464,12 +476,14 @@
   /* VPC and subnet boxes stay, unless "Hide empty containers": then a subnet without a
      shown resource goes, and the VPC with its last subnet. Also refreshes "X of Y shown". */
   function applyContainers(cy) {
-    const subnets = cy.nodes(".subnet").map((s) => ({ subnet_id: s.id(), resources: s.children(".res").toArray() }));
+    // Logical view: the VPC box holds the resources itself.
+    const subnets = cy.nodes(logical ? ".vpc" : ".subnet")
+      .map((s) => ({ subnet_id: s.id(), resources: s.children(".res").toArray() }));
     const gone = TF.hiddenContainers(subnets, (n) => !n.hasClass("filtered"), hideEmptyBox && hideEmptyBox.checked);
     const hidden = new Set(gone.subnets);
     cy.nodes(".subnet").forEach((s) => { s.toggleClass("filtered", hidden.has(s.id())); });
     cy.nodes(".vpc").toggleClass("filtered", gone.vpc);
-    const counts = TF.typeCounts(cy.nodes(".res").map((n) => n.data("raw")), (r) => !cy.getElementById("res:" + r.eni_id).hasClass("filtered"));
+    const counts = TF.typeCounts(cy.nodes(".res").map((n) => n.data("raw")), (r) => !cy.getElementById("res:" + r.id).hasClass("filtered"));
     const out = document.getElementById("tf-counts");
     if (out) {
       const all = Object.values(counts).reduce((a, [shown, total]) => [a[0] + shown, a[1] + total], [0, 0]);
@@ -571,7 +585,7 @@
     const drawChips = () => {
       const terms = TF.nameTerms(nameFilter);
       chips.replaceChildren(
-        ...(terms.length ? [chip(`name: ${terms.join(" | ")}`, () => setName(""))] : []),
+        ...(terms.length ? [chip(`name: ${terms.map((g) => g.join(" + ")).join(" | ")}`,() => setName(""))] : []),
         ...tagFilters.map((f, i) => chip(tagChipText(f), () => {
           tagFilters.splice(i, 1);
           drawChips();
@@ -920,7 +934,7 @@
     vpc.subnets.forEach((s) => s.items.forEach((item) => {
       (item.kind === "group" ? item.members : [item]).forEach((r) => out.push(r));
     }));
-    return out;
+    return out.concat(vpc.items || []);  // Logical view
   }
 
   /* Lane of every resource (its first tag value / Terraform root) and every regional
@@ -1591,7 +1605,8 @@
     });
 
     const link = (a, b, weight) => g.setEdge(a, b, { weight: weight, minlen: 1 }, `${a}>${b}`);
-    const subnets = cy.nodes(".subnet").filter((n) => !n.hasClass("filtered"))
+    // Logical view: the VPC box's resources wrap into rows like a subnet's.
+    const subnets = cy.nodes(logical ? ".vpc" : ".subnet").filter((n) => !n.hasClass("filtered"))
       .sort((a, b) => a.data("order") - b.data("order"));
     const tops = [];     // first layout node of each subnet
     const bottoms = [];  // last layout node of each subnet
@@ -1785,7 +1800,7 @@
       }));
     return {
       vpc_id: vpcId,
-      mode: extended ? "extended" : "ip",
+      mode: view,
       show_vpc: showVpcBox.checked,
       show_subnets: showSubnetsBox.checked,
       expand_groups: Boolean(expand),
@@ -2240,6 +2255,7 @@
       });
     }
     cy.on("dbltap", "node.res", (evt) => {
+      if (!evt.target.data("eni")) return;  // a Logical view node stands for several ENIs
       window.location.href = eniUrl.replace("__ENI__", encodeURIComponent(evt.target.data("eni")));
     });
     cy.on("mouseover", "node.res, node.group", () => { container.style.cursor = "pointer"; });
@@ -2357,7 +2373,10 @@
     function updateStatus() {
       const nRes = data.vpc.subnets.reduce((a, s) => a + s.resource_count, 0);
       const cut = (data.edge_types || []).filter((t) => t.truncated).map((t) => t.label);
-      status.textContent = `${data.vpc.subnets.length} subnet(s) · ${nRes} resource ENI(s) · ` +
+      const lg = data.logical;
+      status.textContent = (lg
+        ? `${lg.resources} logical resource(s) from ${lg.enis} ENI(s) in ${lg.zones} AZ(s) · `
+        : `${data.vpc.subnets.length} subnet(s) · ${nRes} resource ENI(s) · `) +
         `${edges.length} connection(s) · snapshot #${data.snapshot_id}` +
         (cut.length ? ` · truncated: ${cut.join(", ")}` : "") +
         (ext ? ` · ${shownExtNodes(ext).length} regional / external node(s)` +

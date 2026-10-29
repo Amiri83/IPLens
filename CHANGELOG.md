@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.5.0 – 2026-10-29
+
+### Added
+
+- **Visual → Logical view** tab, next to the IP view (`/visual?view=logical`; the IP view is
+  unchanged). Multi-AZ duplicates collapse into one node per logical resource, grouped by the
+  stored ENI owner: Lambda function (the functions sharing its ENIs are one node), ECS service
+  (`cluster/service`), load balancer, VPC endpoint, NAT gateway, TGW attachment, RDS /
+  ElastiCache / OpenSearch cluster or instance, EC2 instance. ENIs without an owner reference
+  (and "ENI/other") stay one node each. Nodes are drawn in the VPC box without subnet boxes and
+  show name, type icon and an AZ count (`3 AZ`) – no IPs or ENI ids (the tooltip lists the AZs).
+  Connections between two collapsed nodes are merged into one edge per connection type (distinct
+  labels and tooltip lines kept). Same layout engine, styling, filters, Group by and exports as
+  the IP view; layout choice and dragged positions are stored per view (`<vpc>:logical`).
+
+### Changed
+
+- The **name filter** takes `,` = OR and `+` = AND, AND binding tighter (`dev+lambda, uat`:
+  (dev AND lambda) OR uat; trimmed, any case, empty terms ignored, so `+dev` / `dev+` is `dev`).
+  A term matches the name, an owner's name, the ENI id, a tag value or the type (or its label);
+  a hint `, = OR  + = AND` sits under the input. It applies the same way in the IP, Logical and
+  Extended view.
+- Diagram exports of the Logical view are named `iplens-<vpc>-logical.svg` / `.drawio`.
+
 ## 1.4.0 – 2026-10-27
 
 ### Added

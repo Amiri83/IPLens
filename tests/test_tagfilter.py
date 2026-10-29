@@ -109,16 +109,30 @@ def test_untagged_hidden_by_default_and_kept_on_request():
 
 
 def test_name_terms_split_on_commas_trimmed_lower_cased():
-    assert name_terms(" Dev ,, NonProd ,") == ["dev", "nonprod"]
+    assert name_terms(" Dev ,, NonProd ,") == [["dev"], ["nonprod"]]
+    assert name_terms("Dev + EC2, uat") == [["dev", "ec2"], ["uat"]]
     assert name_terms("") == [] and name_terms(None) == [] and name_terms(" , ") == []
 
 
 def test_name_filter_terms_are_ored_substrings_in_any_case():
-    assert _shown([], "dev") == ["eni-0abc0002"]
-    assert _shown([], "DEV, fn-a") == ["eni-0abc0002", "eni-0abc0006"]
+    assert _shown([], "web-dev") == ["eni-0abc0002"]
+    assert _shown([], "WEB-DEV, fn-a") == ["eni-0abc0002", "eni-0abc0006"]
     assert _shown([], "WEB-PROD") == ["eni-0abc0001"]
     assert _shown([], "nothing, matches") == []
     assert _shown([], " , ") == _shown([])  # no term: no filter
+
+
+def test_name_filter_matches_tag_values_and_the_type():
+    assert _shown([], "dev") == ["eni-0abc0002", "eni-0abc0005"]  # name or Env=dev
+    assert _shown([], "LAMBDA") == ["eni-0abc0005", "eni-0abc0006"]
+    assert _shown([], "team-b") == ["eni-0abc0002"]
+
+
+def test_name_filter_plus_is_and_binding_tighter_than_comma():
+    assert _shown([], "dev+lambda") == ["eni-0abc0005"]
+    assert _shown([], "dev+lambda, web-prod") == ["eni-0abc0001", "eni-0abc0005"]
+    assert _shown([], "+dev") == _shown([], "dev+") == _shown([], "dev")
+    assert _shown([], "dev+prod") == []
 
 
 def test_name_filter_matches_owner_names_and_the_eni_id():
@@ -126,8 +140,8 @@ def test_name_filter_matches_owner_names_and_the_eni_id():
     assert _shown([], "ENI-0ABC0003") == ["eni-0abc0003"]
     shared = _res("eni-0abc0008", "lambda", "fn-a +1 more", ["fn-a", "fn-nonprod"])
     # The second owner's name only appears in ``owners``.
-    assert name_matches(shared, ["nonprod"])
-    assert not name_matches({**shared, "owners": []}, ["nonprod"])
+    assert name_matches(shared, [["nonprod"]])
+    assert not name_matches({**shared, "owners": []}, [["nonprod"]])
 
 
 def test_name_filter_and_tag_filters_are_anded():
@@ -332,6 +346,9 @@ def test_js_mirror_matches_python():
         ([], "0ABC0004,web-t"),
         ([_f(values=["dev"])], "fn-, web"),
         ([_f(values=["dev", "prod"])], "nothing"),
+        ([], "dev+lambda, web-prod"),  # "+" = AND, binding tighter than ","
+        ([], "+dev"),
+        ([], "dev+ , TEAM-A+ec2"),
     ]
     # With the shared Lambda ENI: tag_values ({key: [values]}) beside plain tags.
     resources = [*RESOURCES, LAMBDA_SHARED]
@@ -356,7 +373,9 @@ def test_js_mirror_matches_python():
         assert got["containers"] == [hidden_containers(SUBNETS, shown, h) for h in (False, True)]
         assert got["terms"] == name_terms(name)
     assert "eni-0abc0008" in js["out"][6]["shown"]  # Env=uat keeps the shared ENI
-    assert js["out"][8]["shown"] == ["eni-0abc0002", "eni-0abc0008"]
+    assert js["out"][8]["shown"] == ["eni-0abc0002", "eni-0abc0005", "eni-0abc0008"]
+    # (dev AND lambda) OR web-prod.
+    assert js["out"][13]["shown"] == ["eni-0abc0001", "eni-0abc0005", "eni-0abc0008"]
     assert js["found"] == discovered_tags(resources)
     assert js["found"]["Env"] == ["dev", "prod", "test", "uat"]
 
