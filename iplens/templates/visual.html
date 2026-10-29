@@ -115,7 +115,14 @@
     <select id="tf-type" aria-label="Resource type"><option value="">(resource type)</option></select>
     <input id="tf-key" list="tf-keys" placeholder="tag key" aria-label="Tag key" autocomplete="off" maxlength="128" disabled>
     <datalist id="tf-keys"></datalist>
-    <select id="tf-values" multiple size="3" aria-label="Tag values" disabled></select>
+    {# One checkbox per value found for the key: a plain click / tap toggles it. #}
+    <span class="tf-values" id="tf-values" role="group" aria-label="Tag values">
+      <span class="tf-values-tools">
+        <button type="button" class="secondary" id="tf-values-all" disabled>Select all</button>
+        <button type="button" class="secondary" id="tf-values-none" disabled>Select none</button>
+      </span>
+      <span class="tf-values-list" id="tf-values-list"><span class="muted small">Choose a tag key to list its values.</span></span>
+    </span>
     <label class="edge-filter" title="Also show resources of this type without the tag key"><input type="checkbox" id="tf-untagged"> Include untagged</label>
     <button type="button" class="secondary" id="tf-add" disabled>Add filter</button>
     <span class="tf-chips" id="tf-chips" aria-live="polite"></span>
@@ -189,6 +196,8 @@
     types are not affected, and several filters on one type must all match. VPC and subnet boxes
     stay unless <b>Hide empty containers</b>. Filters only change this diagram (findings,
     suggestions and data exports always cover every resource); save them as a named preset.
+    {% if not extended %}<b>Transit Gateways</b> found by the Extended crawl are drawn outside the
+    VPC box, linked to it by its routes and attachments (hover or tap the line for them).{% endif %}
     Exports contain the diagram as currently shown; with <b>Expand all groups</b> (default) every
     collapsed group is exported as its member resources.
     {% if extended %}<br><b>Extended view:</b> one line per pair of nodes, styled by its strongest
@@ -253,6 +262,7 @@
 <p class="flash error" id="cy-layout-error" role="alert" hidden></p>
 <p class="muted" id="cy-status"></p>
 <p class="muted small" id="cy-note" aria-live="polite"></p>
+{% if not extended %}<div class="muted small" id="tgw-note" role="note" hidden></div>{% endif %}
 <section class="card visual-legend" id="visual-legend" aria-labelledby="legend-title" {{ 'hidden' if not prefs.show_legend }}>
   <h2 id="legend-title">Legend</h2>
   <div class="legend-grid">

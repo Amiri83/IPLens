@@ -5,7 +5,10 @@
 ### Added
 
 - **Visual → Tag filters** (IP and Extended view): choose a resource type, a tag key (suggested
-  from the tags found on that type) and one or more of its values. A filter only affects its own
+  from the tags found on that type) and one or more of its values, ticked in a checkbox list (a
+  plain click or tap toggles a value; Select all / Select none; touch-sized on mobile). An ENI
+  shared by several Lambda functions matches a value of any of its functions (its displayed tags
+  stay the first function's). A filter only affects its own
   resource type; its values are OR'd, several filters on one type are AND'd; tag keys match in
   any case, values exactly. Resources without the key are hidden unless **Include untagged**
   (off by default). Active filters show as removable chips, with "X of Y shown" per resource
@@ -15,6 +18,11 @@
   diagram's SVG / draw.io export still contains the diagram as shown.
 - Named tag filter presets, saved per account in the database: save (overwrites a preset of the
   same name, including its "Hide empty containers" choice), load and delete.
+- **Visual → IP view: Transit Gateways.** With an Extended crawl, the Transit Gateways a VPC routes
+  to / is attached to are drawn outside the VPC box, linked to it by one line whose tooltip lists
+  every route and attachment line. Without a crawl a note says "Run Extended crawl to see Transit
+  Gateway links"; AccessDenied warnings of the crawl's DescribeRouteTables /
+  DescribeTransitGatewayAttachments are listed in that note.
 
 ## 1.3.1 – 2026-10-22
 

@@ -317,6 +317,12 @@
         }
       });
     });
+    // Transit Gateways (Extended crawl): top-level nodes, outside the VPC box.
+    ((data.tgw && data.tgw.nodes) || []).forEach((n) => {
+      const el = extElement(n, undefined, {});
+      el.classes += " tgw";
+      els.push(el);
+    });
     return els;
   }
 
@@ -483,7 +489,9 @@
     const typeSelect = document.getElementById("tf-type");
     const keyInput = document.getElementById("tf-key");
     const keyList = document.getElementById("tf-keys");
-    const valueSelect = document.getElementById("tf-values");
+    const valueList = document.getElementById("tf-values-list");
+    const valuesAll = document.getElementById("tf-values-all");
+    const valuesNone = document.getElementById("tf-values-none");
     const untaggedBox = document.getElementById("tf-untagged");
     const addBtn = document.getElementById("tf-add");
     const chips = document.getElementById("tf-chips");
@@ -505,17 +513,42 @@
       const wanted = keyInput.value.trim().toLowerCase();
       return Object.keys(found[typeSelect.value] || {}).find((k) => k.toLowerCase() === wanted);
     };
+    const valueBoxes = () => Array.from(valueList.querySelectorAll('input[type="checkbox"]'));
+    const checkedValues = () => valueBoxes().filter((b) => b.checked).map((b) => b.value);
     const syncAdd = () => {
       addBtn.disabled = !typeSelect.value || !keyInput.value.trim() ||
-        !(valueSelect.selectedOptions.length || untaggedBox.checked);
+        !(checkedValues().length || untaggedBox.checked);
     };
+    // One checkbox per value found for the key (no "name": never part of the page URL).
     const syncValues = () => {
       const key = knownKey();
       const values = key ? found[typeSelect.value][key] : [];
-      valueSelect.replaceChildren(...values.map((v) => option(v, v === "" ? "(empty)" : v)));
-      valueSelect.disabled = !values.length;
+      if (values.length) {
+        valueList.replaceChildren(...values.map((v) => {
+          const label = document.createElement("label");
+          label.className = "tf-value";
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.value = v;
+          label.append(box, v === "" ? "(empty)" : v);
+          return label;
+        }));
+      } else {
+        const hint = document.createElement("span");
+        hint.className = "muted small";
+        hint.textContent = keyInput.value.trim()
+          ? "No values found for this key." : "Choose a tag key to list its values.";
+        valueList.replaceChildren(hint);
+      }
+      valuesAll.disabled = valuesNone.disabled = !values.length;
       syncAdd();
     };
+    const checkAll = (on) => {
+      valueBoxes().forEach((b) => { b.checked = on; });
+      syncAdd();
+    };
+    valuesAll.addEventListener("click", () => checkAll(true));
+    valuesNone.addEventListener("click", () => checkAll(false));
     typeSelect.addEventListener("change", () => {
       keyList.replaceChildren(...Object.keys(found[typeSelect.value] || {}).map((k) => option(k, k)));
       keyInput.disabled = !typeSelect.value;
@@ -523,7 +556,7 @@
       syncValues();
     });
     keyInput.addEventListener("input", syncValues);
-    [valueSelect, untaggedBox].forEach((el) => el.addEventListener("change", syncAdd));
+    [valueList, untaggedBox].forEach((el) => el.addEventListener("change", syncAdd));
 
     const drawChips = () => {
       chips.replaceChildren(...tagFilters.map((f, i) => {
@@ -548,10 +581,10 @@
       tagFilters.push({
         resource_type: typeSelect.value,
         tag_key: knownKey() || keyInput.value.trim(),
-        values: Array.from(valueSelect.selectedOptions).map((o) => o.value),
+        values: checkedValues(),
         include_untagged: untaggedBox.checked,
       });
-      valueSelect.selectedIndex = -1;
+      valueBoxes().forEach((b) => { b.checked = false; });
       untaggedBox.checked = false;
       syncAdd();
       drawChips();
@@ -736,11 +769,14 @@
   }
 
   // Export edge type: the evidence style in the Extended view, else the edge type.
+  // IP view: a VPC -> Transit Gateway edge is configured evidence (route / attachment).
   function exportType(type, evidence) {
+    if (type === "tgw") return "ev_configured";
     return extended ? "ev_" + (evidence || "configured") : type;
   }
 
-  function syncEdges(cy, edges) {
+  // ``tgwEdges``: the VPC -> Transit Gateway edges (data.tgw), always drawn.
+  function syncEdges(cy, edges, tgwEdges) {
     const items = visibleEdges(cy, edges, enabledEdgeTypes());
     cy.batch(() => {
       cy.edges().remove();
@@ -756,7 +792,50 @@
         },
         classes: "edge-" + m.type,
       })));
+      cy.add((tgwEdges || []).map((e) => ({
+        group: "edges",
+        data: {
+          id: "edge:" + e.id, etype: e.type, source: e.source, target: e.target,
+          label: shortName(e.label), title: e.title,
+        },
+        classes: "edge-tgw",
+      })));
     });
+  }
+
+  /* IP view: Transit Gateways in a column to the right of everything else (the VPC
+     box), whatever the layout. */
+  function placeTgw(cy) {
+    const gws = cy.nodes(".tgw");
+    if (gws.empty()) return;
+    const rest = cy.nodes(":visible").not(".tgw");
+    const box = rest.nonempty()
+      ? rest.boundingBox({ includeLabels: true, useCache: false })
+      : { x1: 0, x2: 0, y1: 0 };
+    cy.batch(() => {
+      gws.forEach((n, i) => {
+        n.position({ x: box.x2 + BLOCK_GAP_X + TEXT_W.res / 2, y: box.y1 + ICON + i * CELL_H });
+      });
+    });
+  }
+
+  /* IP view: "Run Extended crawl to see Transit Gateway links", or the crawl's
+     AccessDenied warnings of DescribeRouteTables / DescribeTransitGatewayAttachments. */
+  function showTgwNote(tgw) {
+    const el = document.getElementById("tgw-note");
+    if (!el || !tgw) return;
+    const warnings = tgw.warnings || [];
+    el.replaceChildren(tgw.note || "");
+    if (warnings.length) {
+      const list = document.createElement("ul");
+      list.append(...warnings.map((w) => {
+        const li = document.createElement("li");
+        li.textContent = w;
+        return li;
+      }));
+      el.append(list);
+    }
+    el.hidden = !tgw.note && !warnings.length;
   }
 
   // -- extended view: scene (lanes, groups), drawn edges, focus ------------------------
@@ -1338,8 +1417,9 @@
       .sort((a, b) => a.data("order") - b.data("order"));
   }
 
+  // Transit Gateways (IP view) are placed by placeTgw.
   function shownInLayout(n) {
-    return n.visible() && !n.hasClass("ctx") && !n.hasClass("pin");
+    return n.visible() && !n.hasClass("ctx") && !n.hasClass("pin") && !n.hasClass("tgw");
   }
 
   // Layout order: the data's order, then (Extended view) source -> compute -> target
@@ -1449,7 +1529,8 @@
 
     // IP view only; the Extended view has its own left-to-right layout (extLayout).
     const leaves = [];
-    cy.nodes().filter((n) => !n.hasClass("hidden") && !n.hasClass("ctx") && !n.hasClass("filtered")).forEach((n) => {
+    cy.nodes().filter((n) => !n.hasClass("hidden") && !n.hasClass("ctx") && !n.hasClass("filtered") &&
+      !n.hasClass("tgw")).forEach((n) => {
       if (n.isParent()) {
         g.setNode(n.id(), {});
       } else {
@@ -1639,7 +1720,12 @@
         target: m.target,
         type: exportType(m.type, m.evidence),
         label: edgeLabel(m),
-      }))
+      })).concat(cy.edges(".edge-tgw").filter((e) => e.visible()).map((e) => ({
+        source: e.source().id(),
+        target: e.target().id(),
+        type: exportType("tgw"),
+        label: e.data("label") || "",
+      })))
       : cy.edges().filter((e) => e.visible()).map((e) => ({
         source: e.source().id(),
         target: e.target().id(),
@@ -1832,6 +1918,8 @@
       "text-background-opacity": 0.85, "text-background-padding": 2,
     } },
     { selector: "edge.edge-targets", style: { "line-color": "#2457c5", "target-arrow-color": "#2457c5" } },
+    // IP view: VPC -> Transit Gateway, styled like configured evidence (ev-configured).
+    { selector: "edge.edge-tgw", style: { "line-color": "#2457c5", "target-arrow-color": "#2457c5" } },
     { selector: "edge.edge-ecs_lb", style: { "line-color": "#2f8f4e", "target-arrow-color": "#2f8f4e" } },
     { selector: "edge.edge-sg", style: {
       "line-style": "dashed", "line-dash-pattern": [6, 4], "width": 1.2, "line-color": "#8a94a3",
@@ -1880,7 +1968,8 @@
     const title = evt.target.data("title");
     if (!title) return;
     tip.textContent = title;
-    const pos = evt.renderedPosition || evt.target.renderedPosition();
+    const pos = evt.renderedPosition ||
+      (evt.target.isEdge() ? evt.target.renderedMidpoint() : evt.target.renderedPosition());
     tip.style.left = `${container.offsetLeft + pos.x + 14}px`;
     tip.style.top = `${container.offsetTop + pos.y + 14}px`;
     tip.hidden = false;
@@ -1916,7 +2005,8 @@
     let focused = null;  // IP view: id of the node whose edges are highlighted
     let drawnCount = 0;
     const refreshEdges = () => {
-      syncEdges(cy, edges);  // re-adds every edge, so the highlight is re-applied
+      // Re-adds every edge, so the highlight is re-applied.
+      syncEdges(cy, edges, data.tgw && data.tgw.edges);
       applyFocus(cy, focused);
     };
     const refreshContext = () => syncContext(cy, data);
@@ -1934,6 +2024,7 @@
         applyEnvFilterIp(cy);
         refreshEdges();
         runLayout(cy, edges);
+        placeTgw(cy);
         applySaved(cy);
       }
       refreshContext();
@@ -2090,6 +2181,9 @@
         relayout();
         saveExpanded();
       });
+      // Touch screens have no hover: a tap on a Transit Gateway edge shows its lines.
+      cy.on("onetap", "edge.edge-tgw", showTip);
+      showTgwNote(data.tgw);
       cy.on("onetap", (evt) => {
         if (evt.target !== cy || !focused) return;
         focused = null;

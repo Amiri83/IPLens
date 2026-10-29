@@ -144,12 +144,18 @@ mode `0700`). Delete it to reset IPLens completely.
    as containers, edges kept). Data comes from `GET /visual/data.json?vpc=<vpc-id>`.
    **Tag filters** (both views, in the browser over the loaded data, nothing is re-discovered):
    pick a resource type, a tag key (suggested from the tags found on that type, any case) and one
-   or more values; only resources of that type with one of those values are drawn, other types
-   are untouched. Several filters on one type must all match; resources without the key are
+   or more values (a checkbox per value found, with Select all / Select none); only resources of
+   that type with one of those values are drawn, other types are untouched. An ENI shared by
+   several Lambda functions matches the values of any of them (its displayed tags stay the first
+   function's). Several filters on one type must all match; resources without the key are
    hidden unless **Include untagged**. Active filters are removable chips, with "X of Y shown" per
    type. VPC and subnet boxes always stay, unless **Hide empty containers**. Filters can be saved
    as named presets (per account). Compliance rules, findings, suggestions and data exports are
    never filtered.
+   After an Extended crawl the IP view also draws the VPC's **Transit Gateways** outside the VPC
+   box, one line per gateway carrying its route / attachment lines (hover or tap it); without a
+   crawl, or when the crawl was denied `DescribeRouteTables` / `DescribeTransitGatewayAttachments`,
+   a note below the diagram says so.
    The **IP view** is the default; the **Extended view** tab adds regional services (SNS, SQS,
    DynamoDB, EventBridge, S3, API Gateway, Step Functions, Lambda, ECS, Secrets Manager names) and
    external nodes (Transit Gateway, peering, internet via IGW / NAT) around the VPC.

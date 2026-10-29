@@ -103,6 +103,55 @@ def test_untagged_hidden_by_default_and_kept_on_request():
     assert resource_visible(blank, [_f(values=[""])])
 
 
+# -- shared Lambda ENIs: every owner's values ------------------------------------------------
+
+# One ENI shared by a dev function (first owner) and a uat function: ``tags`` (display) keeps
+# the first owner's values, ``tag_values`` (filtering) every owner's.
+LAMBDA_SHARED = {
+    **_res("eni-0abc0008", "lambda", Env="dev", Team="team-a"),
+    "tag_values": {"Env": ["dev", "uat"], "Team": ["team-a"]},
+}
+
+
+def test_shared_eni_matches_any_owner_value():
+    uat = [_f(type_="lambda", values=["uat"])]
+    assert resource_visible(LAMBDA_SHARED, uat)
+    assert not resource_visible({k: v for k, v in LAMBDA_SHARED.items() if k != "tag_values"}, uat)
+    assert resource_visible(LAMBDA_SHARED, [_f(type_="lambda", values=["dev"])])
+    assert not resource_visible(LAMBDA_SHARED, [_f(type_="lambda", values=["prod"])])
+    assert resource_visible(LAMBDA_SHARED, [_f(type_="lambda", key="team", values=["team-a"])])
+    assert discovered_tags([LAMBDA_SHARED])["lambda"] == {"Env": ["dev", "uat"], "Team": ["team-a"]}
+
+
+def test_visual_data_tag_values_of_a_shared_eni(home, snapshot_builder):
+    b = snapshot_builder(home / "iplens.db")
+    b.vpc(VPC, "192.0.2.0/24").subnet("subnet-a", VPC, "192.0.2.0/26")
+    b.eni("eni-0abc0008", "subnet-a", ["192.0.2.18"], owner_type="lambda", owner_ref="fn-a")
+    # Not shared: only the dev function.
+    b.eni("eni-0abc0009", "subnet-a", ["192.0.2.19"], owner_type="lambda", owner_ref="fn-a")
+    b.tag("lambda", "fn-a", "Env", "dev").tag("lambda", "fn-a", "Team", "team-a")
+    b.tag("lambda", "fn-b", "Env", "uat")
+    b.tag("eni", "eni-0abc0008", "Name", "test-server-a")
+    with closing(home / "iplens.db") as c:
+        c.execute(
+            "UPDATE enis SET owner_names=? WHERE eni_id=?", ('["fn-a", "fn-b"]', "eni-0abc0008")
+        )
+        data = queries.visual_data(c, b.id, VPC, OWNER_LABELS)
+    node, dev_only = sorted(data["vpc"]["subnets"][0]["items"], key=lambda n: n["eni_id"])
+    assert dev_only["tag_values"] == {"Env": ["dev"], "Team": ["team-a"]}
+    assert not resource_visible(dev_only, [_f(type_="lambda", values=["uat"])])
+    assert node["tags"] == {"Env": "dev", "Name": "test-server-a", "Team": "team-a"}  # first owner
+    assert node["tag_values"] == {
+        "Env": ["dev", "uat"],
+        "Name": ["test-server-a"],
+        "Team": ["team-a"],
+    }
+    uat = [_f(type_="lambda", values=["uat"])]
+    assert resource_visible(node, uat)
+    assert not resource_visible({**node, "tag_values": None}, uat)  # first owner only: hidden
+    assert not resource_visible(node, [_f(type_="lambda", values=["prod"])])
+
+
 # -- containers and counts -------------------------------------------------------------------
 
 
@@ -224,9 +273,13 @@ def test_js_mirror_matches_python():
         [_f(values=["prod"], untagged=True), _f(type_="lambda", values=["dev"])],
         [_f(type_="lambda", untagged=True)],
         [_f(values=["none"]), _f(type_="lambda", values=["none"])],
+        [_f(type_="lambda", values=["uat"])],  # only the shared ENI's second owner
+        [_f(type_="lambda", key="team", values=["team-a"], untagged=True)],
     ]
+    # With the shared Lambda ENI: tag_values ({key: [values]}) beside plain tags.
+    resources = [*RESOURCES, LAMBDA_SHARED]
     payload = {
-        "resources": RESOURCES,
+        "resources": resources,
         "subnets": SUBNETS,
         "cases": [[f.as_dict() for f in c] for c in cases],
     }
@@ -241,10 +294,12 @@ def test_js_mirror_matches_python():
     js = json.loads(result.stdout)
     for filters, got in zip(cases, js["out"], strict=True):
         shown = lambda r, filters=filters: resource_visible(r, filters)  # noqa: E731
-        assert got["shown"] == [r["eni_id"] for r in RESOURCES if shown(r)]
-        assert got["counts"] == type_counts(RESOURCES, shown)
+        assert got["shown"] == [r["eni_id"] for r in resources if shown(r)]
+        assert got["counts"] == type_counts(resources, shown)
         assert got["containers"] == [hidden_containers(SUBNETS, shown, h) for h in (False, True)]
-    assert js["found"] == discovered_tags(RESOURCES)
+    assert "eni-0abc0008" in js["out"][6]["shown"]  # Env=uat keeps the shared ENI
+    assert js["found"] == discovered_tags(resources)
+    assert js["found"]["lambda"]["Env"] == ["dev", "uat"]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")

@@ -10,7 +10,10 @@ A filter is ``{resource_type, tag_key, values, include_untagged}``:
 - it affects only resources of its ``resource_type`` (a node's ``type``, e.g. "ec2");
   other types are drawn as without filters;
 - a resource matches when one of its tags has the key ``tag_key`` (case-insensitive)
-  and a value in ``values`` (exact): values are OR'd;
+  and a value in ``values`` (exact): values are OR'd. A resource's tags for filtering
+  are its ``tag_values`` (``{key: [values]}``: every value of the ENI and of all its
+  owners, so an ENI shared by several Lambda functions matches any function's value),
+  else its ``tags``;
 - a resource without that tag key is "untagged" for the filter and matches only with
   ``include_untagged`` (default false);
 - every filter on a type must match (filters on the same type are AND'd).
@@ -89,13 +92,29 @@ def parse_filters(raw: str | list[Any] | None) -> list[TagFilter]:
     return [parse_filter(doc) for doc in raw]
 
 
-def key_values(tags: Mapping[str, str] | None, key: str) -> list[str]:
-    """Values of every tag whose key equals ``key`` ignoring case."""
+Tags = Mapping[str, str | list[str]]
+
+
+def filter_tags(resource: Mapping[str, Any]) -> Tags:
+    """The tags a resource is filtered on: ``tag_values`` when present, else ``tags``."""
+    values = resource.get("tag_values")
+    if values is None:
+        return resource.get("tags") or {}
+    return values
+
+
+def key_values(tags: Tags | None, key: str) -> list[str]:
+    """Values of every tag whose key equals ``key`` ignoring case (a key may hold one
+    value or a list of them)."""
     wanted = key.lower()
-    return [v for k, v in (tags or {}).items() if k.lower() == wanted]
+    out: list[str] = []
+    for k, v in (tags or {}).items():
+        if k.lower() == wanted:
+            out.extend(v if isinstance(v, list) else [v])
+    return out
 
 
-def matches(flt: TagFilter, tags: Mapping[str, str] | None) -> bool:
+def matches(flt: TagFilter, tags: Tags | None) -> bool:
     found = key_values(tags, flt.tag_key)
     if not found:
         return flt.include_untagged
@@ -105,7 +124,9 @@ def matches(flt: TagFilter, tags: Mapping[str, str] | None) -> bool:
 def resource_visible(resource: Mapping[str, Any], filters: Iterable[TagFilter]) -> bool:
     """True if every filter on the resource's type matches it (no filter: True)."""
     return all(
-        matches(f, resource.get("tags")) for f in filters if f.resource_type == resource.get("type")
+        matches(f, filter_tags(resource))
+        for f in filters
+        if f.resource_type == resource.get("type")
     )
 
 
@@ -145,9 +166,9 @@ def discovered_tags(resources: Iterable[Mapping[str, Any]]) -> dict[str, dict[st
     spelling: dict[tuple[str, str], str] = {}
     for r in resources:
         keys = out.setdefault(r["type"], {})
-        for k, v in (r.get("tags") or {}).items():
+        for k, v in filter_tags(r).items():
             key = spelling.setdefault((r["type"], k.lower()), k)
-            keys.setdefault(key, set()).add(v)
+            keys.setdefault(key, set()).update(v if isinstance(v, list) else [v])
     return {
         t: {k: sorted(vs) for k, vs in sorted(keys.items(), key=lambda kv: kv[0].lower())}
         for t, keys in sorted(out.items())

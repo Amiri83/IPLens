@@ -9,6 +9,7 @@ Placeholders only: 10.0.x.x, 123456789012, example names."""
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 import threading
@@ -275,11 +276,26 @@ def _options(page, selector):
     return page.eval_on_selector_all(f"{selector} option", "os => os.map((o) => o.value)")
 
 
+def _value_boxes(page, checked=None):
+    """Values of the tag value checkboxes (only the (un)checked ones with ``checked``)."""
+    return page.eval_on_selector_all(
+        "#tf-values-list input[type=checkbox]",
+        "(bs, c) => bs.filter((b) => c === null || b.checked === c).map((b) => b.value)",
+        checked,
+    )
+
+
+def _value_label(page, value):
+    return page.locator("#tf-values-list label.tf-value").filter(
+        has=page.locator(f'input[value="{value}"]')
+    )
+
+
 def _add_filter(page, type_, key, values=(), untagged=False):
     page.select_option("#tf-type", type_)
     page.fill("#tf-key", key)
-    if values:
-        page.select_option("#tf-values", list(values))
+    for v in values:
+        _value_label(page, v).click()  # a plain click on the row toggles the value
     if untagged:
         page.check("#tf-untagged")
     page.click("#tf-add")
@@ -300,7 +316,7 @@ def test_tag_filters_in_the_ip_view(browser, tf_server):
     page.select_option("#tf-type", "ec2")
     assert _options(page, "#tf-keys") == ["Env", "Team"]  # Env / env are one key
     page.fill("#tf-key", "ENV")
-    assert _options(page, "#tf-values") == ["dev", "prod"]
+    assert _value_boxes(page) == ["dev", "prod"]
 
     # Scope: only EC2 is filtered, the Lambda ENI stays; untagged EC2 is hidden.
     _add_filter(page, "ec2", "env", ["prod"])
@@ -374,5 +390,186 @@ def test_tag_filters_in_the_extended_view(browser, tf_server):
     page.check("#tf-hide-empty")
     assert not page.evaluate(VISIBLE, "subnet:subnet-a")
     assert page.evaluate(VISIBLE, "subnet:subnet-b") and page.evaluate(VISIBLE, "vpc")
+    assert errors == []
+    page.close()
+
+
+def test_tag_values_checkbox_list(browser, tf_server):
+    """Plain clicks toggle values (no Ctrl / Cmd); Select all / Select none."""
+    page, errors = _open(browser, f"{tf_server['url']}/visual?vpc={TF_VPC}")
+    assert page.is_disabled("#tf-values-all") and page.is_disabled("#tf-values-none")
+    page.select_option("#tf-type", "ec2")
+    page.fill("#tf-key", "Team")
+    assert _value_boxes(page) == ["team-a", "team-b"]
+    _value_label(page, "team-a").click()
+    _value_label(page, "team-b").click()  # a second plain click adds, never replaces
+    assert _value_boxes(page, True) == ["team-a", "team-b"]
+    _value_label(page, "team-a").click()  # and a click again removes
+    assert _value_boxes(page, True) == ["team-b"]
+    page.click("#tf-values-none")
+    assert _value_boxes(page, True) == [] and page.is_disabled("#tf-add")
+    page.click("#tf-values-all")
+    assert _value_boxes(page, True) == ["team-a", "team-b"] and page.is_enabled("#tf-add")
+    page.click("#tf-add")
+    assert page.evaluate(SHOWN) == ["eni-0abc0001", "eni-0abc0002", "eni-0abc0004", "eni-0abc0005"]
+    assert _value_boxes(page, True) == []  # cleared for the next filter
+    assert errors == []
+    page.close()
+
+
+def test_tag_values_checkbox_list_on_a_touch_screen(browser, tf_server):
+    """Mobile: taps toggle values, and every value row is a large enough target."""
+    ctx = browser.new_context(
+        viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True
+    )
+    page = ctx.new_page()
+    page.goto(f"{tf_server['url']}/visual?vpc={TF_VPC}")
+    page.wait_for_function(
+        f"document.getElementById('cy')._cyreg && {CY}.nodes('.res').length > 0", timeout=15000
+    )
+    page.select_option("#tf-type", "ec2")
+    page.fill("#tf-key", "Env")
+    for value in ("dev", "prod"):
+        row = _value_label(page, value)
+        assert row.bounding_box()["height"] >= 44 - TOLERANCE  # touch target
+        row.tap()
+    assert _value_boxes(page, True) == ["dev", "prod"]
+    _value_label(page, "dev").tap()
+    assert _value_boxes(page, True) == ["prod"]
+    assert page.locator("#tf-values-all").bounding_box()["height"] >= 44 - TOLERANCE
+    page.tap("#tf-add")
+    assert page.evaluate(SHOWN) == ["eni-0abc0001", "eni-0abc0004"]
+    ctx.close()
+
+
+# -- shared Lambda ENI and Transit Gateways (IP view) ---------------------------------------
+
+FX_VPC = "vpc-0abc5678"
+FX_TGW = "tgw-0abc1234"
+FX_SHARED = "eni-0abc0010"  # shared by fn-a (Env=dev, first owner) and fn-b (Env=uat)
+FX_DEV = "eni-0abc0011"  # fn-a only
+
+
+def _fx_server(home, snapshot_builder, crawl_warnings):
+    """A shared Lambda ENI, and (``crawl_warnings`` not None) an Extended crawl with a
+    route and an attachment from the VPC to a Transit Gateway."""
+    port = _free_port()
+    app = create_app(home, testing=True, port=port)
+    db = app.extensions["iplens"]["paths"].db_path
+    b = snapshot_builder(db)
+    b.vpc(FX_VPC, "192.0.2.0/24").subnet("subnet-a", FX_VPC, "192.0.2.0/26", name="test-subnet")
+    b.eni(FX_SHARED, "subnet-a", ["192.0.2.10"], owner_type="lambda", owner_ref="fn-a")
+    b.eni(FX_DEV, "subnet-a", ["192.0.2.11"], owner_type="lambda", owner_ref="fn-a")
+    b.tag("lambda", "fn-a", "Env", "dev").tag("lambda", "fn-b", "Env", "uat")
+    with closing(db) as conn:
+        conn.execute(
+            "UPDATE enis SET owner_names=? WHERE eni_id=?", ('["fn-a", "fn-b"]', FX_SHARED)
+        )
+        if crawl_warnings is not None:
+            conn.executemany(
+                "INSERT INTO ext_edges(snapshot_id, source, target, evidence, label, detail) "
+                "VALUES(?,?,?,?,?,?)",
+                [
+                    (b.id, f"vpc:{FX_VPC}", f"tgw:{FX_TGW}", "configured", "route", "route line"),
+                    (
+                        b.id,
+                        f"vpc:{FX_VPC}",
+                        f"tgw:{FX_TGW}",
+                        "configured",
+                        "attachment",
+                        "att line",
+                    ),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO ext_crawls(snapshot_id, crawled_at, warnings, sources) "
+                "VALUES(?,?,?,?)",
+                (b.id, "2026-01-01T00:00:00+00:00", json.dumps(crawl_warnings), "{}"),
+            )
+    srv = serving.make_server("127.0.0.1", port, app, threaded=True)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    return srv, thread, f"http://127.0.0.1:{port}"
+
+
+@pytest.fixture
+def fx_server(request, home, snapshot_builder):
+    srv, thread, url = _fx_server(home, snapshot_builder, request.param)
+    yield url
+    srv.shutdown()
+    thread.join(timeout=10)
+
+
+@pytest.mark.parametrize("fx_server", [[]], indirect=True)
+def test_shared_lambda_eni_matches_any_owner(browser, fx_server):
+    page, errors = _open(browser, f"{fx_server}/visual?vpc={FX_VPC}")
+    page.select_option("#tf-type", "lambda")
+    page.fill("#tf-key", "Env")
+    assert _value_boxes(page) == ["dev", "uat"]  # uat comes from the second owner only
+    _add_filter(page, "lambda", "Env", ["uat"])
+    assert page.evaluate(SHOWN) == [FX_SHARED]
+    _remove_filters(page)
+    _add_filter(page, "lambda", "Env", ["dev"])
+    assert page.evaluate(SHOWN) == [FX_SHARED, FX_DEV]
+    assert errors == []
+    page.close()
+
+
+TGW_NODE = f"x:tgw:{FX_TGW}"
+OUTSIDE_VPC = f"""() => {{
+  const cy = {CY};
+  const vpc = cy.getElementById('vpc').boundingBox({{ includeLabels: false }});
+  const gw = cy.getElementById('{TGW_NODE}');
+  const b = gw.boundingBox({{ includeLabels: false }});
+  return gw.parent().empty() && (b.x1 > vpc.x2 || b.x2 < vpc.x1 || b.y1 > vpc.y2 || b.y2 < vpc.y1);
+}}"""
+
+
+@pytest.mark.parametrize("fx_server", [[]], indirect=True)
+def test_transit_gateway_outside_the_vpc_in_the_ip_view(browser, fx_server):
+    page, errors = _open(browser, f"{fx_server}/visual?vpc={FX_VPC}")
+    assert page.evaluate(VISIBLE, TGW_NODE)
+    edge = page.evaluate(
+        f"() => {CY}.edges('.edge-tgw')"
+        ".map((e) => [e.source().id(), e.target().id(), e.data('title')])"
+    )
+    assert edge == [["vpc", TGW_NODE, "[attachment] att line\n[route] route line"]]
+    for layout in ("grid", "dagre", "circle", "grid"):
+        _select_layout(page, layout)
+        assert page.evaluate(OUTSIDE_VPC), layout
+    _fit_shows_everything(page)
+    # Click (or tap) the edge: its route + attachment lines in the tooltip.
+    mid = page.evaluate(f"() => {CY}.edges('.edge-tgw').renderedMidpoint()")
+    page.locator("#cy").scroll_into_view_if_needed()
+    box = page.locator("#cy").bounding_box()
+    page.mouse.click(box["x"] + mid["x"], box["y"] + mid["y"])
+    page.wait_for_selector("#cy-tip:not([hidden])")
+    assert "attachment] att line" in page.text_content("#cy-tip")
+    assert "route] route line" in page.text_content("#cy-tip")
+    assert page.is_hidden("#tgw-note")  # crawled, nothing denied
+    with page.expect_download() as dl:  # the export accepts the TGW node and edge
+        page.click("#export-svg")
+    assert dl.value.suggested_filename.endswith(".svg")
+    assert errors == []
+    page.close()
+
+
+@pytest.mark.parametrize(
+    "fx_server",
+    [None, ["ec2:DescribeTransitGatewayAttachments skipped (AccessDenied)", "xray: other"]],
+    indirect=True,
+    ids=["no-crawl", "denied"],
+)
+def test_transit_gateway_note(browser, fx_server, request):
+    page, errors = _open(browser, f"{fx_server}/visual?vpc={FX_VPC}")
+    assert page.is_visible("#tgw-note")
+    note = page.text_content("#tgw-note")
+    if "no-crawl" in request.node.callspec.id:
+        assert note == "Run Extended crawl to see Transit Gateway links"
+        assert page.evaluate(f"() => {CY}.nodes('.tgw').length") == 0
+    else:
+        items = page.eval_on_selector_all("#tgw-note li", "ls => ls.map((li) => li.textContent)")
+        assert items == ["ec2:DescribeTransitGatewayAttachments skipped (AccessDenied)"]
+        assert page.evaluate(VISIBLE, TGW_NODE)  # what was crawled is still drawn
     assert errors == []
     page.close()

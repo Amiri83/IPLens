@@ -26,7 +26,7 @@ from iplens.extended import (
     ExtGraph,
     latest_crawl,
 )
-from iplens.extgraph import EXT_ICONS
+from iplens.extgraph import EXT_ICONS, tgw_links
 from iplens.queries import VPC_ICON
 from iplens.web import create_app
 
@@ -682,6 +682,89 @@ def test_ip_view_stays_default(client, ext_seeded):
     assert "Crawl services" not in page and 'data-mode="ip"' in page
     data = client.get(f"/visual/data.json?vpc={VPC}").get_json()
     assert "extended" not in data
+
+
+TGW = "tgw-0example0000001"
+
+
+def test_ip_view_draws_transit_gateway_links(app, client, ext_seeded):
+    """IP view: one node per Transit Gateway this VPC links to (outside the VPC box) and
+    one VPC -> TGW edge carrying every route / attachment line; other VPCs' lines left out."""
+    with closing(_app_db(app)) as conn:
+        conn.execute(
+            "INSERT INTO ext_edges(snapshot_id, source, target, evidence, label, detail) "
+            "VALUES(?,?,?,?,?,?)",
+            (
+                ext_seeded.id,
+                f"vpc:{VPC}",
+                f"tgw:{TGW}",
+                "configured",
+                "attachment",
+                f"TGW attachment tgw-attach-0abc1234 (vpc {VPC}, available)",
+            ),
+        )
+    tgw = client.get(f"/visual/data.json?vpc={VPC}").get_json()["tgw"]
+    assert [n["id"] for n in tgw["nodes"]] == [f"x:tgw:{TGW}"]
+    assert tgw["nodes"][0]["icon"] == EXT_ICONS["tgw"]
+    (edge,) = tgw["edges"]
+    assert (edge["source"], edge["target"], edge["type"]) == ("vpc", f"x:tgw:{TGW}", "tgw")
+    assert edge["label"] == "attachment · route"
+    assert edge["title"].splitlines() == [
+        f"[attachment] TGW attachment tgw-attach-0abc1234 (vpc {VPC}, available)",
+        "[route] 10.0.0.0/8 → tgw",
+    ]
+    assert tgw["note"] == "" and tgw["warnings"] == []  # crawled, nothing denied
+    # The Extended view keeps its own payload.
+    assert "tgw" not in client.get(f"/visual/data.json?vpc={VPC}&view=extended").get_json()
+    page = client.get(f"/visual?vpc={VPC}").data.decode()
+    assert 'id="tgw-note"' in page
+
+
+def test_ip_view_tgw_note_without_crawl(client, snapshot_builder, app):
+    b = snapshot_builder(_app_db(app))
+    b.vpc(VPC, "192.0.2.0/24").subnet(SA, VPC, "192.0.2.0/26")
+    b.eni("eni-0abc0001", SA, ["192.0.2.10"])
+    tgw = client.get(f"/visual/data.json?vpc={VPC}").get_json()["tgw"]
+    assert tgw == {
+        "nodes": [],
+        "edges": [],
+        "note": "Run Extended crawl to see Transit Gateway links",
+        "warnings": [],
+    }
+
+
+def test_ip_view_tgw_note_lists_access_denied_warnings(app, snapshot_builder):
+    b = snapshot_builder(_app_db(app))
+    b.vpc(VPC, "192.0.2.0/24").subnet(SA, VPC, "192.0.2.0/26")
+    warnings = [
+        "ec2:DescribeRouteTables skipped (AccessDenied)",
+        "ec2:DescribeTransitGatewayAttachments skipped (UnauthorizedOperation)",
+        "ec2:DescribeNetworkAcls skipped (AccessDenied)",  # not a TGW source
+        "ec2:DescribeTransitGatewayAttachments skipped (Throttling)",  # not a denial
+        "xray:GetServiceGraph skipped (AccessDeniedException)",
+    ]
+    with closing(_app_db(app)) as conn:
+        conn.execute(
+            "INSERT INTO ext_crawls(snapshot_id, crawled_at, warnings, sources) VALUES(?,?,?,?)",
+            (b.id, "2026-01-01T00:00:00+00:00", json.dumps(warnings), "{}"),
+        )
+        tgw = tgw_links(conn, b.id, VPC)
+    assert tgw["warnings"] == warnings[:2]
+    assert "denied" in tgw["note"] and tgw["nodes"] == []
+
+
+@mock_aws
+def test_denied_ec2_crawl_warnings_reach_the_tgw_note(db_path, snapshot_builder):
+    ids = _seed_aws()
+    b = _snapshot(snapshot_builder, db_path, ids["vpc"], ids["subnet"])
+    ExtendedCrawler(_PartialGateway({"ec2"}), db_path, b.id).run()
+    with closing(db_path) as conn:
+        tgw = tgw_links(conn, b.id, ids["vpc"])
+    assert tgw["warnings"] == [
+        "ec2:DescribeRouteTables skipped (AccessDeniedException)",
+        "ec2:DescribeTransitGatewayAttachments skipped (AccessDeniedException)",
+    ]
+    assert tgw["edges"] == []
 
 
 def test_extended_view_page(client, ext_seeded):

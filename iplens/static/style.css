@@ -234,7 +234,21 @@ table.job-resources td { padding: .15rem .5rem; }
 .env-filters label { white-space: nowrap; }
 /* Visual: tag filter panel (active filters as removable chips). */
 .tag-filters { align-items: center; }
-.tag-filters select[multiple] { min-width: 9rem; }
+/* Values: a checkbox list (plain click / tap toggles; the whole row is the hit area). */
+.tf-values { display: inline-flex; flex-direction: column; gap: .25rem; min-width: 11rem; }
+.tf-values-tools { display: inline-flex; gap: .3rem; }
+.tf-values-tools button { padding: .2rem .55rem; }
+.tf-values-list { display: flex; flex-direction: column; max-height: 9.5rem; overflow-y: auto;
+                  border: 1px solid var(--line); border-radius: 4px; padding: .15rem .3rem; }
+.tf-value { display: flex; align-items: center; gap: .45rem; min-height: 1.9rem; margin: 0;
+            font-weight: 400; cursor: pointer; }
+.tf-value input { width: 1.05rem; height: 1.05rem; margin: 0; }
+@media (pointer: coarse) {
+  .tf-value { min-height: 44px; }
+  .tf-value input { width: 1.4rem; height: 1.4rem; }
+  .tf-values-tools button { min-height: 44px; }
+  .tf-values-list { max-height: 14rem; }
+}
 .tf-chips:empty, .tf-counts:empty { display: none; }
 .tf-chips { display: inline-flex; flex-wrap: wrap; gap: .3rem; }
 .tf-chip { display: inline-flex; align-items: center; gap: .2rem; border: 1px solid var(--line);

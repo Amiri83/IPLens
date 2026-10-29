@@ -66,6 +66,70 @@ FLOW_NODES = {
 }
 
 
+# IP view: Transit Gateway links come from the Extended crawl.
+TGW_NO_CRAWL = "Run Extended crawl to see Transit Gateway links"
+TGW_SOURCES = ("ec2:DescribeRouteTables", "ec2:DescribeTransitGatewayAttachments")
+# Error codes of a denied call (EC2 answers UnauthorizedOperation).
+DENIED_CODES = ("AccessDenied", "UnauthorizedOperation")
+
+
+def tgw_links(conn: sqlite3.Connection, snap_id: int, vpc_id: str) -> dict[str, Any]:
+    """The IP view's Transit Gateway part for one VPC: ``nodes`` (one per TGW the VPC
+    routes to, is attached to or propagates to, from the crawl's ``ext_edges``),
+    ``edges`` (VPC -> TGW, every evidence line kept), and ``note`` / ``warnings``: no
+    crawl yet, or the crawl was denied DescribeRouteTables /
+    DescribeTransitGatewayAttachments (the links may then be incomplete)."""
+    crawl = latest_crawl(conn, snap_id)
+    if crawl is None:
+        return {"nodes": [], "edges": [], "note": TGW_NO_CRAWL, "warnings": []}
+    warnings = [
+        str(w)
+        for w in crawl["warnings"]
+        if str(w).startswith(TGW_SOURCES) and any(c in str(w) for c in DENIED_CODES)
+    ]
+    lines: dict[str, list[dict[str, str]]] = {}
+    for r in conn.execute(
+        "SELECT target, evidence, label, detail FROM ext_edges WHERE snapshot_id=? "
+        "AND source=? AND target LIKE 'tgw:%' ORDER BY target, label, detail",
+        (snap_id, f"vpc:{vpc_id}"),
+    ):
+        lines.setdefault(r["target"], []).append(
+            {"evidence": r["evidence"], "label": r["label"], "text": r["detail"]}
+        )
+    nodes, edges = [], []
+    for i, (nid, items) in enumerate(sorted(lines.items())):
+        name = nid.partition(":")[2]
+        nodes.append(
+            {
+                "id": EXT_PREFIX + nid,
+                "node_id": nid,
+                "service": "tgw",
+                "service_label": SERVICE_LABELS["tgw"],
+                "name": name,
+                "label_name": name,
+                "arn": "",
+                "icon": EXT_ICONS["tgw"],
+                "broad_access": False,
+                "facts": [],
+            }
+        )
+        edges.append(
+            {
+                "id": f"tgw:{i}",
+                "type": "tgw",
+                "source": VPC_NODE,
+                "target": EXT_PREFIX + nid,
+                "label": " · ".join(dict.fromkeys(ln["label"] for ln in items)),
+                "lines": items,
+                "title": "\n".join(f"[{ln['label']}] {ln['text']}" for ln in items),
+            }
+        )
+    note = ""
+    if warnings:
+        note = "Transit Gateway links may be incomplete: the Extended crawl was denied access."
+    return {"nodes": nodes, "edges": edges, "note": note, "warnings": warnings}
+
+
 def _iter_resources(data: dict[str, Any]) -> Iterator[dict[str, Any]]:
     for s in data["vpc"]["subnets"]:
         for item in s["items"]:

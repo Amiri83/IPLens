@@ -1510,6 +1510,8 @@ def _register(app: Flask) -> None:
             abort(404)
         if _view_mode() == "extended" and data.get("vpc"):
             data["extended"] = extgraph.extended_data(_db(), snap["id"], data, _env_keys())
+        elif data.get("vpc"):
+            data["tgw"] = extgraph.tgw_links(_db(), snap["id"], data["vpc"]["vpc_id"])
         return jsonify(data)
 
     # -- extended view: service crawl and flow logs -------------------------------

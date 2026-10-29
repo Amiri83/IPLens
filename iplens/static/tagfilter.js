@@ -8,9 +8,21 @@
 })(typeof self !== "undefined" ? self : this, function () {
   "use strict";
 
+  // tag_values ({key: [values]}: the ENI's and all its owners') when present, else tags.
+  function filterTags(resource) {
+    const values = resource.tag_values;
+    if (values === undefined || values === null) return resource.tags || {};
+    return values;
+  }
+
+  // A key may hold one value or a list of them.
   function keyValues(tags, key) {
     const wanted = key.toLowerCase();
-    return Object.entries(tags || {}).filter(([k]) => k.toLowerCase() === wanted).map(([, v]) => v);
+    const out = [];
+    Object.entries(tags || {}).forEach(([k, v]) => {
+      if (k.toLowerCase() === wanted) out.push(...(Array.isArray(v) ? v : [v]));
+    });
+    return out;
   }
 
   function matches(flt, tags) {
@@ -20,7 +32,7 @@
   }
 
   function resourceVisible(resource, filters) {
-    return filters.every((f) => f.resource_type !== resource.type || matches(f, resource.tags));
+    return filters.every((f) => f.resource_type !== resource.type || matches(f, filterTags(resource)));
   }
 
   // {type: [shown, total]}; shown(resource) -> bool.
@@ -52,11 +64,12 @@
     const spelling = new Map();
     resources.forEach((r) => {
       const keys = out[r.type] || (out[r.type] = {});
-      Object.entries(r.tags || {}).forEach(([k, v]) => {
+      Object.entries(filterTags(r)).forEach(([k, v]) => {
         const id = `${r.type}\u0000${k.toLowerCase()}`;
         if (!spelling.has(id)) spelling.set(id, k);
         const key = spelling.get(id);
-        (keys[key] || (keys[key] = new Set())).add(v);
+        const set = keys[key] || (keys[key] = new Set());
+        (Array.isArray(v) ? v : [v]).forEach((x) => set.add(x));
       });
     });
     return Object.fromEntries(Object.keys(out).sort().map((t) => [t, Object.fromEntries(
@@ -65,6 +78,7 @@
   }
 
   return {
+    filterTags: filterTags,
     keyValues: keyValues,
     matches: matches,
     resourceVisible: resourceVisible,

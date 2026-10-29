@@ -417,6 +417,7 @@ def test_visual_data_endpoint(client, seeded):
         "tag_keys",
         "tf_roots",
         "type_labels",
+        "tgw",  # IP view: Transit Gateway links of the Extended crawl
     }
     assert data["vpcs"] == [{"vpc_id": VPC, "name": "example-vpc"}]
     vpc = data["vpc"]
