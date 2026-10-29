@@ -27,6 +27,7 @@ OWNER_TYPES = (
     "rds",
     "elasticache",
     "opensearch",
+    "tgw_attachment",
     "other",
 )
 
@@ -40,6 +41,7 @@ OWNER_LABELS = {
     "rds": "RDS",
     "elasticache": "ElastiCache",
     "opensearch": "OpenSearch",
+    "tgw_attachment": "TGW attachment",
     "other": "ENI/other",
 }
 
@@ -58,6 +60,7 @@ _INTERFACE_TYPE_MAP = {
     "efa-only": "ec2",
     "trunk": "ec2",
     "branch": "ec2",
+    "transit_gateway": "tgw_attachment",
 }
 
 _REQUESTER_MAP = {
@@ -79,12 +82,15 @@ _DESC_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^arn:aws[\w-]*:ecs:[^:]*:[^:]*:attachment/(?P<ref>[0-9a-f-]+)"), "ecs"),
     (re.compile(r"^ElastiCache (?:Serverless )?(?P<ref>\S+)"), "elasticache"),
     (re.compile(r"^(?:ES|OpenSearch(?: Service)?) (?P<ref>\S+)$"), "opensearch"),
+    (
+        re.compile(r"^Network Interface for Transit Gateway Attachment (?P<ref>tgw-attach-\w+)"),
+        "tgw_attachment",
+    ),
 ]
 
 _OTHER_DESC_HINTS = (
     ("Amazon EKS", "EKS"),
     ("EFS mount target", "EFS"),
-    ("Network Interface for Transit Gateway", "Transit Gateway"),
     ("AWS created network interface for directory", "Directory Service"),
     ("Route 53 Resolver", "Route 53 Resolver"),
 )

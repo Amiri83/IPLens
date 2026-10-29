@@ -142,6 +142,27 @@ mode `0700`). Delete it to reset IPLens completely.
    + view until **Reset layout** (which also leaves focus mode). **Export SVG** / **Export
    draw.io** download the view exactly as shown (draw.io: `mxgraph.aws4` shapes, VPC and subnets
    as containers, edges kept). Data comes from `GET /visual/data.json?vpc=<vpc-id>`.
+   **Tag filters** (both views, in the browser over the loaded data, nothing is re-discovered):
+   pick a tag key (suggested from the tags found on every resource, any case) and one or more
+   values (a checkbox per value found, with Select all / Select none); a filter applies to every
+   resource node, whatever its type, and only resources with one of those values are drawn. An
+   ENI shared by several Lambda functions matches the values of any of them (its displayed tags
+   stay the first function's). Several filters must all match; resources without the key are
+   hidden unless **Include untagged**. The **name filter** takes comma-separated terms
+   (`dev, nonprod`) and keeps resources whose name, any owner's name (every function of a shared
+   Lambda ENI) or ENI id contains one of them, in any case; it combines with the tag filters
+   (both must match). Active filters are removable chips, with "X of Y shown" in total and per
+   type. VPC and subnet boxes always stay, unless **Hide empty containers**. Filters (tag and name)
+   can be saved as named presets (per account). Compliance rules, findings, suggestions and data
+   exports are never filtered.
+   The IP view also draws the VPC's **Transit Gateways** outside the VPC box, from every Refresh
+   (`ec2:DescribeTransitGatewayAttachments`, `ec2:DescribeRouteTables`): each Transit Gateway
+   attachment ENI (resource type "TGW attachment") is linked to its gateway, labelled with the
+   attachment id and state, and each subnet whose route table routes to a gateway is linked to it
+   (hover or tap: the destination CIDRs / prefix lists and the route table id). An Extended crawl
+   adds what discovery does not see (TGW route table propagations) on a VPC → gateway line. A note
+   below the diagram says when there is no crawl yet, and lists the `DescribeRouteTables` /
+   `DescribeTransitGatewayAttachments` calls that discovery or the crawl was denied.
    The **IP view** is the default; the **Extended view** tab adds regional services (SNS, SQS,
    DynamoDB, EventBridge, S3, API Gateway, Step Functions, Lambda, ECS, Secrets Manager names) and
    external nodes (Transit Gateway, peering, internet via IGW / NAT) around the VPC.
@@ -597,6 +618,8 @@ the instance attachment's secondary private IPs; without it ENIs keep their own 
 `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth` and
 `ec2:DescribeSecurityGroups` add load balancer → target and security group reference
 connections to the Visual page; without them those connections are left out.
+`ec2:DescribeTransitGatewayAttachments` and `ec2:DescribeRouteTables` add the IP view's Transit
+Gateway links; each one missing is a Refresh warning, listed in the note below the diagram.
 Managed-service names: `rds:DescribeDBInstances`, `rds:DescribeDBClusters`,
 `redshift:DescribeClusters`, `elasticache:DescribeCacheClusters`,
 `elasticache:DescribeReplicationGroups`, `es:ListDomainNames`, `es:DescribeDomains` and
@@ -638,6 +661,7 @@ sources, simply not enabled).
 | Account alias in the header | `iam:ListAccountAliases` | optional (falls back to account id / display name) |
 | EC2 instance names and attachment IPs | `ec2:DescribeInstances` | optional (skipped with warning) |
 | Visual: LB → target and security group connections | `elasticloadbalancing:DescribeTargetGroups`, `elasticloadbalancing:DescribeTargetHealth`, `ec2:DescribeSecurityGroups` | optional (connections left out) |
+| Visual IP view: Transit Gateway links | `ec2:DescribeTransitGatewayAttachments`, `ec2:DescribeRouteTables` | optional (missing permission = warning, shown in the diagram's note) |
 | Managed-service ENI names (RDS / Aurora, Redshift, ElastiCache, OpenSearch, MSK) | `rds:DescribeDBInstances`, `rds:DescribeDBClusters`, `redshift:DescribeClusters`, `elasticache:DescribeCacheClusters`, `elasticache:DescribeReplicationGroups`, `es:ListDomainNames`, `es:DescribeDomains`, `kafka:ListClustersV2` | optional (missing permission = warning + skip; ENIs keep the generic name) |
 | Scale headroom (ASG and ECS service maximums) | `autoscaling:DescribeAutoScalingGroups`, `application-autoscaling:DescribeScalableTargets` | optional (missing permission = warning; headroom uses what is known) |
 | Ownership: tags, CloudFormation | `tag:GetResources`, `cloudformation:ListStacks`, `cloudformation:ListStackResources` | optional (skipped with warning) |

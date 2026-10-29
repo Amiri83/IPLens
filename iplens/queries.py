@@ -441,6 +441,17 @@ def resource_tags(index: TagIndex, row: dict[str, Any]) -> dict[str, str]:
     return dict(sorted(tags.items()))
 
 
+def resource_tag_values(index: TagIndex, row: dict[str, Any]) -> dict[str, list[str]]:
+    """``{key: [values]}`` of an ENI row for tag filtering: every distinct value of the
+    ENI's own TagSet and of every owner (a shared Lambda ENI keeps each function's
+    value, where :func:`resource_tags` keeps the first owner's)."""
+    out: dict[str, set[str]] = {}
+    for key in [("eni", row["eni_id"]), *owner_tag_keys(row)]:
+        for k, v in index.get(key, {}).items():
+            out.setdefault(k, set()).add(v)
+    return {k: sorted(vs) for k, vs in sorted(out.items())}
+
+
 def tag_keys(conn: sqlite3.Connection, snap_id: int) -> list[str]:
     """Every tag key of an ENI-owning resource in a snapshot (security group, VPC and
     subnet tags excluded)."""
@@ -654,10 +665,12 @@ VISUAL_TYPE_ORDER = (
     "rds",
     "elasticache",
     "opensearch",
+    "tgw_attachment",
     "other",
 )
 
-# Files under static/icons/aws/ (official AWS Architecture Icons).
+# Files under static/icons/aws/ (official AWS Architecture Icons); an "ext/" name is a
+# self-drawn badge under static/icons/ (the Transit Gateway family has no resource icon).
 VPC_ICON = "Virtual-private-cloud-VPC_32.svg"
 TYPE_ICONS = {
     "vpc_endpoint": "Res_Amazon-VPC_Endpoints_48.svg",
@@ -669,6 +682,7 @@ TYPE_ICONS = {
     "rds": "Arch_Amazon-RDS_48.svg",
     "elasticache": "Arch_Amazon-ElastiCache_48.svg",
     "opensearch": "Arch_Amazon-OpenSearch-Service_48.svg",
+    "tgw_attachment": "ext/tgw-attachment.svg",
     "other": "Res_Amazon-VPC_Elastic-Network-Interface_48.svg",
 }
 LB_ICONS = {
@@ -689,8 +703,11 @@ def _type_rank(owner_type: str) -> int:
         return len(VISUAL_TYPE_ORDER)
 
 
-def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[dict[str, Any]]:
-    """One node per ENI (rows are already ordered by IP)."""
+def _resource_nodes(
+    rows: list[dict[str, Any]], labels: dict[str, str], tags: TagIndex
+) -> list[dict[str, Any]]:
+    """One node per ENI (rows are already ordered by IP). ``tags`` (the TagIndex)
+    gives each node its ``tag_values`` for the tag filters."""
     nodes: dict[str, dict[str, Any]] = {}
     for r in rows:
         node = nodes.get(r["eni_id"])
@@ -713,6 +730,8 @@ def _resource_nodes(rows: list[dict[str, Any]], labels: dict[str, str]) -> list[
                 "owners": owners,
                 "sgs": r["security_groups"],
                 "tags": r["tags"],
+                # Tag filters: every value of the ENI and of all its owners.
+                "tag_values": resource_tag_values(tags, r),
                 "tf": r["tf"],
                 "environment": r["environment"],
                 "env_source": r["env_source"],
@@ -807,8 +826,9 @@ def visual_data(
     subnets = []
     resources: dict[str, dict[str, Any]] = {}
     names = sg_names(conn, snap_id)
+    tags = tag_index(conn, snap_id)
     for s in vpc.subnets:
-        nodes = _resource_nodes(by_subnet.get(s.subnet_id, []), labels)
+        nodes = _resource_nodes(by_subnet.get(s.subnet_id, []), labels, tags)
         resources.update((n["eni_id"], n) for n in nodes)
         subnets.append(
             {
@@ -845,6 +865,10 @@ def visual_data(
             for sg in sorted({g for n in resources.values() for g in n["sgs"]})
         },
         "tag_keys": sorted({k for n in resources.values() for k in n["tags"]}),
+        # Resource type labels of the view filters' "X of Y shown" counts.
+        "type_labels": {
+            t: labels.get(t, t) for t in sorted({n["type"] for n in resources.values()})
+        },
         "tf_roots": sorted({m["root"] for n in resources.values() for m in n["tf"]}),
         **visual_edges(conn, snap_id, vpc.vpc_id, resources, by_ip, edge_types, names),
     }

@@ -416,6 +416,8 @@ def test_visual_data_endpoint(client, seeded):
         "sg_names",
         "tag_keys",
         "tf_roots",
+        "type_labels",
+        "tgw",  # IP view: Transit Gateway links of the Extended crawl
     }
     assert data["vpcs"] == [{"vpc_id": VPC, "name": "example-vpc"}]
     vpc = data["vpc"]
@@ -443,7 +445,8 @@ def test_visual_data_without_snapshot(client):
 def test_visual_assets_are_vendored(client):
     names = {*queries.TYPE_ICONS.values(), *queries.LB_ICONS.values(), queries.VPC_ICON}
     for name in sorted(names):
-        resp = client.get(f"/static/icons/aws/{name}")
+        path = name if name.startswith("ext/") else f"aws/{name}"
+        resp = client.get(f"/static/icons/{path}")
         assert resp.status_code == 200 and b"<svg" in resp.data, name
         resp.close()
     resp = client.get("/static/vendor/cytoscape.min.js")

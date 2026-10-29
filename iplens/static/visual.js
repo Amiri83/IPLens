@@ -71,6 +71,9 @@
   const focusHops = document.getElementById("focus-hops");
   const focusReset = document.getElementById("focus-reset");
   const D = window.IPLensDeclutter;
+  const TF = window.IPLensTagFilter;
+  const tagPanel = document.getElementById("tag-filters");
+  const hideEmptyBox = document.getElementById("tf-hide-empty");
   const GROUP_THRESHOLD = 10;  // mirrors iplens.queries.VISUAL_GROUP_THRESHOLD
   const COMPUTE_TYPES = new Set(["lambda", "ecs"]);
   const SHARED_LANE = "shared";
@@ -258,7 +261,7 @@
         order: order,
         label: resourceLabel(r),
         title: resourceTitle(r),
-        icon: iconBase + r.icon,
+        icon: iconUrl(r.icon),
         iconFile: r.icon,
         eni: r.eni_id,
         raw: r,
@@ -302,7 +305,7 @@
             data: {
               id: item.id, parent: sid, order: i, label: groupLabel(item, false),
               title: groupTitle(item), expanded: false,
-              icon: iconBase + item.icon, iconFile: item.icon, raw: item,
+              icon: iconUrl(item.icon), iconFile: item.icon, raw: item,
             },
             classes: "group",
           });
@@ -313,6 +316,12 @@
           els.push(resourceElement(item, sid, i, {}));
         }
       });
+    });
+    // Transit Gateways (Extended crawl): top-level nodes, outside the VPC box.
+    ((data.tgw && data.tgw.nodes) || []).forEach((n) => {
+      const el = extElement(n, undefined, {});
+      el.classes += " tgw";
+      els.push(el);
     });
     return els;
   }
@@ -424,16 +433,247 @@
     window.history.replaceState(null, "", `${window.location.pathname}?${params}`);
   }
 
-  /* IP view: resources of unticked environments disappear, and a group whose members are
-     all gone with them (the Extended view folds this into applyServiceFilter). */
+  /* IP view: resources of unticked environments or left out by a tag filter disappear,
+     and a group whose members are all gone with them (the Extended view folds this into
+     applyServiceFilter). */
   function applyEnvFilterIp(cy) {
     const off = envOff();
     cy.batch(() => {
-      cy.nodes(".res").forEach((n) => { n.toggleClass("filtered", off.has(n.data("raw").environment || "")); });
+      cy.nodes(".res").forEach((n) => {
+        n.toggleClass("filtered", off.has(n.data("raw").environment || "") || tagGone(n));
+      });
       cy.nodes(".group").forEach((g) => {
         g.toggleClass("filtered", groupMembers(cy, g).every((m) => m.hasClass("filtered")));
       });
+      applyContainers(cy);
     });
+  }
+
+  // -- tag filters (both views; rules in tagfilter.js) -----------------------------------
+
+  // Active tag filters (every resource type): [{tag_key, values, include_untagged}], and
+  // the applied name filter (comma-separated terms).
+  let tagFilters = [];
+  let nameFilter = "";
+  let typeLabels = {};  // resource type -> label (visual data "type_labels")
+
+  function tagGone(n) {
+    return !TF.resourceVisible(n.data("raw"), tagFilters, nameFilter);
+  }
+
+  /* VPC and subnet boxes stay, unless "Hide empty containers": then a subnet without a
+     shown resource goes, and the VPC with its last subnet. Also refreshes "X of Y shown". */
+  function applyContainers(cy) {
+    const subnets = cy.nodes(".subnet").map((s) => ({ subnet_id: s.id(), resources: s.children(".res").toArray() }));
+    const gone = TF.hiddenContainers(subnets, (n) => !n.hasClass("filtered"), hideEmptyBox && hideEmptyBox.checked);
+    const hidden = new Set(gone.subnets);
+    cy.nodes(".subnet").forEach((s) => { s.toggleClass("filtered", hidden.has(s.id())); });
+    cy.nodes(".vpc").toggleClass("filtered", gone.vpc);
+    const counts = TF.typeCounts(cy.nodes(".res").map((n) => n.data("raw")), (r) => !cy.getElementById("res:" + r.eni_id).hasClass("filtered"));
+    const out = document.getElementById("tf-counts");
+    if (out) {
+      const all = Object.values(counts).reduce((a, [shown, total]) => [a[0] + shown, a[1] + total], [0, 0]);
+      const parts = Object.entries(counts)
+        .map(([t, [shown, total]]) => `${typeLabels[t] || t}: ${shown} of ${total} shown`);
+      if (parts.length > 1) parts.unshift(`All: ${all[0]} of ${all[1]} shown`);
+      out.textContent = parts.join(" · ");
+    }
+  }
+
+  function tagChipText(f) {
+    const values = f.values.map((v) => (v === "" ? "(empty)" : v));
+    if (f.include_untagged) values.push("untagged");
+    return `${f.tag_key} = ${values.join(" | ")}`;
+  }
+
+  /* The filter panel: a name filter, then a tag key (suggested from the tags found on
+     every resource) and its values (found for that key); active filters as removable
+     chips; named presets saved per account. ``onChange`` redraws. */
+  function setupTagFilters(data, onChange) {
+    if (!tagPanel) return;
+    const nameInput = document.getElementById("tf-name");
+    const keyInput = document.getElementById("tf-key");
+    const keyList = document.getElementById("tf-keys");
+    const valueList = document.getElementById("tf-values-list");
+    const valuesAll = document.getElementById("tf-values-all");
+    const valuesNone = document.getElementById("tf-values-none");
+    const untaggedBox = document.getElementById("tf-untagged");
+    const addBtn = document.getElementById("tf-add");
+    const chips = document.getElementById("tf-chips");
+    const presetSelect = document.getElementById("tf-preset");
+    const presetName = document.getElementById("tf-preset-name");
+    let presets = JSON.parse(document.getElementById("visual-filter-presets").textContent || "[]");
+    const found = TF.discoveredTags(allResources(data.vpc));
+    typeLabels = data.type_labels || {};
+
+    const option = (value, text) => {
+      const opt = document.createElement("option");
+      opt.value = value;
+      opt.textContent = text;
+      return opt;
+    };
+    keyList.replaceChildren(...Object.keys(found).map((k) => option(k, k)));
+
+    const knownKey = () => {
+      const wanted = keyInput.value.trim().toLowerCase();
+      return Object.keys(found).find((k) => k.toLowerCase() === wanted);
+    };
+    const valueBoxes = () => Array.from(valueList.querySelectorAll('input[type="checkbox"]'));
+    const checkedValues = () => valueBoxes().filter((b) => b.checked).map((b) => b.value);
+    const syncAdd = () => {
+      addBtn.disabled = !keyInput.value.trim() || !(checkedValues().length || untaggedBox.checked);
+    };
+    // One checkbox per value found for the key (no "name": never part of the page URL).
+    const syncValues = () => {
+      const key = knownKey();
+      const values = key ? found[key] : [];
+      if (values.length) {
+        valueList.replaceChildren(...values.map((v) => {
+          const label = document.createElement("label");
+          label.className = "tf-value";
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.value = v;
+          label.append(box, v === "" ? "(empty)" : v);
+          return label;
+        }));
+      } else {
+        const hint = document.createElement("span");
+        hint.className = "muted small";
+        hint.textContent = keyInput.value.trim()
+          ? "No values found for this key." : "Choose a tag key to list its values.";
+        valueList.replaceChildren(hint);
+      }
+      valuesAll.disabled = valuesNone.disabled = !values.length;
+      syncAdd();
+    };
+    const checkAll = (on) => {
+      valueBoxes().forEach((b) => { b.checked = on; });
+      syncAdd();
+    };
+    valuesAll.addEventListener("click", () => checkAll(true));
+    valuesNone.addEventListener("click", () => checkAll(false));
+    keyInput.addEventListener("input", syncValues);
+    [valueList, untaggedBox].forEach((el) => el.addEventListener("change", syncAdd));
+
+    const chip = (text, onRemove) => {
+      const el = document.createElement("span");
+      el.className = "tf-chip";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "×";
+      remove.title = "Remove this filter";
+      remove.setAttribute("aria-label", "Remove filter " + text);
+      remove.addEventListener("click", onRemove);
+      el.append(text + " ", remove);
+      return el;
+    };
+    const drawChips = () => {
+      const terms = TF.nameTerms(nameFilter);
+      chips.replaceChildren(
+        ...(terms.length ? [chip(`name: ${terms.join(" | ")}`, () => setName(""))] : []),
+        ...tagFilters.map((f, i) => chip(tagChipText(f), () => {
+          tagFilters.splice(i, 1);
+          drawChips();
+          onChange();
+        })),
+      );
+    };
+    // The name filter applies as it is typed (after a short pause) or on Enter.
+    const setName = (text) => {
+      nameInput.value = text;
+      if (text.trim() === nameFilter) return;
+      nameFilter = text.trim();
+      drawChips();
+      onChange();
+    };
+    let nameTimer = null;
+    nameInput.addEventListener("input", () => {
+      clearTimeout(nameTimer);
+      nameTimer = setTimeout(() => setName(nameInput.value), SAVE_DELAY_MS);
+    });
+    const applyName = () => {
+      clearTimeout(nameTimer);
+      setName(nameInput.value);
+    };
+    const add = () => {
+      if (addBtn.disabled) return;
+      tagFilters.push({
+        tag_key: knownKey() || keyInput.value.trim(),
+        values: checkedValues(),
+        include_untagged: untaggedBox.checked,
+      });
+      valueBoxes().forEach((b) => { b.checked = false; });
+      untaggedBox.checked = false;
+      syncAdd();
+      drawChips();
+      onChange();
+    };
+    addBtn.addEventListener("click", add);
+    hideEmptyBox.addEventListener("change", onChange);
+
+    const drawPresets = (selected) => {
+      presetSelect.replaceChildren(option("", "(preset)"), ...presets.map((p) => option(p.name, p.name)));
+      presetSelect.value = selected || "";
+    };
+    const sendPreset = (url, fields) => {
+      const body = new URLSearchParams({ csrf_token: csrf, ...fields });
+      return fetch(url, { method: "POST", body: body, credentials: "same-origin" })
+        .then((r) => {
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          return r.json();
+        })
+        .then((list) => { presets = list; });
+    };
+    const save = () => {
+      const name = presetName.value.trim();
+      if (!name) {
+        note.textContent = "Name the preset first.";
+        return;
+      }
+      sendPreset(container.dataset.presetsUrl, {
+        name: name, filters: JSON.stringify(tagFilters), name_filter: nameFilter,
+        hide_empty: hideEmptyBox.checked ? "1" : "0",
+      })
+        .then(() => {
+          drawPresets(name);
+          note.textContent = `Preset "${name}" saved.`;
+        })
+        .catch((err) => { note.textContent = `Could not save the preset (${err.message}).`; });
+    };
+    document.getElementById("tf-save").addEventListener("click", save);
+    document.getElementById("tf-load").addEventListener("click", () => {
+      const p = presets.find((x) => x.name === presetSelect.value);
+      if (!p) return;
+      tagFilters = p.filters.map((f) => ({ ...f, values: f.values.slice() }));
+      clearTimeout(nameTimer);
+      nameFilter = p.name_filter || "";
+      nameInput.value = nameFilter;
+      hideEmptyBox.checked = p.hide_empty;
+      presetName.value = p.name;
+      drawChips();
+      onChange();
+    });
+    document.getElementById("tf-delete").addEventListener("click", () => {
+      const name = presetSelect.value;
+      if (!name) return;
+      sendPreset(container.dataset.presetsDeleteUrl, { name: name })
+        .then(() => {
+          drawPresets("");
+          note.textContent = `Preset "${name}" deleted.`;
+        })
+        .catch((err) => { note.textContent = `Could not delete the preset (${err.message}).`; });
+    });
+    // Enter applies the name filter / adds the filter / saves the preset instead of
+    // submitting the page form.
+    [[nameInput, applyName], [keyInput, add], [presetName, save]].forEach(([input, action]) => {
+      input.addEventListener("keydown", (evt) => {
+        if (evt.key !== "Enter") return;
+        evt.preventDefault();
+        action();
+      });
+    });
+    drawPresets("");
   }
 
   /* Rebuild the context boxes: one non-compound "ctx" node per SG / tag value / root,
@@ -553,11 +793,39 @@
   }
 
   // Export edge type: the evidence style in the Extended view, else the edge type.
+  // IP view: a VPC -> Transit Gateway edge is configured evidence (route / attachment).
   function exportType(type, evidence) {
+    if (type === "tgw") return "ev_configured";
     return extended ? "ev_" + (evidence || "configured") : type;
   }
 
-  function syncEdges(cy, edges) {
+  /* Transit Gateway edges (data.tgw) as drawn: an attachment ENI's end ("res:<ENI>")
+     follows its node like any edge (its collapsed group; none when filtered out), a
+     subnet's end goes with its box; edges between the same two nodes merged. */
+  function visibleTgwEdges(cy, tgwEdges, expandAll) {
+    const end = (id) => {
+      if (id.startsWith("res:")) return endpointId(cy, id.slice(4), expandAll);
+      const n = cy.getElementById(id);
+      return n.empty() || n.hasClass("filtered") ? null : id;
+    };
+    const merged = new Map();
+    (tgwEdges || []).forEach((e) => {
+      const s = end(e.source);
+      const t = end(e.target);
+      if (!s || !t) return;
+      const m = merged.get(`${s}|${t}`);
+      if (m) {
+        m.n += 1;
+        m.title += "\n" + e.title;
+      } else {
+        merged.set(`${s}|${t}`, { id: e.id, type: e.type, source: s, target: t, label: e.label, title: e.title, n: 1 });
+      }
+    });
+    return Array.from(merged.values());
+  }
+
+  // ``tgwEdges``: the Transit Gateway edges (data.tgw), whatever the edge type boxes.
+  function syncEdges(cy, edges, tgwEdges) {
     const items = visibleEdges(cy, edges, enabledEdgeTypes());
     cy.batch(() => {
       cy.edges().remove();
@@ -573,7 +841,50 @@
         },
         classes: "edge-" + m.type,
       })));
+      cy.add(visibleTgwEdges(cy, tgwEdges).map((e) => ({
+        group: "edges",
+        data: {
+          id: "edge:" + e.id, etype: e.type, source: e.source, target: e.target,
+          label: edgeLabel(e), title: e.title,
+        },
+        classes: "edge-tgw",
+      })));
     });
+  }
+
+  /* IP view: Transit Gateways in a column to the right of everything else (the VPC
+     box), whatever the layout. */
+  function placeTgw(cy) {
+    const gws = cy.nodes(".tgw");
+    if (gws.empty()) return;
+    const rest = cy.nodes(":visible").not(".tgw");
+    const box = rest.nonempty()
+      ? rest.boundingBox({ includeLabels: true, useCache: false })
+      : { x1: 0, x2: 0, y1: 0 };
+    cy.batch(() => {
+      gws.forEach((n, i) => {
+        n.position({ x: box.x2 + BLOCK_GAP_X + TEXT_W.res / 2, y: box.y1 + ICON + i * CELL_H });
+      });
+    });
+  }
+
+  /* IP view: no Extended crawl yet, or the AccessDenied warnings of DescribeRouteTables /
+     DescribeTransitGatewayAttachments (discovery's and the crawl's). */
+  function showTgwNote(tgw) {
+    const el = document.getElementById("tgw-note");
+    if (!el || !tgw) return;
+    const warnings = tgw.warnings || [];
+    el.replaceChildren(tgw.note || "");
+    if (warnings.length) {
+      const list = document.createElement("ul");
+      list.append(...warnings.map((w) => {
+        const li = document.createElement("li");
+        li.textContent = w;
+        return li;
+      }));
+      el.append(list);
+    }
+    el.hidden = !tgw.note && !warnings.length;
   }
 
   // -- extended view: scene (lanes, groups), drawn edges, focus ------------------------
@@ -681,7 +992,7 @@
       group: "nodes",
       data: {
         id: id, parent: parent, order: order, label: groupLabel(g, false), title: groupTitle(g),
-        expanded: false, icon: iconBase + g.icon, iconFile: g.icon, raw: g,
+        expanded: false, icon: iconUrl(g.icon), iconFile: g.icon, raw: g,
       },
       classes: "group",
     };
@@ -806,8 +1117,8 @@
     }
   }
 
-  // Service and environment filters: unticked services / environments disappear, and
-  // with them a group of only those.
+  // Service, environment and tag filters: unticked services / environments and resources
+  // left out by a tag filter disappear, and with them a group of only those.
   function applyServiceFilter(cy) {
     const off = new Set(Array.from(document.querySelectorAll('input[name="service"]'))
       .filter((b) => !b.checked).map((b) => b.value));
@@ -815,12 +1126,13 @@
     const envGone = (n) => envs.has((n.data("raw") || {}).environment || "");
     cy.batch(() => {
       cy.nodes(".ext").forEach((n) => { n.toggleClass("filtered", off.has(n.data("service")) || envGone(n)); });
-      cy.nodes(".res").forEach((n) => { n.toggleClass("filtered", envGone(n)); });
+      cy.nodes(".res").forEach((n) => { n.toggleClass("filtered", envGone(n) || tagGone(n)); });
       cy.nodes(".group").forEach((g) => {
         const gone = groupMembers(cy, g).every((m) => m.hasClass("filtered"));
         g.toggleClass("filtered", gone);
         if (g.hasClass("svc")) cy.getElementById("box:" + g.id()).toggleClass("filtered", gone);
       });
+      applyContainers(cy);
     });
   }
 
@@ -1154,8 +1466,9 @@
       .sort((a, b) => a.data("order") - b.data("order"));
   }
 
+  // Transit Gateways (IP view) are placed by placeTgw.
   function shownInLayout(n) {
-    return n.visible() && !n.hasClass("ctx") && !n.hasClass("pin");
+    return n.visible() && !n.hasClass("ctx") && !n.hasClass("pin") && !n.hasClass("tgw");
   }
 
   // Layout order: the data's order, then (Extended view) source -> compute -> target
@@ -1265,7 +1578,8 @@
 
     // IP view only; the Extended view has its own left-to-right layout (extLayout).
     const leaves = [];
-    cy.nodes().filter((n) => !n.hasClass("hidden") && !n.hasClass("ctx") && !n.hasClass("filtered")).forEach((n) => {
+    cy.nodes().filter((n) => !n.hasClass("hidden") && !n.hasClass("ctx") && !n.hasClass("filtered") &&
+      !n.hasClass("tgw")).forEach((n) => {
       if (n.isParent()) {
         g.setNode(n.id(), {});
       } else {
@@ -1277,7 +1591,8 @@
     });
 
     const link = (a, b, weight) => g.setEdge(a, b, { weight: weight, minlen: 1 }, `${a}>${b}`);
-    const subnets = cy.nodes(".subnet").sort((a, b) => a.data("order") - b.data("order"));
+    const subnets = cy.nodes(".subnet").filter((n) => !n.hasClass("filtered"))
+      .sort((a, b) => a.data("order") - b.data("order"));
     const tops = [];     // first layout node of each subnet
     const bottoms = [];  // last layout node of each subnet
     subnets.forEach((sn) => {
@@ -1418,7 +1733,7 @@
      ``expand`` ("Expand all groups") a collapsed group also carries its members and
      the edges go to the members; the server lays the members out in place of the
      group box (iplens.diagram.expand_groups). An expanded group's header is left out. */
-  function currentView(cy, dataEdges, expand) {
+  function currentView(cy, dataEdges, expand, tgwEdges) {
     const nodes = [];
     cy.nodes().filter((n) => n.visible() && !n.hasClass("pin")).forEach((n) => {
       const kind = nodeKind(n);
@@ -1454,7 +1769,12 @@
         target: m.target,
         type: exportType(m.type, m.evidence),
         label: edgeLabel(m),
-      }))
+      })).concat(visibleTgwEdges(cy, tgwEdges, true).map((m) => ({
+        source: m.source,
+        target: m.target,
+        type: exportType("tgw"),
+        label: edgeLabel(m),
+      })))
       : cy.edges().filter((e) => e.visible()).map((e) => ({
         source: e.source().id(),
         target: e.target().id(),
@@ -1647,6 +1967,8 @@
       "text-background-opacity": 0.85, "text-background-padding": 2,
     } },
     { selector: "edge.edge-targets", style: { "line-color": "#2457c5", "target-arrow-color": "#2457c5" } },
+    // IP view: VPC -> Transit Gateway, styled like configured evidence (ev-configured).
+    { selector: "edge.edge-tgw", style: { "line-color": "#2457c5", "target-arrow-color": "#2457c5" } },
     { selector: "edge.edge-ecs_lb", style: { "line-color": "#2f8f4e", "target-arrow-color": "#2f8f4e" } },
     { selector: "edge.edge-sg", style: {
       "line-style": "dashed", "line-dash-pattern": [6, 4], "width": 1.2, "line-color": "#8a94a3",
@@ -1695,7 +2017,8 @@
     const title = evt.target.data("title");
     if (!title) return;
     tip.textContent = title;
-    const pos = evt.renderedPosition || evt.target.renderedPosition();
+    const pos = evt.renderedPosition ||
+      (evt.target.isEdge() ? evt.target.renderedMidpoint() : evt.target.renderedPosition());
     tip.style.left = `${container.offsetLeft + pos.x + 14}px`;
     tip.style.top = `${container.offsetTop + pos.y + 14}px`;
     tip.hidden = false;
@@ -1731,7 +2054,8 @@
     let focused = null;  // IP view: id of the node whose edges are highlighted
     let drawnCount = 0;
     const refreshEdges = () => {
-      syncEdges(cy, edges);  // re-adds every edge, so the highlight is re-applied
+      // Re-adds every edge, so the highlight is re-applied.
+      syncEdges(cy, edges, data.tgw && data.tgw.edges);
       applyFocus(cy, focused);
     };
     const refreshContext = () => syncContext(cy, data);
@@ -1749,6 +2073,7 @@
         applyEnvFilterIp(cy);
         refreshEdges();
         runLayout(cy, edges);
+        placeTgw(cy);
         applySaved(cy);
       }
       refreshContext();
@@ -1801,6 +2126,10 @@
       },
     );
     refreshEnvFilters();
+    setupTagFilters(data, () => {
+      if (ext) applyServiceFilter(cy);
+      relayout();
+    });
     if (ext) applyServiceFilter(cy);
     relayout();
     fitShown(true);
@@ -1901,6 +2230,9 @@
         relayout();
         saveExpanded();
       });
+      // Touch screens have no hover: a tap on a Transit Gateway edge shows its lines.
+      cy.on("onetap", "edge.edge-tgw", showTip);
+      showTgwNote(data.tgw);
       cy.on("onetap", (evt) => {
         if (evt.target !== cy || !focused) return;
         focused = null;
@@ -1992,7 +2324,9 @@
       savePrefs({ shorten_names: shortenBox.checked ? "1" : "0" });
     });
     // The Extended view exports exactly what is drawn (focus, groups, filters).
-    const exportView = () => currentView(cy, edges, !ext && expandExportBox && expandExportBox.checked);
+    const exportView = () => currentView(
+      cy, edges, !ext && expandExportBox && expandExportBox.checked, data.tgw && data.tgw.edges,
+    );
     document.getElementById("export-svg").addEventListener("click", () => {
       download(container.dataset.exportSvg, exportView());
     });
