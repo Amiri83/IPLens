@@ -61,7 +61,7 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 # Progress steps of one collection (see Collector._step).
-COLLECT_STEPS = 22
+COLLECT_STEPS = 24
 # tag:GetResources page size (the API maximum).
 _TAG_PAGE = 100
 # CloudTrail events read per looked-up resource.
@@ -85,6 +85,10 @@ MANAGED_SOURCES: dict[str, tuple[str, ...]] = {
 # Scale headroom (iplens.headroom): Auto Scaling groups and ECS service maximums.
 ASG_RESOURCE = "autoscaling:DescribeAutoScalingGroups"
 SCALABLE_TARGETS_RESOURCE = "application-autoscaling:DescribeScalableTargets"
+# Transit Gateway links of the Visual page's IP view (iplens.extgraph.tgw_links).
+TGW_ATTACHMENTS_RESOURCE = "ec2:DescribeTransitGatewayAttachments"
+ROUTE_TABLES_RESOURCE = "ec2:DescribeRouteTables"
+TGW_RESOURCES = (TGW_ATTACHMENTS_RESOURCE, ROUTE_TABLES_RESOURCE)
 RESOURCES = (
     "sts:GetCallerIdentity",
     "iam:ListAccountAliases",
@@ -96,6 +100,7 @@ RESOURCES = (
     "elasticloadbalancing:DescribeTargetGroups",
     "elasticloadbalancing:DescribeTargetHealth",
     "ec2:DescribeSecurityGroups",
+    *TGW_RESOURCES,
     "ECS services and tasks",
     ASG_RESOURCE,
     SCALABLE_TARGETS_RESOURCE,
@@ -166,6 +171,8 @@ _MERGED: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
         ("own_resources", "own_tags"),
         (),
     ),
+    (frozenset({TGW_ATTACHMENTS_RESOURCE}), ("tgw_attachments",), ()),
+    (frozenset({ROUTE_TABLES_RESOURCE}), ("route_tables", "tgw_routes"), ()),
     (frozenset({ASG_RESOURCE}), ("asgs",), ()),
     (frozenset({SCALABLE_TARGETS_RESOURCE}), ("ecs_scalable_targets",), ()),
     *(
@@ -468,6 +475,42 @@ def asg_rows(groups: Iterable[dict[str, Any]]) -> list[tuple[str, int, int, int,
                 json.dumps(instances),
             )
         )
+    return sorted(out)
+
+
+RouteTableRow = tuple[str, str, int, str]
+
+
+def route_table_rows(
+    tables: Iterable[dict[str, Any]],
+) -> list[tuple[RouteTableRow, list[tuple[str, str, str]]]]:
+    """``((route table id, VPC id, is main, subnet ids JSON), [(destination, TGW id,
+    state), ...])`` of every route table: its explicitly associated subnets and its
+    routes to a Transit Gateway (destination: a CIDR, or a prefix list id)."""
+    out = []
+    for rt in tables:
+        assoc = rt.get("Associations", []) or []
+        subnets = sorted({a["SubnetId"] for a in assoc if a.get("SubnetId")})
+        routes = sorted(
+            {
+                (dest, r["TransitGatewayId"], r.get("State") or "")
+                for r in rt.get("Routes", []) or []
+                if r.get("TransitGatewayId")
+                and (
+                    dest := r.get("DestinationCidrBlock")
+                    or r.get("DestinationIpv6CidrBlock")
+                    or r.get("DestinationPrefixListId")
+                    or ""
+                )
+            }
+        )
+        row = (
+            rt["RouteTableId"],
+            rt.get("VpcId") or "",
+            int(any(a.get("Main") for a in assoc)),
+            json.dumps(subnets),
+        )
+        out.append((row, routes))
     return sorted(out)
 
 
@@ -845,6 +888,20 @@ class Collector:
             "ec2:DescribeSecurityGroups",
             lambda: _paginate(ec2, "describe_security_groups", "SecurityGroups"),
         )
+        self._step(TGW_ATTACHMENTS_RESOURCE)
+        tgw_attachments = self._optional(
+            result,
+            TGW_ATTACHMENTS_RESOURCE,
+            lambda: _paginate(
+                ec2, "describe_transit_gateway_attachments", "TransitGatewayAttachments"
+            ),
+        )
+        self._step(ROUTE_TABLES_RESOURCE)
+        route_tables = self._optional(
+            result,
+            ROUTE_TABLES_RESOURCE,
+            lambda: _paginate(ec2, "describe_route_tables", "RouteTables"),
+        )
         self._step("ECS services and tasks")
         ecs = self._collect_ecs(result)
         self._step(ASG_RESOURCE)
@@ -1166,6 +1223,36 @@ class Collector:
                     ),
                 )
 
+        def write_tgw_attachments(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                "INSERT OR IGNORE INTO tgw_attachments(snapshot_id, attachment_id, tgw_id, "
+                "resource_type, resource_id, state) VALUES(?,?,?,?,?,?)",
+                [
+                    (
+                        snap_id,
+                        a["TransitGatewayAttachmentId"],
+                        a["TransitGatewayId"],
+                        a.get("ResourceType"),
+                        a.get("ResourceId"),
+                        a.get("State"),
+                    )
+                    for a in tgw_attachments
+                ],
+            )
+
+        def write_route_tables(conn: sqlite3.Connection) -> None:
+            for row, routes in route_table_rows(route_tables):
+                conn.execute(
+                    "INSERT OR IGNORE INTO route_tables(snapshot_id, route_table_id, vpc_id, "
+                    "is_main, subnet_ids) VALUES(?,?,?,?,?)",
+                    (snap_id, *row),
+                )
+                conn.executemany(
+                    "INSERT OR IGNORE INTO tgw_routes(snapshot_id, route_table_id, "
+                    "destination, tgw_id, state) VALUES(?,?,?,?,?)",
+                    [(snap_id, row[0], *r) for r in routes],
+                )
+
         def write_tags(conn: sqlite3.Connection) -> None:
             conn.executemany(
                 "INSERT OR IGNORE INTO resource_tags(snapshot_id, resource_type, resource_id, "
@@ -1212,6 +1299,8 @@ class Collector:
             ("elasticloadbalancing:DescribeTargetHealth", False, write_lb_targets),
             ("ECS services and tasks", False, write_ecs),
             ("ec2:DescribeSecurityGroups", False, write_security_groups),
+            (TGW_ATTACHMENTS_RESOURCE, False, write_tgw_attachments),
+            (ROUTE_TABLES_RESOURCE, False, write_route_tables),
             (ASG_RESOURCE, False, write_asgs),
             (SCALABLE_TARGETS_RESOURCE, False, write_scalable_targets),
             *((MANAGED_SOURCES[s][0], False, write_managed(s)) for s in MANAGED_SOURCES),

@@ -4,25 +4,35 @@
 
 ### Added
 
-- **Visual → Tag filters** (IP and Extended view): choose a resource type, a tag key (suggested
-  from the tags found on that type) and one or more of its values, ticked in a checkbox list (a
-  plain click or tap toggles a value; Select all / Select none; touch-sized on mobile). An ENI
-  shared by several Lambda functions matches a value of any of its functions (its displayed tags
-  stay the first function's). A filter only affects its own
-  resource type; its values are OR'd, several filters on one type are AND'd; tag keys match in
-  any case, values exactly. Resources without the key are hidden unless **Include untagged**
-  (off by default). Active filters show as removable chips, with "X of Y shown" per resource
-  type. VPC and subnet boxes are always drawn, unless **Hide empty containers** (off by default)
-  is ticked. Filtering runs in the browser over the data already loaded (no new discovery).
-  Compliance rules, findings, suggestions and data exports always use every resource; the
-  diagram's SVG / draw.io export still contains the diagram as shown.
-- Named tag filter presets, saved per account in the database: save (overwrites a preset of the
-  same name, including its "Hide empty containers" choice), load and delete.
-- **Visual → IP view: Transit Gateways.** With an Extended crawl, the Transit Gateways a VPC routes
-  to / is attached to are drawn outside the VPC box, linked to it by one line whose tooltip lists
-  every route and attachment line. Without a crawl a note says "Run Extended crawl to see Transit
-  Gateway links"; AccessDenied warnings of the crawl's DescribeRouteTables /
-  DescribeTransitGatewayAttachments are listed in that note.
+- **Visual → Tag filters** (IP and Extended view): choose a tag key (suggested from the tags
+  found on every resource) and one or more of its values, ticked in a checkbox list (a plain
+  click or tap toggles a value; Select all / Select none; touch-sized on mobile). A filter applies
+  to every resource node, whatever its type. An ENI shared by several Lambda functions matches a
+  value of any of its functions (its displayed tags stay the first function's). A filter's values
+  are OR'd, several filters are AND'd; tag keys match in any case, values exactly. Resources
+  without the key are hidden unless **Include untagged** (off by default). Active filters show as
+  removable chips, with "X of Y shown" in total and per resource type. VPC and subnet boxes are
+  always drawn, unless **Hide empty containers** (off by default) is ticked. Filtering runs in
+  the browser over the data already loaded (no new discovery). Compliance rules, findings,
+  suggestions and data exports always use every resource; the diagram's SVG / draw.io export
+  still contains the diagram as shown.
+- **Visual → name filter**: comma-separated terms (e.g. `dev, nonprod`), matched in any case as
+  a substring of a resource's name, of every owner's name (all functions of a shared Lambda ENI)
+  or of its ENI id; terms are OR'd, and the name filter is AND'd with the tag filters. Shown as a
+  removable chip and saved in presets.
+- Named view filter presets, saved per account in the database: save (overwrites a preset of the
+  same name, including its name filter and "Hide empty containers" choice), load and delete.
+- **Visual → IP view: Transit Gateways from every Refresh.** Discovery also calls
+  `ec2:DescribeTransitGatewayAttachments` and `ec2:DescribeRouteTables` (optional: a denied call
+  is a Refresh warning), stored per snapshot. Transit Gateway attachment ENIs are a resource type
+  of their own ("TGW attachment", with a Transit Gateway icon) instead of "ENI/other". The IP view
+  draws one node per Transit Gateway outside the VPC box, an edge from each attachment ENI to its
+  gateway (labelled with the attachment id and state) and from each subnet whose route table
+  routes to it (tooltip: destination CIDRs / prefix lists and the route table id), without an
+  Extended crawl. With a crawl its VPC → gateway lines are merged in, without the routes and
+  attachments discovery already draws. A note below the diagram suggests the crawl when there is
+  none, and lists the AccessDenied / UnauthorizedOperation warnings of DescribeRouteTables /
+  DescribeTransitGatewayAttachments from discovery and from the crawl.
 
 ## 1.3.1 – 2026-10-22
 

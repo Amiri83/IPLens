@@ -81,7 +81,27 @@ from iplens.attribution import attribute_eni
             "other",
             "EFS",
         ),
-        ({"InterfaceType": "transit_gateway"}, "other", "transit_gateway"),
+        # Transit Gateway attachment ENIs: their own type, the attachment id as the ref
+        ({"InterfaceType": "transit_gateway"}, "tgw_attachment", ""),
+        (
+            {
+                "InterfaceType": "transit_gateway",
+                "RequesterManaged": True,
+                "Description": "Network Interface for Transit Gateway Attachment "
+                "tgw-attach-0abc1234",
+            },
+            "tgw_attachment",
+            "tgw-attach-0abc1234",
+        ),
+        (
+            {
+                "InterfaceType": "interface",
+                "Description": "Network Interface for Transit Gateway Attachment "
+                "tgw-attach-0abc5678",
+            },
+            "tgw_attachment",
+            "tgw-attach-0abc5678",
+        ),
         # both NAT InterfaceType spellings
         (
             {"InterfaceType": "natGateway", "Description": "Interface for NAT Gateway nat-0abc123"},

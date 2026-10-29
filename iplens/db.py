@@ -169,6 +169,38 @@ CREATE TABLE IF NOT EXISTS ecs_scalable_targets (
     PRIMARY KEY (snapshot_id, cluster, service)
 );
 
+-- Transit Gateway attachments (ec2:DescribeTransitGatewayAttachments): the IP view's
+-- attachment ENI -> Transit Gateway links.
+CREATE TABLE IF NOT EXISTS tgw_attachments (
+    snapshot_id   INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    attachment_id TEXT NOT NULL,
+    tgw_id        TEXT NOT NULL,
+    resource_type TEXT,             -- vpc | vpn | peering | direct-connect-gateway | ...
+    resource_id   TEXT,
+    state         TEXT,
+    PRIMARY KEY (snapshot_id, attachment_id)
+);
+
+-- VPC route tables (ec2:DescribeRouteTables): their subnets, and their routes to a
+-- Transit Gateway (the IP view's subnet -> Transit Gateway links).
+CREATE TABLE IF NOT EXISTS route_tables (
+    snapshot_id    INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    route_table_id TEXT NOT NULL,
+    vpc_id         TEXT,
+    is_main        INTEGER NOT NULL DEFAULT 0,
+    subnet_ids     TEXT,            -- JSON list of explicitly associated subnets
+    PRIMARY KEY (snapshot_id, route_table_id)
+);
+
+CREATE TABLE IF NOT EXISTS tgw_routes (
+    snapshot_id    INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
+    route_table_id TEXT NOT NULL,
+    destination    TEXT NOT NULL,   -- IPv4 / IPv6 CIDR or prefix list id
+    tgw_id         TEXT NOT NULL,
+    state          TEXT,
+    PRIMARY KEY (snapshot_id, route_table_id, destination)
+);
+
 CREATE TABLE IF NOT EXISTS ecs_task_enis (
     snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
     eni_id      TEXT NOT NULL,
@@ -468,6 +500,7 @@ CREATE TABLE IF NOT EXISTS visual_filter_presets (
     name        TEXT NOT NULL,
     filters     TEXT NOT NULL,      -- JSON list of tag filters (tagfilter.TagFilter)
     hide_empty  INTEGER NOT NULL DEFAULT 0,
+    name_filter TEXT NOT NULL DEFAULT '',  -- comma-separated name terms
     PRIMARY KEY (account_ref, name)
 );
 
@@ -566,6 +599,7 @@ _ADDED_COLUMNS = (
     ("ecs_services", "subnet_ids", "TEXT"),
     ("ecs_services", "max_percent", "INTEGER"),
     ("ecs_services", "deployment_controller", "TEXT"),
+    ("visual_filter_presets", "name_filter", "TEXT NOT NULL DEFAULT ''"),
 )
 
 # Single-account settings rows from before multi-account support.

@@ -1,14 +1,13 @@
-"""Visual page tag filters: which resource nodes, subnets and VPC boxes are drawn.
+"""Visual page view filters: which resource nodes, subnets and VPC boxes are drawn.
 
 The Visual page filters in the browser, over the data it already loaded (nothing is
 re-discovered); ``static/tagfilter.js`` mirrors these functions one by one and
 tests/test_tagfilter.py runs both on the same input. Only the diagram is filtered:
 compliance rules, findings, suggestions and data exports always see every resource.
 
-A filter is ``{resource_type, tag_key, values, include_untagged}``:
+A tag filter is ``{tag_key, values, include_untagged}`` and applies to every resource
+node, whatever its type:
 
-- it affects only resources of its ``resource_type`` (a node's ``type``, e.g. "ec2");
-  other types are drawn as without filters;
 - a resource matches when one of its tags has the key ``tag_key`` (case-insensitive)
   and a value in ``values`` (exact): values are OR'd. A resource's tags for filtering
   are its ``tag_values`` (``{key: [values]}``: every value of the ENI and of all its
@@ -16,7 +15,11 @@ A filter is ``{resource_type, tag_key, values, include_untagged}``:
   else its ``tags``;
 - a resource without that tag key is "untagged" for the filter and matches only with
   ``include_untagged`` (default false);
-- every filter on a type must match (filters on the same type are AND'd).
+- every filter must match (filters are AND'd).
+
+The name filter is a text of comma-separated terms: a resource matches when one term
+(OR'd) is a case-insensitive substring of its name, of one of its owners' names (every
+function of a shared Lambda ENI) or of its ENI id. It is AND'd with the tag filters.
 
 VPC and subnet boxes are always drawn, unless "hide empty containers" is on: then a
 subnet without a shown resource is hidden, and the VPC when none of its subnets is shown.
@@ -31,14 +34,13 @@ from typing import Any
 
 MAX_FILTERS = 50
 MAX_VALUES = 200
-MAX_TYPE = 64
 MAX_KEY = 128
 MAX_VALUE = 256
+MAX_NAME_FILTER = 512
 
 
 @dataclass(frozen=True)
 class TagFilter:
-    resource_type: str
     tag_key: str
     values: tuple[str, ...] = ()
     include_untagged: bool = False
@@ -55,7 +57,8 @@ def _text(doc: Mapping[str, Any], field: str, limit: int) -> str:
 
 
 def parse_filter(doc: Any) -> TagFilter:
-    """One filter from its JSON object; raises ValueError when it is not valid."""
+    """One filter from its JSON object; raises ValueError when it is not valid. A
+    ``resource_type`` (presets saved before filters applied to every type) is ignored."""
     if not isinstance(doc, dict):
         raise ValueError("a filter must be a JSON object")
     values = doc.get("values", [])
@@ -69,7 +72,6 @@ def parse_filter(doc: Any) -> TagFilter:
     if not values and not untagged:
         raise ValueError("a filter needs at least one value or include_untagged")
     return TagFilter(
-        resource_type=_text(doc, "resource_type", MAX_TYPE),
         tag_key=_text(doc, "tag_key", MAX_KEY),
         values=tuple(dict.fromkeys(values)),  # values match exactly: no stripping
         include_untagged=untagged,
@@ -90,6 +92,14 @@ def parse_filters(raw: str | list[Any] | None) -> list[TagFilter]:
     if len(raw) > MAX_FILTERS:
         raise ValueError(f"at most {MAX_FILTERS} filters")
     return [parse_filter(doc) for doc in raw]
+
+
+def parse_name_filter(raw: str | None) -> str:
+    """The name filter text as saved (stripped); raises ValueError when too long."""
+    text = (raw or "").strip()
+    if len(text) > MAX_NAME_FILTER:
+        raise ValueError(f"the name filter is at most {MAX_NAME_FILTER} characters")
+    return text
 
 
 Tags = Mapping[str, str | list[str]]
@@ -121,13 +131,27 @@ def matches(flt: TagFilter, tags: Tags | None) -> bool:
     return any(v in flt.values for v in found)
 
 
-def resource_visible(resource: Mapping[str, Any], filters: Iterable[TagFilter]) -> bool:
-    """True if every filter on the resource's type matches it (no filter: True)."""
-    return all(
-        matches(f, filter_tags(resource))
-        for f in filters
-        if f.resource_type == resource.get("type")
-    )
+def name_terms(text: str | None) -> list[str]:
+    """The lower-cased, non-empty comma-separated terms of a name filter."""
+    return [t for t in (p.strip().lower() for p in (text or "").split(",")) if t]
+
+
+def name_matches(resource: Mapping[str, Any], terms: list[str]) -> bool:
+    """True if a term is part of the resource's name, an owner's name or its ENI id (no
+    term: True)."""
+    if not terms:
+        return True
+    fields = [resource.get("name"), *(resource.get("owners") or []), resource.get("eni_id")]
+    texts = [f.lower() for f in fields if f]
+    return any(t in f for t in terms for f in texts)
+
+
+def resource_visible(
+    resource: Mapping[str, Any], filters: Iterable[TagFilter], name: str = ""
+) -> bool:
+    """True if every tag filter and the name filter match the resource (none: True)."""
+    tags = filter_tags(resource)
+    return all(matches(f, tags) for f in filters) and name_matches(resource, name_terms(name))
 
 
 def type_counts(
@@ -159,17 +183,13 @@ def hidden_containers(
     return {"subnets": empty, "vpc": len(empty) == len(subnets)}
 
 
-def discovered_tags(resources: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, list[str]]]:
-    """``{type: {tag key: [values]}}`` offered by the filter panel. Keys differing only in
-    case are one entry, spelled as first seen; values are sorted."""
-    out: dict[str, dict[str, set[str]]] = {}
-    spelling: dict[tuple[str, str], str] = {}
+def discovered_tags(resources: Iterable[Mapping[str, Any]]) -> dict[str, list[str]]:
+    """``{tag key: [values]}`` over every resource, offered by the filter panel. Keys
+    differing only in case are one entry, spelled as first seen; values are sorted."""
+    out: dict[str, set[str]] = {}
+    spelling: dict[str, str] = {}
     for r in resources:
-        keys = out.setdefault(r["type"], {})
         for k, v in filter_tags(r).items():
-            key = spelling.setdefault((r["type"], k.lower()), k)
-            keys.setdefault(key, set()).update(v if isinstance(v, list) else [v])
-    return {
-        t: {k: sorted(vs) for k, vs in sorted(keys.items(), key=lambda kv: kv[0].lower())}
-        for t, keys in sorted(out.items())
-    }
+            key = spelling.setdefault(k.lower(), k)
+            out.setdefault(key, set()).update(v if isinstance(v, list) else [v])
+    return {k: sorted(vs) for k, vs in sorted(out.items(), key=lambda kv: kv[0].lower())}

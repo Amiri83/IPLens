@@ -1,4 +1,4 @@
-/* IPLens Visual page tag filters: mirrors iplens/tagfilter.py function by function
+/* IPLens Visual page view filters: mirrors iplens/tagfilter.py function by function
    (tests/test_tagfilter.py runs both on the same input). Pure functions, no DOM: loaded
    by the Visual page as window.IPLensTagFilter, or required by node. */
 (function (root, factory) {
@@ -31,8 +31,23 @@
     return found.some((v) => flt.values.includes(v));
   }
 
-  function resourceVisible(resource, filters) {
-    return filters.every((f) => f.resource_type !== resource.type || matches(f, filterTags(resource)));
+  // Lower-cased, non-empty comma-separated terms of the name filter.
+  function nameTerms(text) {
+    return (text || "").split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
+  }
+
+  // A term is part of the name, an owner's name or the ENI id (no term: true).
+  function nameMatches(resource, terms) {
+    if (!terms.length) return true;
+    const texts = [resource.name, ...(resource.owners || []), resource.eni_id]
+      .filter(Boolean).map((f) => f.toLowerCase());
+    return terms.some((t) => texts.some((f) => f.includes(t)));
+  }
+
+  // Every tag filter (any resource type) and the name filter must match.
+  function resourceVisible(resource, filters, name) {
+    const tags = filterTags(resource);
+    return filters.every((f) => matches(f, tags)) && nameMatches(resource, nameTerms(name));
   }
 
   // {type: [shown, total]}; shown(resource) -> bool.
@@ -58,29 +73,29 @@
     return x < y ? -1 : x > y ? 1 : 0;
   }
 
-  // {type: {tag key: [values]}}: keys differing only in case are one, spelled as first seen.
+  // {tag key: [values]} over every resource: keys differing only in case are one,
+  // spelled as first seen.
   function discoveredTags(resources) {
     const out = {};
     const spelling = new Map();
     resources.forEach((r) => {
-      const keys = out[r.type] || (out[r.type] = {});
       Object.entries(filterTags(r)).forEach(([k, v]) => {
-        const id = `${r.type}\u0000${k.toLowerCase()}`;
+        const id = k.toLowerCase();
         if (!spelling.has(id)) spelling.set(id, k);
         const key = spelling.get(id);
-        const set = keys[key] || (keys[key] = new Set());
+        const set = out[key] || (out[key] = new Set());
         (Array.isArray(v) ? v : [v]).forEach((x) => set.add(x));
       });
     });
-    return Object.fromEntries(Object.keys(out).sort().map((t) => [t, Object.fromEntries(
-      Object.keys(out[t]).sort(byLower).map((k) => [k, Array.from(out[t][k]).sort()]),
-    )]));
+    return Object.fromEntries(Object.keys(out).sort(byLower).map((k) => [k, Array.from(out[k]).sort()]));
   }
 
   return {
     filterTags: filterTags,
     keyValues: keyValues,
     matches: matches,
+    nameTerms: nameTerms,
+    nameMatches: nameMatches,
     resourceVisible: resourceVisible,
     typeCounts: typeCounts,
     hiddenContainers: hiddenContainers,

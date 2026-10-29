@@ -112,8 +112,8 @@
   {# No "name" attributes: the tag filters never become part of the page URL. #}
   <fieldset class="edge-filters tag-filters" id="tag-filters">
     <legend>Tag filters</legend>
-    <select id="tf-type" aria-label="Resource type"><option value="">(resource type)</option></select>
-    <input id="tf-key" list="tf-keys" placeholder="tag key" aria-label="Tag key" autocomplete="off" maxlength="128" disabled>
+    <input id="tf-name" placeholder="name contains, e.g. dev, nonprod" aria-label="Name filter: comma-separated terms" title="Shows resources whose name, owner name or ENI id contains one of the comma-separated terms (any case)" autocomplete="off" maxlength="512">
+    <input id="tf-key" list="tf-keys" placeholder="tag key" aria-label="Tag key" autocomplete="off" maxlength="128">
     <datalist id="tf-keys"></datalist>
     {# One checkbox per value found for the key: a plain click / tap toggles it. #}
     <span class="tf-values" id="tf-values" role="group" aria-label="Tag values">
@@ -123,7 +123,7 @@
       </span>
       <span class="tf-values-list" id="tf-values-list"><span class="muted small">Choose a tag key to list its values.</span></span>
     </span>
-    <label class="edge-filter" title="Also show resources of this type without the tag key"><input type="checkbox" id="tf-untagged"> Include untagged</label>
+    <label class="edge-filter" title="Also show resources without the tag key"><input type="checkbox" id="tf-untagged"> Include untagged</label>
     <button type="button" class="secondary" id="tf-add" disabled>Add filter</button>
     <span class="tf-chips" id="tf-chips" aria-live="polite"></span>
     <label class="edge-filter" title="Hide subnets (and the VPC) with no resource shown inside"><input type="checkbox" id="tf-hide-empty"> Hide empty containers</label>
@@ -191,13 +191,17 @@
     IaC tag, Terraform, CloudTrail creator or unmanaged — see the Ownership page) or a team (the team
     tag key of Settings → Ownership). <b>Environment</b> shows only the ticked environments
     (from the Terraform root × environment mapping, else the environment tag set in Settings).
-    <b>Tag filters</b> show only the resources of a type whose tag (key in any case) has one of
-    the chosen values; resources without the key are hidden unless <b>Include untagged</b>, other
-    types are not affected, and several filters on one type must all match. VPC and subnet boxes
-    stay unless <b>Hide empty containers</b>. Filters only change this diagram (findings,
-    suggestions and data exports always cover every resource); save them as a named preset.
-    {% if not extended %}<b>Transit Gateways</b> found by the Extended crawl are drawn outside the
-    VPC box, linked to it by its routes and attachments (hover or tap the line for them).{% endif %}
+    <b>Tag filters</b> show only the resources (of every type) whose tag (key in any case) has one
+    of the chosen values; resources without the key are hidden unless <b>Include untagged</b>, and
+    several filters must all match. The <b>name filter</b> (comma-separated terms, any case) keeps
+    the resources whose name, owner name or ENI id contains one of the terms, together with the
+    tag filters. VPC and subnet boxes stay unless <b>Hide empty containers</b>. Filters only
+    change this diagram (findings, suggestions and data exports always cover every resource);
+    save them as a named preset.
+    {% if not extended %}<b>Transit Gateways</b> are drawn outside the VPC box: each attachment ENI
+    is linked to its gateway (attachment id and state), each subnet to the gateways its route
+    table routes to (hover or tap the line for the destinations); an Extended crawl adds its
+    route table propagations.{% endif %}
     Exports contain the diagram as currently shown; with <b>Expand all groups</b> (default) every
     collapsed group is exported as its member resources.
     {% if extended %}<br><b>Extended view:</b> one line per pair of nodes, styled by its strongest
@@ -267,7 +271,7 @@
   <h2 id="legend-title">Legend</h2>
   <div class="legend-grid">
     {% for label, icon in legend_icons %}
-      <span class="legend-item"><img src="{{ url_for('static', filename='icons/aws/' ~ icon) }}" alt="" width="22" height="22"> {{ label }}</span>
+      <span class="legend-item"><img src="{{ url_for('static', filename=('icons/' if icon.startswith('ext/') else 'icons/aws/') ~ icon) }}" alt="" width="22" height="22"> {{ label }}</span>
     {% endfor %}
   </div>
   <div class="legend-grid">

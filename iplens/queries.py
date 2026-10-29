@@ -665,10 +665,12 @@ VISUAL_TYPE_ORDER = (
     "rds",
     "elasticache",
     "opensearch",
+    "tgw_attachment",
     "other",
 )
 
-# Files under static/icons/aws/ (official AWS Architecture Icons).
+# Files under static/icons/aws/ (official AWS Architecture Icons); an "ext/" name is a
+# self-drawn badge under static/icons/ (the Transit Gateway family has no resource icon).
 VPC_ICON = "Virtual-private-cloud-VPC_32.svg"
 TYPE_ICONS = {
     "vpc_endpoint": "Res_Amazon-VPC_Endpoints_48.svg",
@@ -680,6 +682,7 @@ TYPE_ICONS = {
     "rds": "Arch_Amazon-RDS_48.svg",
     "elasticache": "Arch_Amazon-ElastiCache_48.svg",
     "opensearch": "Arch_Amazon-OpenSearch-Service_48.svg",
+    "tgw_attachment": "ext/tgw-attachment.svg",
     "other": "Res_Amazon-VPC_Elastic-Network-Interface_48.svg",
 }
 LB_ICONS = {
@@ -862,7 +865,7 @@ def visual_data(
             for sg in sorted({g for n in resources.values() for g in n["sgs"]})
         },
         "tag_keys": sorted({k for n in resources.values() for k in n["tags"]}),
-        # Resource types of the tag filter panel.
+        # Resource type labels of the view filters' "X of Y shown" counts.
         "type_labels": {
             t: labels.get(t, t) for t in sorted({n["type"] for n in resources.values()})
         },

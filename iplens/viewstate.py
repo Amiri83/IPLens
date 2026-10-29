@@ -10,7 +10,7 @@ import sqlite3
 from typing import Any
 
 from .declutter import DEFAULT_EVIDENCE, parse_evidence
-from .tagfilter import TagFilter, parse_filters
+from .tagfilter import TagFilter, parse_filters, parse_name_filter
 
 # Saved layouts are bounded: a VPC diagram with more nodes than this is not sensible.
 MAX_POSITIONS = 5000
@@ -245,21 +245,24 @@ def parse_preset_name(raw: str | None) -> str:
 
 
 def list_presets(conn: sqlite3.Connection, account_ref: int) -> list[dict[str, Any]]:
-    """Named tag filter presets of the account, by name: ``{name, filters, hide_empty}``."""
+    """Named view filter presets of the account, by name: ``{name, filters,
+    name_filter, hide_empty}`` (a filter's old ``resource_type`` is dropped)."""
     out = []
     for row in conn.execute(
-        "SELECT name, filters, hide_empty FROM visual_filter_presets WHERE account_ref=? "
-        "ORDER BY name COLLATE NOCASE, name",
+        "SELECT name, filters, hide_empty, name_filter FROM visual_filter_presets "
+        "WHERE account_ref=? ORDER BY name COLLATE NOCASE, name",
         (account_ref,),
     ):
         try:
             filters = parse_filters(row["filters"])
+            name_filter = parse_name_filter(row["name_filter"])
         except ValueError:  # written by a later version with other rules: skip it
             continue
         out.append(
             {
                 "name": row["name"],
                 "filters": [f.as_dict() for f in filters],
+                "name_filter": name_filter,
                 "hide_empty": bool(row["hide_empty"]),
             }
         )
@@ -272,17 +275,20 @@ def save_preset(
     name: str,
     filters: list[TagFilter],
     hide_empty: bool = False,
+    name_filter: str = "",
 ) -> None:
     """Store (or overwrite) the preset ``name``."""
     conn.execute(
-        "INSERT INTO visual_filter_presets(account_ref, name, filters, hide_empty) "
-        "VALUES(?,?,?,?) ON CONFLICT(account_ref, name) DO UPDATE SET "
-        "filters=excluded.filters, hide_empty=excluded.hide_empty",
+        "INSERT INTO visual_filter_presets(account_ref, name, filters, hide_empty, name_filter) "
+        "VALUES(?,?,?,?,?) ON CONFLICT(account_ref, name) DO UPDATE SET "
+        "filters=excluded.filters, hide_empty=excluded.hide_empty, "
+        "name_filter=excluded.name_filter",
         (
             account_ref,
             parse_preset_name(name),
             json.dumps([f.as_dict() for f in filters]),
             int(hide_empty),
+            parse_name_filter(name_filter),
         ),
     )
 

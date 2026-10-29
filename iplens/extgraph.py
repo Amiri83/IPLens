@@ -21,6 +21,8 @@ one edge per node pair, evidence filter, service / compute groups, focus mode.
 
 from __future__ import annotations
 
+import json
+import re
 import sqlite3
 from collections.abc import Iterator, Sequence
 from typing import Any
@@ -66,68 +68,191 @@ FLOW_NODES = {
 }
 
 
-# IP view: Transit Gateway links come from the Extended crawl.
-TGW_NO_CRAWL = "Run Extended crawl to see Transit Gateway links"
+# IP view: Transit Gateway links come from discovery (every Refresh calls
+# DescribeTransitGatewayAttachments and DescribeRouteTables); an Extended crawl adds
+# what discovery does not see (TGW route table propagations).
+TGW_NO_CRAWL = "Run Extended crawl to also see Transit Gateway route table propagations"
 TGW_SOURCES = ("ec2:DescribeRouteTables", "ec2:DescribeTransitGatewayAttachments")
 # Error codes of a denied call (EC2 answers UnauthorizedOperation).
 DENIED_CODES = ("AccessDenied", "UnauthorizedOperation")
+TGW_DENIED = "Transit Gateway links may be incomplete: {what} was denied access."
 
 
-def tgw_links(conn: sqlite3.Connection, snap_id: int, vpc_id: str) -> dict[str, Any]:
-    """The IP view's Transit Gateway part for one VPC: ``nodes`` (one per TGW the VPC
-    routes to, is attached to or propagates to, from the crawl's ``ext_edges``),
-    ``edges`` (VPC -> TGW, every evidence line kept), and ``note`` / ``warnings``: no
-    crawl yet, or the crawl was denied DescribeRouteTables /
-    DescribeTransitGatewayAttachments (the links may then be incomplete)."""
-    crawl = latest_crawl(conn, snap_id)
-    if crawl is None:
-        return {"nodes": [], "edges": [], "note": TGW_NO_CRAWL, "warnings": []}
-    warnings = [
+def _tgw_denials(warnings: Sequence[Any]) -> list[str]:
+    return [
         str(w)
-        for w in crawl["warnings"]
+        for w in warnings
         if str(w).startswith(TGW_SOURCES) and any(c in str(w) for c in DENIED_CODES)
     ]
-    lines: dict[str, list[dict[str, str]]] = {}
+
+
+def _tgw_line(label: str, text: str) -> dict[str, str]:
+    return {"evidence": "configured", "label": label, "text": text}
+
+
+def _discovered_tgw_lines(
+    conn: sqlite3.Connection, snap_id: int, vpc_id: str
+) -> dict[tuple[str, str], list[dict[str, str]]]:
+    """``{(source node, TGW id): [lines]}`` from discovery: each Transit Gateway
+    attachment ENI of the VPC -> its TGW (an attachment of the VPC without an ENI found:
+    the VPC box), each subnet -> the TGWs its route table (explicit, else the VPC's main
+    one) routes to."""
+    out: dict[tuple[str, str], list[dict[str, str]]] = {}
+    atts = {
+        r["attachment_id"]: r
+        for r in conn.execute(
+            "SELECT attachment_id, tgw_id, resource_type, resource_id, state "
+            "FROM tgw_attachments WHERE snapshot_id=? ORDER BY attachment_id",
+            (snap_id,),
+        )
+    }
+    own = [a for a in atts.values() if a["resource_type"] == "vpc" and a["resource_id"] == vpc_id]
+    linked: set[str] = set()
+    for e in conn.execute(
+        "SELECT eni_id, owner_ref FROM enis WHERE snapshot_id=? AND vpc_id=? "
+        "AND owner_type='tgw_attachment' ORDER BY eni_id",
+        (snap_id, vpc_id),
+    ):
+        # The ENI's description names its attachment; without it, the VPC's only one.
+        ref = e["owner_ref"] or ""
+        att = atts.get(ref) if ref else (own[0] if len(own) == 1 else None)
+        if att is None:
+            continue
+        linked.add(att["attachment_id"])
+        text = f"TGW attachment {att['attachment_id']} ({att['state'] or '?'})"
+        out.setdefault((f"res:{e['eni_id']}", att["tgw_id"]), []).append(
+            _tgw_line("attachment", text)
+        )
+    for a in own:
+        if a["attachment_id"] not in linked:
+            text = f"TGW attachment {a['attachment_id']} ({a['state'] or '?'}), no ENI found"
+            out.setdefault((VPC_NODE, a["tgw_id"]), []).append(_tgw_line("attachment", text))
+
+    tables = list(
+        conn.execute(
+            "SELECT route_table_id, is_main, subnet_ids FROM route_tables "
+            "WHERE snapshot_id=? AND vpc_id=?",
+            (snap_id, vpc_id),
+        )
+    )
+    main = next((t["route_table_id"] for t in tables if t["is_main"]), None)
+    table_of = {s: t["route_table_id"] for t in tables for s in json.loads(t["subnet_ids"] or "[]")}
+    routes: dict[str, list[sqlite3.Row]] = {}
+    for r in conn.execute(
+        "SELECT route_table_id, destination, tgw_id, state FROM tgw_routes "
+        "WHERE snapshot_id=? ORDER BY route_table_id, tgw_id, destination",
+        (snap_id,),
+    ):
+        routes.setdefault(r["route_table_id"], []).append(r)
+    for s in conn.execute(
+        "SELECT subnet_id FROM subnets WHERE snapshot_id=? AND vpc_id=? ORDER BY subnet_id",
+        (snap_id, vpc_id),
+    ):
+        rtb = table_of.get(s["subnet_id"], main)
+        for r in routes.get(rtb or "", []):
+            state = f" ({r['state']})" if r["state"] not in ("", "active", None) else ""
+            text = f"route table {rtb}: {r['destination']} → {r['tgw_id']}{state}"
+            out.setdefault((f"subnet:{s['subnet_id']}", r["tgw_id"]), []).append(
+                _tgw_line("route", text)
+            )
+    return out
+
+
+_TGW_LINE_IDS = re.compile(r"\b(?:tgw-attach|rtb)-\w+")
+
+
+def _crawl_tgw_lines(
+    conn: sqlite3.Connection, snap_id: int, vpc_id: str, known: set[str]
+) -> dict[tuple[str, str], list[dict[str, str]]]:
+    """``{("vpc", TGW id): [lines]}`` of the Extended crawl (VPC -> TGW evidence), without
+    the lines discovery already draws: attachment / route lines whose attachment or
+    route table ids are all in ``known``."""
+    out: dict[tuple[str, str], list[dict[str, str]]] = {}
     for r in conn.execute(
         "SELECT target, evidence, label, detail FROM ext_edges WHERE snapshot_id=? "
         "AND source=? AND target LIKE 'tgw:%' ORDER BY target, label, detail",
         (snap_id, f"vpc:{vpc_id}"),
     ):
-        lines.setdefault(r["target"], []).append(
+        ids = set(_TGW_LINE_IDS.findall(r["detail"]))
+        if r["label"] in ("attachment", "route") and ids and ids <= known:
+            continue
+        out.setdefault((VPC_NODE, r["target"].partition(":")[2]), []).append(
             {"evidence": r["evidence"], "label": r["label"], "text": r["detail"]}
         )
-    nodes, edges = [], []
-    for i, (nid, items) in enumerate(sorted(lines.items())):
-        name = nid.partition(":")[2]
-        nodes.append(
-            {
-                "id": EXT_PREFIX + nid,
-                "node_id": nid,
-                "service": "tgw",
-                "service_label": SERVICE_LABELS["tgw"],
-                "name": name,
-                "label_name": name,
-                "arn": "",
-                "icon": EXT_ICONS["tgw"],
-                "broad_access": False,
-                "facts": [],
-            }
-        )
+    return out
+
+
+def _tgw_node(tgw_id: str) -> dict[str, Any]:
+    return {
+        "id": f"{EXT_PREFIX}tgw:{tgw_id}",
+        "node_id": f"tgw:{tgw_id}",
+        "service": "tgw",
+        "service_label": SERVICE_LABELS["tgw"],
+        "name": tgw_id,
+        "label_name": tgw_id,
+        "arn": "",
+        "icon": EXT_ICONS["tgw"],
+        "broad_access": False,
+        "facts": [],
+    }
+
+
+def _tgw_edge_label(source: str, items: list[dict[str, str]]) -> str:
+    """An attachment ENI's edge: "<attachment id> · <state>"; else the line kinds."""
+    if source.startswith("res:"):
+        m = re.match(r"TGW attachment (\S+) \(([^)]*)\)", items[0]["text"])
+        if m:
+            return f"{m[1]} · {m[2]}"
+    return " · ".join(dict.fromkeys(ln["label"] for ln in items))
+
+
+def tgw_links(conn: sqlite3.Connection, snap_id: int, vpc_id: str) -> dict[str, Any]:
+    """The IP view's Transit Gateway part for one VPC: ``nodes`` (one per TGW, drawn
+    outside the VPC box) and ``edges`` to them from discovery (attachment ENI -> TGW,
+    labelled with the attachment id and state; subnet -> TGW for its route table's
+    routes) and from the Extended crawl when there is one (VPC -> TGW, without the
+    lines discovery already draws). ``source`` / ``target`` are diagram node ids
+    ("res:<ENI>", "subnet:<id>", "vpc", "x:tgw:<id>"). ``note`` / ``warnings``: no crawl
+    yet, or discovery or the crawl was denied DescribeRouteTables /
+    DescribeTransitGatewayAttachments (the links may then be incomplete)."""
+    snap = conn.execute("SELECT warnings FROM snapshots WHERE id=?", (snap_id,)).fetchone()
+    found = _tgw_denials(json.loads((snap and snap["warnings"]) or "[]"))
+    lines = _discovered_tgw_lines(conn, snap_id, vpc_id)
+    crawl = latest_crawl(conn, snap_id)
+    crawled: list[str] = []
+    if crawl is not None:
+        crawled = _tgw_denials(crawl["warnings"])
+        known = {
+            i for items in lines.values() for ln in items for i in _TGW_LINE_IDS.findall(ln["text"])
+        }
+        for key, items in _crawl_tgw_lines(conn, snap_id, vpc_id, known).items():
+            lines.setdefault(key, []).extend(items)
+    edges = []
+    for i, ((source, tgw), items) in enumerate(sorted(lines.items())):
         edges.append(
             {
                 "id": f"tgw:{i}",
                 "type": "tgw",
-                "source": VPC_NODE,
-                "target": EXT_PREFIX + nid,
-                "label": " · ".join(dict.fromkeys(ln["label"] for ln in items)),
+                "source": source,
+                "target": f"{EXT_PREFIX}tgw:{tgw}",
+                "label": _tgw_edge_label(source, items),
                 "lines": items,
                 "title": "\n".join(f"[{ln['label']}] {ln['text']}" for ln in items),
             }
         )
-    note = ""
-    if warnings:
-        note = "Transit Gateway links may be incomplete: the Extended crawl was denied access."
-    return {"nodes": nodes, "edges": edges, "note": note, "warnings": warnings}
+    notes = []
+    if found:
+        notes.append(TGW_DENIED.format(what="discovery"))
+    if crawl is None:
+        notes.append(TGW_NO_CRAWL)
+    elif crawled:
+        notes.append(TGW_DENIED.format(what="the Extended crawl"))
+    return {
+        "nodes": [_tgw_node(t) for t in sorted({tgw for _source, tgw in lines})],
+        "edges": edges,
+        "note": " ".join(notes),
+        "warnings": found + crawled,
+    }
 
 
 def _iter_resources(data: dict[str, Any]) -> Iterator[dict[str, Any]]:

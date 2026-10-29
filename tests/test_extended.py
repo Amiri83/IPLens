@@ -728,7 +728,7 @@ def test_ip_view_tgw_note_without_crawl(client, snapshot_builder, app):
     assert tgw == {
         "nodes": [],
         "edges": [],
-        "note": "Run Extended crawl to see Transit Gateway links",
+        "note": "Run Extended crawl to also see Transit Gateway route table propagations",
         "warnings": [],
     }
 

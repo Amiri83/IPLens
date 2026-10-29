@@ -1453,10 +1453,13 @@ def _register(app: Flask) -> None:
         try:
             name = viewstate.parse_preset_name(request.form.get("name"))
             filters = tagfilter.parse_filters(request.form.get("filters", "")[:200_000])
+            name_filter = tagfilter.parse_name_filter(request.form.get("name_filter"))
         except ValueError as exc:
             abort(400, str(exc))
         with closing(_paths().db_path) as conn:
-            viewstate.save_preset(conn, ref, name, filters, request.form.get("hide_empty") == "1")
+            viewstate.save_preset(
+                conn, ref, name, filters, request.form.get("hide_empty") == "1", name_filter
+            )
             presets = viewstate.list_presets(conn, ref)
         log.info("visual filter preset saved (account=%s, %d filter(s))", ref, len(filters))
         return jsonify(presets)

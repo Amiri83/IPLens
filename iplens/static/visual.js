@@ -261,7 +261,7 @@
         order: order,
         label: resourceLabel(r),
         title: resourceTitle(r),
-        icon: iconBase + r.icon,
+        icon: iconUrl(r.icon),
         iconFile: r.icon,
         eni: r.eni_id,
         raw: r,
@@ -305,7 +305,7 @@
             data: {
               id: item.id, parent: sid, order: i, label: groupLabel(item, false),
               title: groupTitle(item), expanded: false,
-              icon: iconBase + item.icon, iconFile: item.icon, raw: item,
+              icon: iconUrl(item.icon), iconFile: item.icon, raw: item,
             },
             classes: "group",
           });
@@ -451,12 +451,14 @@
 
   // -- tag filters (both views; rules in tagfilter.js) -----------------------------------
 
-  // Active filters: [{resource_type, tag_key, values, include_untagged}].
+  // Active tag filters (every resource type): [{tag_key, values, include_untagged}], and
+  // the applied name filter (comma-separated terms).
   let tagFilters = [];
+  let nameFilter = "";
   let typeLabels = {};  // resource type -> label (visual data "type_labels")
 
   function tagGone(n) {
-    return !TF.resourceVisible(n.data("raw"), tagFilters);
+    return !TF.resourceVisible(n.data("raw"), tagFilters, nameFilter);
   }
 
   /* VPC and subnet boxes stay, unless "Hide empty containers": then a subnet without a
@@ -470,23 +472,26 @@
     const counts = TF.typeCounts(cy.nodes(".res").map((n) => n.data("raw")), (r) => !cy.getElementById("res:" + r.eni_id).hasClass("filtered"));
     const out = document.getElementById("tf-counts");
     if (out) {
-      out.textContent = Object.entries(counts)
-        .map(([t, [shown, total]]) => `${typeLabels[t] || t}: ${shown} of ${total} shown`).join(" · ");
+      const all = Object.values(counts).reduce((a, [shown, total]) => [a[0] + shown, a[1] + total], [0, 0]);
+      const parts = Object.entries(counts)
+        .map(([t, [shown, total]]) => `${typeLabels[t] || t}: ${shown} of ${total} shown`);
+      if (parts.length > 1) parts.unshift(`All: ${all[0]} of ${all[1]} shown`);
+      out.textContent = parts.join(" · ");
     }
   }
 
   function tagChipText(f) {
     const values = f.values.map((v) => (v === "" ? "(empty)" : v));
     if (f.include_untagged) values.push("untagged");
-    return `${typeLabels[f.resource_type] || f.resource_type}: ${f.tag_key} = ${values.join(" | ")}`;
+    return `${f.tag_key} = ${values.join(" | ")}`;
   }
 
-  /* The filter panel: resource type, then tag key (suggested from the tags found on that
-     type), then values (found for that key); active filters as removable chips; named
-     presets saved per account. ``onChange`` redraws. */
+  /* The filter panel: a name filter, then a tag key (suggested from the tags found on
+     every resource) and its values (found for that key); active filters as removable
+     chips; named presets saved per account. ``onChange`` redraws. */
   function setupTagFilters(data, onChange) {
     if (!tagPanel) return;
-    const typeSelect = document.getElementById("tf-type");
+    const nameInput = document.getElementById("tf-name");
     const keyInput = document.getElementById("tf-key");
     const keyList = document.getElementById("tf-keys");
     const valueList = document.getElementById("tf-values-list");
@@ -507,22 +512,21 @@
       opt.textContent = text;
       return opt;
     };
-    typeSelect.append(...Object.entries(typeLabels).map(([t, label]) => option(t, label)));
+    keyList.replaceChildren(...Object.keys(found).map((k) => option(k, k)));
 
     const knownKey = () => {
       const wanted = keyInput.value.trim().toLowerCase();
-      return Object.keys(found[typeSelect.value] || {}).find((k) => k.toLowerCase() === wanted);
+      return Object.keys(found).find((k) => k.toLowerCase() === wanted);
     };
     const valueBoxes = () => Array.from(valueList.querySelectorAll('input[type="checkbox"]'));
     const checkedValues = () => valueBoxes().filter((b) => b.checked).map((b) => b.value);
     const syncAdd = () => {
-      addBtn.disabled = !typeSelect.value || !keyInput.value.trim() ||
-        !(checkedValues().length || untaggedBox.checked);
+      addBtn.disabled = !keyInput.value.trim() || !(checkedValues().length || untaggedBox.checked);
     };
     // One checkbox per value found for the key (no "name": never part of the page URL).
     const syncValues = () => {
       const key = knownKey();
-      const values = key ? found[typeSelect.value][key] : [];
+      const values = key ? found[key] : [];
       if (values.length) {
         valueList.replaceChildren(...values.map((v) => {
           const label = document.createElement("label");
@@ -549,37 +553,52 @@
     };
     valuesAll.addEventListener("click", () => checkAll(true));
     valuesNone.addEventListener("click", () => checkAll(false));
-    typeSelect.addEventListener("change", () => {
-      keyList.replaceChildren(...Object.keys(found[typeSelect.value] || {}).map((k) => option(k, k)));
-      keyInput.disabled = !typeSelect.value;
-      keyInput.value = "";
-      syncValues();
-    });
     keyInput.addEventListener("input", syncValues);
     [valueList, untaggedBox].forEach((el) => el.addEventListener("change", syncAdd));
 
+    const chip = (text, onRemove) => {
+      const el = document.createElement("span");
+      el.className = "tf-chip";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "×";
+      remove.title = "Remove this filter";
+      remove.setAttribute("aria-label", "Remove filter " + text);
+      remove.addEventListener("click", onRemove);
+      el.append(text + " ", remove);
+      return el;
+    };
     const drawChips = () => {
-      chips.replaceChildren(...tagFilters.map((f, i) => {
-        const chip = document.createElement("span");
-        chip.className = "tf-chip";
-        const remove = document.createElement("button");
-        remove.type = "button";
-        remove.textContent = "×";
-        remove.title = "Remove this filter";
-        remove.setAttribute("aria-label", "Remove filter " + tagChipText(f));
-        remove.addEventListener("click", () => {
+      const terms = TF.nameTerms(nameFilter);
+      chips.replaceChildren(
+        ...(terms.length ? [chip(`name: ${terms.join(" | ")}`, () => setName(""))] : []),
+        ...tagFilters.map((f, i) => chip(tagChipText(f), () => {
           tagFilters.splice(i, 1);
           drawChips();
           onChange();
-        });
-        chip.append(tagChipText(f) + " ", remove);
-        return chip;
-      }));
+        })),
+      );
+    };
+    // The name filter applies as it is typed (after a short pause) or on Enter.
+    const setName = (text) => {
+      nameInput.value = text;
+      if (text.trim() === nameFilter) return;
+      nameFilter = text.trim();
+      drawChips();
+      onChange();
+    };
+    let nameTimer = null;
+    nameInput.addEventListener("input", () => {
+      clearTimeout(nameTimer);
+      nameTimer = setTimeout(() => setName(nameInput.value), SAVE_DELAY_MS);
+    });
+    const applyName = () => {
+      clearTimeout(nameTimer);
+      setName(nameInput.value);
     };
     const add = () => {
       if (addBtn.disabled) return;
       tagFilters.push({
-        resource_type: typeSelect.value,
         tag_key: knownKey() || keyInput.value.trim(),
         values: checkedValues(),
         include_untagged: untaggedBox.checked,
@@ -613,7 +632,8 @@
         return;
       }
       sendPreset(container.dataset.presetsUrl, {
-        name: name, filters: JSON.stringify(tagFilters), hide_empty: hideEmptyBox.checked ? "1" : "0",
+        name: name, filters: JSON.stringify(tagFilters), name_filter: nameFilter,
+        hide_empty: hideEmptyBox.checked ? "1" : "0",
       })
         .then(() => {
           drawPresets(name);
@@ -626,6 +646,9 @@
       const p = presets.find((x) => x.name === presetSelect.value);
       if (!p) return;
       tagFilters = p.filters.map((f) => ({ ...f, values: f.values.slice() }));
+      clearTimeout(nameTimer);
+      nameFilter = p.name_filter || "";
+      nameInput.value = nameFilter;
       hideEmptyBox.checked = p.hide_empty;
       presetName.value = p.name;
       drawChips();
@@ -641,8 +664,9 @@
         })
         .catch((err) => { note.textContent = `Could not delete the preset (${err.message}).`; });
     });
-    // Enter adds the filter / saves the preset instead of submitting the page form.
-    [[keyInput, add], [presetName, save]].forEach(([input, action]) => {
+    // Enter applies the name filter / adds the filter / saves the preset instead of
+    // submitting the page form.
+    [[nameInput, applyName], [keyInput, add], [presetName, save]].forEach(([input, action]) => {
       input.addEventListener("keydown", (evt) => {
         if (evt.key !== "Enter") return;
         evt.preventDefault();
@@ -775,7 +799,32 @@
     return extended ? "ev_" + (evidence || "configured") : type;
   }
 
-  // ``tgwEdges``: the VPC -> Transit Gateway edges (data.tgw), always drawn.
+  /* Transit Gateway edges (data.tgw) as drawn: an attachment ENI's end ("res:<ENI>")
+     follows its node like any edge (its collapsed group; none when filtered out), a
+     subnet's end goes with its box; edges between the same two nodes merged. */
+  function visibleTgwEdges(cy, tgwEdges, expandAll) {
+    const end = (id) => {
+      if (id.startsWith("res:")) return endpointId(cy, id.slice(4), expandAll);
+      const n = cy.getElementById(id);
+      return n.empty() || n.hasClass("filtered") ? null : id;
+    };
+    const merged = new Map();
+    (tgwEdges || []).forEach((e) => {
+      const s = end(e.source);
+      const t = end(e.target);
+      if (!s || !t) return;
+      const m = merged.get(`${s}|${t}`);
+      if (m) {
+        m.n += 1;
+        m.title += "\n" + e.title;
+      } else {
+        merged.set(`${s}|${t}`, { id: e.id, type: e.type, source: s, target: t, label: e.label, title: e.title, n: 1 });
+      }
+    });
+    return Array.from(merged.values());
+  }
+
+  // ``tgwEdges``: the Transit Gateway edges (data.tgw), whatever the edge type boxes.
   function syncEdges(cy, edges, tgwEdges) {
     const items = visibleEdges(cy, edges, enabledEdgeTypes());
     cy.batch(() => {
@@ -792,11 +841,11 @@
         },
         classes: "edge-" + m.type,
       })));
-      cy.add((tgwEdges || []).map((e) => ({
+      cy.add(visibleTgwEdges(cy, tgwEdges).map((e) => ({
         group: "edges",
         data: {
           id: "edge:" + e.id, etype: e.type, source: e.source, target: e.target,
-          label: shortName(e.label), title: e.title,
+          label: edgeLabel(e), title: e.title,
         },
         classes: "edge-tgw",
       })));
@@ -819,8 +868,8 @@
     });
   }
 
-  /* IP view: "Run Extended crawl to see Transit Gateway links", or the crawl's
-     AccessDenied warnings of DescribeRouteTables / DescribeTransitGatewayAttachments. */
+  /* IP view: no Extended crawl yet, or the AccessDenied warnings of DescribeRouteTables /
+     DescribeTransitGatewayAttachments (discovery's and the crawl's). */
   function showTgwNote(tgw) {
     const el = document.getElementById("tgw-note");
     if (!el || !tgw) return;
@@ -943,7 +992,7 @@
       group: "nodes",
       data: {
         id: id, parent: parent, order: order, label: groupLabel(g, false), title: groupTitle(g),
-        expanded: false, icon: iconBase + g.icon, iconFile: g.icon, raw: g,
+        expanded: false, icon: iconUrl(g.icon), iconFile: g.icon, raw: g,
       },
       classes: "group",
     };
@@ -1684,7 +1733,7 @@
      ``expand`` ("Expand all groups") a collapsed group also carries its members and
      the edges go to the members; the server lays the members out in place of the
      group box (iplens.diagram.expand_groups). An expanded group's header is left out. */
-  function currentView(cy, dataEdges, expand) {
+  function currentView(cy, dataEdges, expand, tgwEdges) {
     const nodes = [];
     cy.nodes().filter((n) => n.visible() && !n.hasClass("pin")).forEach((n) => {
       const kind = nodeKind(n);
@@ -1720,11 +1769,11 @@
         target: m.target,
         type: exportType(m.type, m.evidence),
         label: edgeLabel(m),
-      })).concat(cy.edges(".edge-tgw").filter((e) => e.visible()).map((e) => ({
-        source: e.source().id(),
-        target: e.target().id(),
+      })).concat(visibleTgwEdges(cy, tgwEdges, true).map((m) => ({
+        source: m.source,
+        target: m.target,
         type: exportType("tgw"),
-        label: e.data("label") || "",
+        label: edgeLabel(m),
       })))
       : cy.edges().filter((e) => e.visible()).map((e) => ({
         source: e.source().id(),
@@ -2275,7 +2324,9 @@
       savePrefs({ shorten_names: shortenBox.checked ? "1" : "0" });
     });
     // The Extended view exports exactly what is drawn (focus, groups, filters).
-    const exportView = () => currentView(cy, edges, !ext && expandExportBox && expandExportBox.checked);
+    const exportView = () => currentView(
+      cy, edges, !ext && expandExportBox && expandExportBox.checked, data.tgw && data.tgw.edges,
+    );
     document.getElementById("export-svg").addEventListener("click", () => {
       download(container.dataset.exportSvg, exportView());
     });

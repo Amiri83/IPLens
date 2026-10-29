@@ -46,6 +46,9 @@ SNAPSHOT_TABLES = (
     "own_tags",
     "asgs",
     "ecs_scalable_targets",
+    "tgw_attachments",
+    "route_tables",
+    "tgw_routes",
 )
 
 
