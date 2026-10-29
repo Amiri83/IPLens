@@ -8,7 +8,7 @@ Local web app for private IPv4 usage visibility &amp; optimization across one or
 - **IP List** – every private IP in one filterable table (VPC, subnet, resource type, status,
   environment, owner), exportable to Excel.
 - **Visual** – per-VPC diagram of subnets and resource ENIs with AWS icons, several layouts and
-  SVG / draw.io export.
+  SVG / draw.io export; a **Logical view** draws each resource once, whatever its AZs.
 - **Extended view** – optional crawl of regional services (SNS, SQS, DynamoDB, EventBridge, S3,
   API Gateway, Step Functions, Lambda, ECS, MSK, ...) and network edges, each connection ranked by
   evidence; opt-in flow log analysis.
@@ -129,28 +129,29 @@ mode `0700`). Delete it to reset IPLens completely.
    downloads the current filter as an `.xlsx` (one sheet, header row frozen, autofilter enabled).
    A resource's environment comes from the Terraform repo root × environment that manages it,
    else from the first environment tag (Settings; default `Environment`, `env`, `stage`) on the
-   resource, its subnet or its VPC. Both Visual views filter by environment and can group / colour
+   resource, its subnet or its VPC. Every Visual view filters by environment and can group / colour
    by it.
 4. **Visual** – nested diagram per VPC: VPC box → subnet boxes (CIDR, used/idle/free) → one node
    per resource ENI with its AWS icon, name and IPs. More than 10 nodes of one type in a subnet are
    collapsed into a group node (click to expand). Scroll/drag to zoom and pan; double-click a node
    to open its ENI. VPC/subnet borders and the legend can be toggled (remembered per account).
-   Both views share one toolbar (zoom, Fit, Expand / Collapse groups, Reset layout) and a
+   Every view shares one toolbar (zoom, Fit, Expand / Collapse groups, Reset layout) and a
    **Layout** choice – Grid (default), Hierarchy (dagre), Circle, Concentric, Breadthfirst – that
    keeps every box (VPC, subnet, expanded service group, swimlane) together; the layout and the
    expanded groups are remembered per account and view, dragged node positions per account + VPC
    + view until **Reset layout** (which also leaves focus mode). **Export SVG** / **Export
    draw.io** download the view exactly as shown (draw.io: `mxgraph.aws4` shapes, VPC and subnets
    as containers, edges kept). Data comes from `GET /visual/data.json?vpc=<vpc-id>`.
-   **Tag filters** (both views, in the browser over the loaded data, nothing is re-discovered):
+   **Tag filters** (every view, in the browser over the loaded data, nothing is re-discovered):
    pick a tag key (suggested from the tags found on every resource, any case) and one or more
    values (a checkbox per value found, with Select all / Select none); a filter applies to every
    resource node, whatever its type, and only resources with one of those values are drawn. An
    ENI shared by several Lambda functions matches the values of any of them (its displayed tags
    stay the first function's). Several filters must all match; resources without the key are
    hidden unless **Include untagged**. The **name filter** takes comma-separated terms
-   (`dev, nonprod`) and keeps resources whose name, any owner's name (every function of a shared
-   Lambda ENI) or ENI id contains one of them, in any case; it combines with the tag filters
+   (`dev, uat`: spaces trimmed, empty terms such as in `dev,,` ignored) and keeps resources whose
+   name, any owner's name (every function of a shared Lambda ENI) or ENI id contains one of them,
+   in any case – the same in the IP, Logical and Extended view; it combines with the tag filters
    (both must match). Active filters are removable chips, with "X of Y shown" in total and per
    type. VPC and subnet boxes always stay, unless **Hide empty containers**. Filters (tag and name)
    can be saved as named presets (per account). Compliance rules, findings, suggestions and data
@@ -163,6 +164,15 @@ mode `0700`). Delete it to reset IPLens completely.
    adds what discovery does not see (TGW route table propagations) on a VPC → gateway line. A note
    below the diagram says when there is no crawl yet, and lists the `DescribeRouteTables` /
    `DescribeTransitGatewayAttachments` calls that discovery or the crawl was denied.
+   The **Logical view** tab (next to the IP view, `?view=logical`) collapses multi-AZ duplicates:
+   one node per logical resource instead of one per ENI, grouped by the stored ENI owner – a
+   Lambda function (the functions sharing its Hyperplane ENIs are one node), an ECS service, a
+   load balancer, a VPC endpoint, a NAT gateway, an RDS / ElastiCache / OpenSearch cluster or
+   instance, an EC2 instance; an ENI without owner stays a node of its own. Nodes sit in the VPC
+   box (no subnet boxes) with name, type icon and an AZ count (`3 AZ`), no IPs or ENI ids;
+   connections between two collapsed nodes are merged into one line per connection type. Same
+   layouts, styling, filters, Group by and exports as the IP view; its layout and dragged
+   positions are kept apart from the other views. Double-click does not open an ENI there.
    The **IP view** is the default; the **Extended view** tab adds regional services (SNS, SQS,
    DynamoDB, EventBridge, S3, API Gateway, Step Functions, Lambda, ECS, Secrets Manager names) and
    external nodes (Transit Gateway, peering, internet via IGW / NAT) around the VPC.

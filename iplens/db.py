@@ -477,7 +477,7 @@ CREATE TABLE IF NOT EXISTS visual_layouts (
     PRIMARY KEY (account_ref, vpc_id)
 );
 
--- Visual page state per account and view ("ip" | "extended"): the chosen layout.
+-- Visual page state per account and view ("ip" | "logical" | "extended"): the chosen layout.
 CREATE TABLE IF NOT EXISTS visual_view_prefs (
     account_ref INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     view        TEXT NOT NULL,

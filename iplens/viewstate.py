@@ -1,5 +1,5 @@
 """Per-account Visual page state: border/label/legend toggles, the Extended view's
-evidence filter, named tag filter presets, and per view ("ip" | "extended") the chosen
+evidence filter, named tag filter presets, and per view ("ip" | "logical" | "extended") the chosen
 layout, the expanded groups and the dragged node positions."""
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ DEFAULT_PREFS = {
     "show_legend": True,
 }
 
-VIEWS = ("ip", "extended")
+VIEWS = ("ip", "logical", "extended")
 # Layout choices of the Visual page (both views): "dagre" is the vendored hierarchical
 # layout, the others are cytoscape.js built-ins applied box by box (see visual.js).
 LAYOUTS = {
@@ -36,9 +36,9 @@ LAYOUTS = {
     "breadthfirst": "Breadthfirst",
 }
 DEFAULT_LAYOUT = "grid"
-# The Extended view's dragged positions are stored under "<vpc id>:extended", so that
-# dragging in one view never moves nodes in the other (the IP view keeps the bare id).
-EXT_LAYOUT_SUFFIX = ":extended"
+# The Extended / Logical view's dragged positions are stored under "<vpc id>:extended" /
+# "<vpc id>:logical", so that dragging in one view never moves nodes in another (the IP
+# view keeps the bare id).
 # A saved layout row holds {"layouts": {layout name: {node id: {x, y}}}}: dragged positions
 # belong to the layout they were dragged in and are restored only for that layout.
 LAYOUTS_FIELD = "layouts"
@@ -173,7 +173,7 @@ def reset_layout(conn: sqlite3.Connection, account_ref: int, vpc_id: str) -> boo
 
 def layout_key(vpc_id: str, view: str) -> str:
     """Key of the saved positions of ``vpc_id`` in ``view``."""
-    return f"{vpc_id}{EXT_LAYOUT_SUFFIX}" if vpc_id and view == "extended" else vpc_id
+    return f"{vpc_id}:{view}" if vpc_id and view in ("extended", "logical") else vpc_id
 
 
 def _view(view: str) -> str:

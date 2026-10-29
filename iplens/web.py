@@ -77,6 +77,7 @@ from .extended import EVIDENCE_HELP, EVIDENCE_LABELS, EVIDENCE_LEVELS, ExtendedC
 from .jobs import KINDS as JOB_KINDS
 from .jobs import JobBusy, JobCancelled, JobContext, JobFailed, JobManager, Progress
 from .logging_setup import LEVELS, LOG_FILE, configure_logging, read_log
+from .logical import logical_view
 from .mcpconfig import (
     DISABLED_MESSAGE,
     TOKEN_ENV,
@@ -138,8 +139,10 @@ GROUP_BY = {
     "owner": "owner (ownership source)",
     "team": "team",
 }
-# Visual page modes: the IP view is the default; "extended" adds regional services.
-VIEW_MODES = {"ip": "IP view", "extended": "Extended view"}  # keys: viewstate.VIEWS
+# Visual page modes: the IP view is the default; "logical" collapses each resource's
+# ENIs into one node (iplens.logical); "extended" adds regional services. Keys:
+# viewstate.VIEWS.
+VIEW_MODES = {"ip": "IP view", "logical": "Logical view", "extended": "Extended view"}
 # Snapshot warnings shown on the Ownership page (prefixes of the collector's messages).
 OWNERSHIP_APIS = ("tag:GetResources", "cloudformation:", "cloudtrail:")
 # IP list "Owner" filter: an ownership source, or unmanaged.
@@ -1499,19 +1502,23 @@ def _register(app: Flask) -> None:
         snap = _snapshot_or_none()
         if not snap:
             return jsonify({"snapshot_id": None, "vpcs": [], "vpc": None})
+        mode = _view_mode()
         data = queries.visual_data(
             _db(),
             snap["id"],
             request.args.get("vpc", "").strip(),
             OWNER_LABELS,
-            _edge_types(),
+            # Logical view: every type, so that its merged edge counts stay unfiltered.
+            EDGE_TYPES if mode == "logical" else _edge_types(),
             _scope(),
             _env_keys(),
             _own(),
         )
         if data is None:
             abort(404)
-        if _view_mode() == "extended" and data.get("vpc"):
+        if mode == "logical":
+            data = logical_view(data, _edge_types())
+        elif mode == "extended" and data.get("vpc"):
             data["extended"] = extgraph.extended_data(_db(), snap["id"], data, _env_keys())
         elif data.get("vpc"):
             data["tgw"] = extgraph.tgw_links(_db(), snap["id"], data["vpc"]["vpc_id"])
