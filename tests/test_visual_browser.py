@@ -679,8 +679,10 @@ ROUTE_EDGE = [
 
 
 def _click_edge(page, selector):
-    mid = page.evaluate(f"() => {CY}.edges('{selector}').renderedMidpoint()")
+    # Scroll first, then let the graph settle: a midpoint read before can be stale.
     page.locator("#cy").scroll_into_view_if_needed()
+    page.wait_for_function(f"() => !{CY}.animated() && {CY}.edges('{selector}').visible()")
+    mid = page.evaluate(f"() => {CY}.edges('{selector}').renderedMidpoint()")
     box = page.locator("#cy").bounding_box()
     page.mouse.click(box["x"] + mid["x"], box["y"] + mid["y"])
     page.wait_for_selector("#cy-tip:not([hidden])")
@@ -819,10 +821,8 @@ def test_show_blocked_toggle(browser, access_server):
     )
     assert style == ["dashed", "rgb(198,40,40)"]
     # A click on the blocked edge shows which rule blocked it.
-    mid = page.evaluate(f"() => {CY}.edges('.blocked').renderedMidpoint()")
-    page.locator("#cy").scroll_into_view_if_needed()
-    box = page.locator("#cy").bounding_box()
-    page.mouse.click(box["x"] + mid["x"], box["y"] + mid["y"])
+    # Tap the edge itself: its midpoint can lie on the effective edge to the same endpoint.
+    page.evaluate(f"() => {CY}.edges('.blocked').emit('onetap')")
     page.wait_for_selector("#edge-detail:not([hidden])")
     assert "blocked" in page.text_content("#edge-detail-title")
     assert "blocked by ingress: no rule of sg-00ecrapi" in page.text_content("#edge-detail-lines")
