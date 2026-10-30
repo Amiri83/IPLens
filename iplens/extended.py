@@ -40,6 +40,7 @@ from urllib.parse import unquote
 
 from botocore.exceptions import ClientError
 
+from . import access
 from .aws import AwsGateway, ReadOnlyViolation
 from .db import closing
 from .jobs import NullProgress, Progress
@@ -370,6 +371,38 @@ class ExtendedCrawler:
         self._vpcs: set[str] = set()
         self._nat_enis: dict[str, str] = {}  # NAT gateway id -> ENI id
         self._prefix_lists: dict[str, str] = {}
+        # Effective access (iplens.access): (holder node id, purpose) -> role ARN, the
+        # simulations already cached for this snapshot, new results and the verdicts of
+        # resource policies (the policies themselves stay in memory, in _policies).
+        self._principals: dict[tuple[str, str], str] = {}
+        self._cached_sims: set[access.SimRequest] = set()
+        self._sims: dict[access.SimRequest, tuple[str, str]] = {}
+        self._resource_checks: dict[access.SimRequest, tuple[str, str]] = {}
+        self._policies: dict[str, str | None] = {}
+        self._ecr_actions: list[str] = []  # the snapshot has ECR interface endpoints
+        self._vpc_holders: set[str] = set()  # Lambda functions / ECS services with VPC ENIs
+        # Full path: the simulated requests (-> resource node id), KMS key references of
+        # encrypted queues / topics, ECR repositories each ECS service's images come from,
+        # the KMS and SCP results (new ones; cached ones are not asked again) and the
+        # subnets' NACL / route rows (None: the source did not run).
+        self._requests: dict[access.SimRequest, str] = {}
+        self._key_refs: dict[str, str] = {}
+        self._images: dict[str, set[str]] = {}
+        self._kms_targets: dict[tuple[str, str], str] = {}
+        self._kms_requests: list[access.SimRequest] = []
+        self._cached_kms: set[access.SimRequest] = set()
+        self._kms_sims: dict[access.SimRequest, tuple[str, str, str, str]] = {}
+        self._cached_scps: set[tuple[str, str, str]] = set()
+        self._scp_rows: dict[tuple[str, str, str], tuple[str, str]] = {}
+        self._acl_rows: tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]] | None = None
+        self._route_rows: tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]] | None = None
+        # Condition context: DescribeOrganization (the organization, or the error code),
+        # the organization id (also cached for the snapshot), each holder's VPC (None: not
+        # in a VPC) and the interface endpoints (VPC, service name, endpoint id).
+        self._org: dict[str, Any] | str | None = None
+        self._org_id = ""
+        self._holder_vpcs: dict[str, str | None] = {}
+        self._interface_eps: list[tuple[str, str, str]] = []
 
     # -- plumbing ---------------------------------------------------------------------
 
@@ -434,6 +467,9 @@ class ExtendedCrawler:
             ("states:DescribeStateMachine", self._state_machines),
             ("ecs:DescribeTaskDefinition", self._task_definitions),
             ("iam:GetRolePolicy", self._iam),
+            ("iam:SimulatePrincipalPolicy", self._simulate),
+            ("kms:DescribeKey", self._kms),
+            ("organizations:ListPoliciesForTarget", self._scps),
             ("ec2:DescribeManagedPrefixLists", self._prefix_list_names),
             ("ec2:DescribeRouteTables", self._route_tables),
             ("ec2:DescribeNetworkAcls", self._nacls),
@@ -449,6 +485,7 @@ class ExtendedCrawler:
             self.progress.step(f"crawl · {name}", done=i, total=len(sources) + 1)
             self._source(name, fn)
         self._functions.clear()
+        self._policies.clear()
         self.progress.check()
         self.progress.step("crawl · saving", done=len(sources), total=len(sources) + 1)
         self._save()
@@ -471,6 +508,56 @@ class ExtendedCrawler:
         ):
             if r["owner_ref"]:
                 self._nat_enis.setdefault(r["owner_ref"], r["eni_id"])
+        self._cached_sims = {
+            access.SimRequest(r["role_arn"], r["action"], r["resource"])
+            for r in conn.execute(
+                "SELECT role_arn, action, resource FROM iam_sims WHERE snapshot_id=?", (sid,)
+            )
+        }
+        self._cached_kms = {
+            access.SimRequest(r["role_arn"], r["action"], r["key_arn"])
+            for r in conn.execute(
+                "SELECT role_arn, action, key_arn FROM kms_sims WHERE snapshot_id=?", (sid,)
+            )
+        }
+        self._cached_scps = {
+            (r["account"], r["action"], r["resource"])
+            for r in conn.execute(
+                "SELECT account, action, resource FROM scp_checks WHERE snapshot_id=?", (sid,)
+            )
+        }
+        services = {
+            r[0]
+            for r in conn.execute("SELECT service_name FROM endpoints WHERE snapshot_id=?", (sid,))
+        }
+        self._ecr_actions = sorted({a for s in services if (a := access.ecr_action(s))})
+        self._holder_vpcs = {
+            node_id("lambda", r[0]): r[1]
+            for r in conn.execute("SELECT name, vpc_id FROM lambdas WHERE snapshot_id=?", (sid,))
+        }
+        ecs_vpcs: dict[str, set[str | None]] = {}
+        for r in conn.execute(
+            "SELECT DISTINCT t.cluster, t.service, e.vpc_id FROM ecs_task_enis t "
+            "LEFT JOIN enis e ON e.snapshot_id=t.snapshot_id AND e.eni_id=t.eni_id "
+            "WHERE t.snapshot_id=? AND t.service != ''",
+            (sid,),
+        ):
+            ecs_vpcs.setdefault(node_id("ecs", f"{r[0]}/{r[1]}"), set()).add(r[2])
+        # A service's tasks are in one VPC; otherwise its context is unknown (left out).
+        self._holder_vpcs.update(
+            {h: next(iter(v)) for h, v in ecs_vpcs.items() if len(v) == 1 and None not in v}
+        )
+        self._vpc_holders = {h for h, vpc in self._holder_vpcs.items() if vpc} | set(ecs_vpcs)
+        self._interface_eps = [
+            (r[0], r[1] or "", r[2])
+            for r in conn.execute(
+                "SELECT vpc_id, service_name, endpoint_id FROM endpoints "
+                "WHERE snapshot_id=? AND endpoint_type='Interface' ORDER BY endpoint_id",
+                (sid,),
+            )
+        ]
+        row = conn.execute("SELECT org_id FROM iam_context WHERE snapshot_id=?", (sid,)).fetchone()
+        self._org_id = row[0] if row else ""
 
     def _save(self) -> None:
         g, sid = self.graph, self.snapshot_id
@@ -494,6 +581,71 @@ class ExtendedCrawler:
                 "INSERT OR IGNORE INTO ext_facts(snapshot_id, subject, detail) VALUES(?,?,?)",
                 [(sid, *f) for f in sorted(g.facts)],
             )
+            # Effective access: simulations stay cached; the roles are the crawl's.
+            conn.execute("DELETE FROM iam_principals WHERE snapshot_id=?", (sid,))
+            conn.executemany(
+                "INSERT INTO iam_principals(snapshot_id, holder, purpose, role_arn) "
+                "VALUES(?,?,?,?)",
+                [(sid, h, p, role) for (h, p), role in sorted(self._principals.items())],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO iam_sims(snapshot_id, role_arn, action, resource, "
+                "decision, detail) VALUES(?,?,?,?,?,?)",
+                [
+                    (sid, r.role_arn, r.action, r.resource, d, detail)
+                    for r, (d, detail) in sorted(self._sims.items())
+                ],
+            )
+            conn.executemany(
+                "UPDATE iam_sims SET resource_decision=?, resource_detail=? WHERE snapshot_id=? "
+                "AND role_arn=? AND action=? AND resource=?",
+                [
+                    (d, detail[:400], sid, r.role_arn, r.action, r.resource)
+                    for r, (d, detail) in sorted(self._resource_checks.items())
+                ],
+            )
+            # Full path: NACLs and routes as this crawl read them (kept when unreadable),
+            # the keys of encrypted targets, and the cached KMS / SCP verdicts.
+            for rows, tables in (
+                (self._acl_rows, ("nacl_subnets", "nacl_entries")),
+                (self._route_rows, ("route_subnets", "route_entries")),
+            ):
+                if rows is None:
+                    continue
+                for table, table_rows in zip(tables, rows, strict=True):
+                    conn.execute(f"DELETE FROM {table} WHERE snapshot_id=?", (sid,))  # noqa: S608
+                    if table_rows:
+                        marks = ",".join("?" * (len(table_rows[0]) + 1))
+                        conn.executemany(
+                            f"INSERT OR IGNORE INTO {table} VALUES({marks})",  # noqa: S608
+                            [(sid, *row) for row in table_rows],
+                        )
+            conn.execute("DELETE FROM kms_targets WHERE snapshot_id=?", (sid,))
+            conn.executemany(
+                "INSERT INTO kms_targets(snapshot_id, resource, holder, key_arn) VALUES(?,?,?,?)",
+                [
+                    (sid, res, holder, key)
+                    for (res, holder), key in sorted(self._kms_targets.items())
+                ],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO kms_sims(snapshot_id, role_arn, key_arn, action, decision, "
+                "detail, policy_decision, policy_detail) VALUES(?,?,?,?,?,?,?,?)",
+                [
+                    (sid, r.role_arn, r.resource, r.action, *(v[:400] for v in result))
+                    for r, result in sorted(self._kms_sims.items())
+                ],
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO scp_checks(snapshot_id, account, action, resource, "
+                "decision, detail) VALUES(?,?,?,?,?,?)",
+                [(sid, *key, *result) for key, result in sorted(self._scp_rows.items())],
+            )
+            if self._org_id:
+                conn.execute(
+                    "INSERT OR REPLACE INTO iam_context(snapshot_id, org_id) VALUES(?,?)",
+                    (sid, self._org_id),
+                )
             conn.execute(
                 "INSERT INTO ext_crawls(snapshot_id, crawled_at, warnings, sources) "
                 "VALUES(?,?,?,?)",
@@ -540,6 +692,7 @@ class ExtendedCrawler:
             nid = self.graph.node("lambda", fn["FunctionName"], fn.get("FunctionArn", ""))
             if fn.get("Role"):
                 self._role_holders.setdefault(fn["Role"], set()).add(nid)
+                self._principals[(nid, "lambda")] = fn["Role"]
         return len(self._functions)
 
     def _sns_topics(self) -> int:
@@ -560,12 +713,17 @@ class ExtendedCrawler:
         for url in urls:
             try:
                 attrs[url] = sqs.get_queue_attributes(
-                    QueueUrl=url, AttributeNames=["QueueArn", "RedrivePolicy"]
+                    QueueUrl=url,
+                    AttributeNames=["QueueArn", "RedrivePolicy", "Policy", "KmsMasterKeyId"],
                 ).get("Attributes", {})
             except ClientError:
                 attrs[url] = {}
             name = _last(url, "/")
-            self.graph.node("sqs", name, attrs[url].get("QueueArn", ""), url)
+            nid = self.graph.node("sqs", name, attrs[url].get("QueueArn", ""), url)
+            # The queue policy: evaluated by _simulate, never stored.
+            self._policies[nid] = attrs[url].pop("Policy", None)
+            if attrs[url].get("KmsMasterKeyId"):
+                self._key_refs[nid] = attrs[url]["KmsMasterKeyId"]
         for url, a in attrs.items():
             policy = _policy_doc(a.get("RedrivePolicy") or "{}")
             dlq = policy.get("deadLetterTargetArn")
@@ -918,11 +1076,21 @@ class ExtendedCrawler:
         for td_arn, services in self._task_defs.items():
             td = ecs.describe_task_definition(taskDefinition=td_arn).get("taskDefinition", {})
             family = td.get("family", _last(td_arn, "/"))
-            for role in (td.get("taskRoleArn"), td.get("executionRoleArn")):
+            for purpose, role in (
+                ("task", td.get("taskRoleArn")),
+                ("execution", td.get("executionRoleArn")),
+            ):
                 if role:
                     self._role_holders.setdefault(role, set()).update(services)
+                    self._principals.update({(svc, purpose): role for svc in services})
             for c in td.get("containerDefinitions", []):
                 where = f"task definition {family} container {c.get('name', '?')}"
+                # <account>.dkr.ecr.<region>.amazonaws.com/<repository>[:tag|@digest]
+                image = str(c.get("image", ""))
+                if ".dkr.ecr." in image and "/" in image:
+                    repo = re.split(r"[:@]", image.split("/", 1)[1], maxsplit=1)[0]
+                    for svc in services:
+                        self._images.setdefault(svc, set()).add(repo)
                 env = [(e.get("name", ""), e.get("value")) for e in c.get("environment", [])]
                 for svc in services:
                     self._match_refs(svc, env, where)
@@ -1001,6 +1169,238 @@ class ExtendedCrawler:
                         )
         return len(self._role_holders)
 
+    def _role_for(self, holder: str, action: str) -> str | None:
+        return next(
+            (
+                self._principals[(holder, p)]
+                for p in access.purposes(holder, action)
+                if (holder, p) in self._principals
+            ),
+            None,
+        )
+
+    def _organization(self) -> dict[str, Any] | str:
+        """``DescribeOrganization``, once per crawl: the organization, or the error code."""
+        if self._org is None:
+            try:
+                self._org = self._client("organizations").describe_organization()["Organization"]
+                self._org_id = self._org.get("Id", "")
+            except ClientError as exc:
+                self._org = exc.response.get("Error", {}).get("Code", "") or "ClientError"
+        return self._org
+
+    def _context(self, req: access.SimRequest) -> dict[str, str | None]:
+        """The condition keys of ``req`` known here: the principal's and, when every holder
+        of the role sits in the same VPC (or none in a VPC), the network path: through
+        the VPC's interface endpoint for the service (private DNS assumed), else none."""
+        ctx = access.principal_context(req.role_arn, self._org_id)
+        holders = {h for (h, _), role in self._principals.items() if role == req.role_arn}
+        vpcs = {self._holder_vpcs.get(h, "?") for h in holders}
+        if len(vpcs) != 1 or "?" in vpcs:
+            return ctx
+        vpc = vpcs.pop()
+        suffix = access.endpoint_suffix(req.action)
+        ep = next(
+            (e for v, name, e in self._interface_eps if vpc and v == vpc and name.endswith(suffix)),
+            None,
+        )
+        return {**ctx, **access.network_context(ep, vpc)}
+
+    def _need_org(self, todo: Iterable[access.SimRequest], cached: set[access.SimRequest]) -> None:
+        """Read the organization id (aws:PrincipalOrgID) before simulating anything new."""
+        if not self._org_id and any(r not in cached for r in todo):
+            self._organization()
+
+    def _resource_policy(self, nid: str) -> str | None:
+        """An SQS queue's policy (read with its attributes) or an SNS topic's (read here)."""
+        if nid not in self._policies and nid.startswith("sns:"):
+            arn = self.graph.nodes[nid].arn
+            try:
+                attrs = self._client("sns").get_topic_attributes(TopicArn=arn)["Attributes"]
+                self._policies[nid] = attrs.get("Policy")
+                if attrs.get("KmsMasterKeyId"):
+                    self._key_refs[nid] = attrs["KmsMasterKeyId"]
+            except ClientError:
+                self._policies[nid] = None
+        return self._policies.get(nid)
+
+    def _simulate(self) -> int:
+        """Effective access: ``iam:SimulatePrincipalPolicy`` for the actions the crawled
+        connections need (a function / service sending to a queue or topic, a queue feeding
+        a function) and, when the snapshot has ECR interface endpoints, the image pull of
+        every function / service with VPC ENIs. Results cached for the snapshot are not
+        simulated again; resource policies are evaluated here (see iplens.access)."""
+        requests: dict[access.SimRequest, str] = {}  # -> resource node id ("" for "*")
+        for source, target, *_ in sorted(self.graph.edges):
+            req = access.ext_request(source, target)
+            if req is None:
+                continue
+            holder, action, res_node = req
+            rec, role = self.graph.nodes.get(res_node), self._role_for(holder, action)
+            if rec is not None and rec.arn and role:
+                requests[access.SimRequest(role, action, rec.arn)] = res_node
+        for holder in sorted(self._vpc_holders):
+            for action in self._ecr_actions:
+                role = self._role_for(holder, action)
+                if role:
+                    requests[access.SimRequest(role, action, "*")] = ""
+        wanted = self._cap("IAM simulations", sorted(requests), MAX_PER_SOURCE)
+        self._requests = {req: requests[req] for req in wanted}
+        self._need_org(wanted, self._cached_sims)
+        for req in wanted:
+            policy = self._resource_policy(requests[req]) if requests[req] else None
+            if policy:
+                self._resource_checks[req] = access.policy_decision(
+                    policy, req.role_arn, req.action, req.resource, context=self._context(req)
+                )
+        for req, decision, detail in access.simulate(
+            self._client("iam"), wanted, self._cached_sims, self._context
+        ):
+            self._sims[req] = (decision, detail)
+        return len(wanted)
+
+    def _kms(self) -> int:
+        """Effective access, KMS: the keys of the encrypted queues / topics the simulated
+        connections reach and of the ECR repositories (``ecr:DescribeRepositories``) the ECS
+        services' images come from, resolved with ``kms:DescribeKey``; then
+        ``kms:GenerateDataKey`` / ``kms:Decrypt`` simulated for each role on each key, and
+        the key policy (``kms:GetKeyPolicy``) evaluated when it is readable."""
+        refs: dict[tuple[str, str], str] = {}  # (resource ARN, holder) -> key id / alias / ARN
+        kms_requests: set[tuple[str, str, str]] = set()  # (role, action, key reference)
+        for req, nid in self._requests.items():
+            if nid in self._key_refs:
+                refs[(req.resource, "")] = self._key_refs[nid]
+                for action in access.KMS_ACTIONS.get(req.action, ()):
+                    kms_requests.add((req.role_arn, action, self._key_refs[nid]))
+        pull = "ecr:BatchGetImage"
+        if pull in self._ecr_actions:
+            ecr = self._client("ecr")
+            for holder in sorted(self._vpc_holders):
+                role = self._role_for(holder, pull)
+                for repo in sorted(self._images.get(holder, ()))[:MAX_PER_SOURCE]:
+                    try:
+                        found = ecr.describe_repositories(repositoryNames=[repo])["repositories"]
+                    except ClientError:
+                        continue  # another account's repository, or not readable
+                    enc = (found[0] if found else {}).get("encryptionConfiguration") or {}
+                    if enc.get("encryptionType") == "KMS" and enc.get("kmsKey") and role:
+                        refs[(found[0]["repositoryArn"], holder)] = enc["kmsKey"]
+                        kms_requests.add((role, "kms:Decrypt", enc["kmsKey"]))
+        if not refs:
+            return 0
+        kms = self._client("kms")
+        keys: dict[str, tuple[str, str | None]] = {}  # reference -> (key ARN, key policy)
+        for ref in sorted(set(refs.values())):
+            try:
+                arn = kms.describe_key(KeyId=ref)["KeyMetadata"]["Arn"]
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "") or "ClientError"
+                self._warn(f"kms:DescribeKey {ref}: {code}; its targets are not KMS-checked")
+                continue
+            try:
+                policy = kms.get_key_policy(KeyId=arn, PolicyName="default")["Policy"]
+            except ClientError:
+                policy = None  # the IAM simulation alone decides
+            keys[ref] = (arn, policy)
+        self._kms_targets = {k: keys[ref][0] for k, ref in refs.items() if ref in keys}
+        wanted: dict[access.SimRequest, str | None] = {}
+        for role, action, ref in sorted(kms_requests):
+            if ref in keys:
+                arn, policy = keys[ref]
+                wanted[access.SimRequest(role, action, arn)] = policy
+        self._kms_requests = sorted(wanted)
+        self._need_org(wanted, self._cached_kms)
+
+        # KMS is called by the queue / topic / ECR on the role's behalf: principal keys only.
+        def context(req: access.SimRequest) -> dict[str, str | None]:
+            return access.principal_context(req.role_arn, self._org_id)
+
+        policies = {
+            req: (
+                access.key_policy_decision(
+                    policy, req.role_arn, req.action, req.resource, context(req)
+                )
+                if policy
+                else ("", "")
+            )
+            for req, policy in wanted.items()
+        }
+        for req, decision, detail in access.simulate(
+            self._client("iam"), sorted(wanted), self._cached_kms, context
+        ):
+            self._kms_sims[req] = (decision, detail, *policies[req])
+        return len(wanted)
+
+    def _scps(self) -> int:
+        """Effective access, SCPs: when Organizations is readable (``DescribeOrganization``,
+        ``ListParents``, ``ListPoliciesForTarget``, ``DescribePolicy``), the SCPs from the
+        root down to each role's account for every simulated action. Without access the
+        connections stay "SCP not evaluated" (a warning, never a block)."""
+        todo = sorted(
+            {
+                (access.account_of(r.role_arn), r.action, r.resource)
+                for r in (*self._requests, *self._kms_requests)
+            }
+            - self._cached_scps
+        )
+        if not todo:
+            return 0
+        org = self._client("organizations")
+        found = self._organization()
+        if isinstance(found, str):
+            self._warn(f"SCP not evaluated: Organizations not readable ({found})")
+            return 0
+        master = found.get("MasterAccountId", "")
+        levels: dict[str, list[tuple[str, list[tuple[str, Any]]]]] = {}
+        contents: dict[str, Any] = {}
+        for account, action, resource in todo:
+            if account == master:
+                self._scp_rows[(account, action, resource)] = (
+                    access.ALLOWED,
+                    "the management account: SCPs do not apply",
+                )
+                continue
+            if account not in levels:
+                levels[account] = self._scp_levels(org, account, contents)
+            # SCP rows are per account: the principal ARN stays unknown.
+            context = {"aws:principalaccount": account}
+            if self._org_id:
+                context["aws:principalorgid"] = self._org_id
+            self._scp_rows[(account, action, resource)] = access.scp_decision(
+                levels[account], action, resource, context
+            )
+        return len(todo)
+
+    def _scp_levels(
+        self, org: Any, account: str, contents: dict[str, Any]
+    ) -> list[tuple[str, list[tuple[str, Any]]]]:
+        """``[(target id, [(SCP name, document), ...]), ...]`` from the root down to the
+        account."""
+        chain, child = [account], account
+        for _ in range(8):  # an organization nests OUs at most five levels deep
+            parents = org.list_parents(ChildId=child).get("Parents", [])
+            if not parents:
+                break
+            chain.append(parents[0]["Id"])
+            if parents[0].get("Type") == "ROOT":
+                break
+            child = parents[0]["Id"]
+        out = []
+        for target in reversed(chain):
+            policies = []
+            for p in _pages(
+                org,
+                "list_policies_for_target",
+                "Policies",
+                TargetId=target,
+                Filter="SERVICE_CONTROL_POLICY",
+            ):
+                if p["Id"] not in contents:
+                    contents[p["Id"]] = org.describe_policy(PolicyId=p["Id"])["Policy"]["Content"]
+                policies.append((p.get("Name") or p["Id"], contents[p["Id"]]))
+            out.append((target, policies))
+        return out
+
     def _prefix_list_names(self) -> int:
         lists = _pages(self._client("ec2"), "describe_managed_prefix_lists", "PrefixLists")
         for pl in lists:
@@ -1010,6 +1410,9 @@ class ExtendedCrawler:
     def _route_tables(self) -> int:
         tables = _pages(self._client("ec2"), "describe_route_tables", "RouteTables")
         count = 0
+        assoc_rows: list[tuple[Any, ...]] = []
+        route_rows: list[tuple[Any, ...]] = []
+        self._route_rows = (assoc_rows, route_rows)
         for rt in tables:
             vpc = rt.get("VpcId", "")
             if vpc not in self._vpcs:
@@ -1019,6 +1422,29 @@ class ExtendedCrawler:
             assoc = rt.get("Associations", [])
             subnets = sorted(a["SubnetId"] for a in assoc if a.get("SubnetId"))
             scope = "main route table" if any(a.get("Main") for a in assoc) else ""
+            # Effective access (route layer): '' is the VPC's main route table.
+            assoc_rows += [(rtb, vpc, s) for s in [*subnets, *([""] if scope else [])]]
+            for r in rt.get("Routes", []):
+                dest = r.get("DestinationCidrBlock") or r.get("DestinationPrefixListId")
+                target = next(
+                    (
+                        str(r[k])
+                        for k in (
+                            "GatewayId",
+                            "NatGatewayId",
+                            "TransitGatewayId",
+                            "VpcPeeringConnectionId",
+                            "NetworkInterfaceId",
+                            "InstanceId",
+                            "LocalGatewayId",
+                            "CarrierGatewayId",
+                        )
+                        if r.get(k)
+                    ),
+                    "",
+                )
+                if dest and target:
+                    route_rows.append((rtb, dest, target, r.get("State") or "active"))
             where = f"route table {rtb} ({', '.join(filter(None, [scope, *subnets])) or 'unused'})"
             for s in subnets:
                 self.graph.fact(f"subnet:{s}", f"{where}: {len(rt.get('Routes', []))} route(s)")
@@ -1059,11 +1485,35 @@ class ExtendedCrawler:
     def _nacls(self) -> int:
         acls = _pages(self._client("ec2"), "describe_network_acls", "NetworkAcls")
         count = 0
+        subnet_rows: list[tuple[Any, ...]] = []
+        entry_rows: list[tuple[Any, ...]] = []
+        self._acl_rows = (subnet_rows, entry_rows)
         for acl in acls:
             if acl.get("VpcId") not in self._vpcs:
                 continue
             count += 1
             entries = [e for e in acl.get("Entries", []) if e.get("RuleNumber") != 32767]
+            # Effective access (NACL layer): IPv4 entries; the default rule * is implicit.
+            nacl = acl["NetworkAclId"]
+            subnet_rows += [
+                (a["SubnetId"], nacl) for a in acl.get("Associations", []) if a.get("SubnetId")
+            ]
+            for e in entries:
+                if not e.get("CidrBlock"):
+                    continue
+                ports = e.get("PortRange") or {}
+                entry_rows.append(
+                    (
+                        nacl,
+                        int(bool(e.get("Egress"))),
+                        e["RuleNumber"],
+                        str(e.get("Protocol", "-1")),
+                        e["CidrBlock"],
+                        ports.get("From"),
+                        ports.get("To"),
+                        e.get("RuleAction", "deny"),
+                    )
+                )
             inbound = sum(1 for e in entries if not e.get("Egress"))
             deny = sum(1 for e in entries if e.get("RuleAction") == "deny")
             text = (

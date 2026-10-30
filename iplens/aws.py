@@ -7,7 +7,8 @@ hook that rejects any API operation whose name does not start with
 analysis, ``sts:AssumeRole`` for the role an S3 Terraform backend names: its
 session is only used to read the state object, and the ownership sources
 ``tag:GetResources``, ``cloudformation:ListStacks`` / ``ListStackResources`` and
-``cloudtrail:LookupEvents``). IPLens never mutates AWS.
+``cloudtrail:LookupEvents``, and the effective access simulation
+``iam:SimulatePrincipalPolicy``). IPLens never mutates AWS.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ READ_ONLY_ALLOWLIST = frozenset(
         ("cloudformation", "ListStackResources"),
         # Opt-in: the creator of a still unowned resource (management events, read-only).
         ("cloudtrail", "LookupEvents"),
+        # Effective access (iplens.access): evaluates a role's policies, changes nothing.
+        ("iam", "SimulatePrincipalPolicy"),
     }
 )
 

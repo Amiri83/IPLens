@@ -131,6 +131,8 @@ label.edge-filter { display: inline-flex; align-items: center; gap: .35rem; marg
 .edge-swatch.edge-ecs_lb { border-color: #2f8f4e; }
 .edge-swatch.edge-reach { border-top: 2px dashed #b0469b; }
 .edge-swatch.edge-sg { border-top: 2px dashed #8a94a3; }
+.edge-swatch.edge-blocked { border-top: 2px dashed #c62828; }
+.edge-swatch.edge-unverified { border-top: 2px dashed #9e9e9e; }
 /* Extended view evidence levels (mirrors the ev-* edge styles in visual.js). */
 .edge-swatch.ev-observed { border-top: 3px solid #1a7f37; }
 .edge-swatch.ev-configured { border-top: 2px solid #2457c5; }

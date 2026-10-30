@@ -33,7 +33,14 @@ jobs:
           ruff check .
           ruff format --check .
       - name: Test
-        run: python -m pytest -q
+        # Each failing test also becomes an annotation (readable without the raw log).
+        run: |
+          set -o pipefail
+          python -m pytest -q -rfE 2>&1 | tee pytest.out || {
+            grep -E "^(FAILED|ERROR) " pytest.out | head -20 | sed 's/^/::error::/'
+            grep -E "^E  " pytest.out | head -10 | sed 's/^/::error::/'
+            exit 1
+          }
       - name: CLI
         run: iplens --version
 

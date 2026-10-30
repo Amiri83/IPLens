@@ -1,5 +1,106 @@
 # Changelog
 
+## 1.6.3 – 2026-10-29
+
+### Added
+
+- **`NotPrincipal`** in endpoint, resource (SQS / SNS) and KMS key policies is evaluated (such
+  statements were skipped): the statement applies to every principal it does not name. A value
+  names a role by its role ARN, its sts `assumed-role` ARN, its account id or its account root;
+  so a `Deny` with `NotPrincipal` naming another role is an explicit deny.
+
+## 1.6.2 – 2026-10-29
+
+### Added
+
+- **Condition evaluation** in endpoint, resource (SQS / SNS) and KMS key policies and SCPs:
+  `aws:SourceVpce`, `aws:SourceVpc`, `aws:PrincipalArn`, `aws:PrincipalAccount`,
+  `aws:PrincipalOrgID` with `StringEquals` / `StringLike` / `ArnEquals` / `ArnLike`, the `Not`
+  variants and `IfExists` (an absent key: only a `Not` operator or `IfExists` holds).
+  `iam:SimulatePrincipalPolicy` gets the same keys as `ContextEntries`. An unknown key or operator
+  (or a key whose value is not known) makes the outcome **conditional**, never allowed.
+- **Edge states**: `allowed` (fully verified: every layer checked and passing), `unverified` (a
+  layer not checked, or conditional) and `blocked`. Unverified connections are drawn dashed grey;
+  the click reason starts with `Unverified: ` and lists the layers not checked / conditional.
+  Edges carry `state` and `unverified`.
+- **Verified only** toggle (Connections): draws only fully verified connections (`verified=1`).
+- Banner "IAM not checked – run Extended crawl" on a snapshot without an Extended crawl.
+
+### Changed
+
+- A conditional statement no longer counts as an Allow (it was taken as allowing), and a
+  conditional Deny no longer passes silently: both now make the connection unverified. An
+  unreadable resource / endpoint policy, a missing KMS key policy and "SCP not evaluated" are
+  unverified too.
+- New per-snapshot table `iam_context` (the organization id, for `aws:PrincipalOrgID`), copied by
+  *Retry skipped*; `DescribeOrganization` is read once per crawl.
+
+## 1.6.1 – 2026-10-29
+
+### Added
+
+- **Effective access, full path**, on top of the security group and IAM checks (data read by the
+  Extended crawl, cached per snapshot):
+  - **NACL**: the network ACLs of both subnets, stateless, in rule number order (first match wins,
+    the default rule `*` denies), for the request and its return traffic on the ephemeral ports
+    1024-65535, in both directions. Traffic inside one subnet is not filtered.
+  - **route**: the source subnet's route table (explicit, else the VPC's main table) needs a route
+    to the target – longest prefix match over local, VPC endpoint, NAT / internet gateway, transit
+    gateway, peering; no route or a blackhole blocks. To SQS / SNS: an interface VPC endpoint in
+    the VPC (its NACLs checked on tcp/443), else a default route.
+  - **KMS**: for encrypted SQS queues, SNS topics and ECR repositories, `kms:GenerateDataKey` /
+    `kms:Decrypt` on the key simulated for the role, and the key policy evaluated when readable
+    (a statement naming the account root delegates to IAM).
+  - **SCP**: when Organizations is readable, the SCPs from the root down to the account (every
+    level must allow, none may deny); otherwise the connection is marked "SCP not evaluated" and
+    not blocked.
+- A blocked connection's reason starts with the layer that blocked it (`Blocked at layer: SG`,
+  `NACL`, `route`, `IAM`, `endpoint policy`, `resource policy`, `KMS` or `SCP`), followed by the
+  layer's detail; edges carry `blocked_by`.
+
+### Changed
+
+- New per-snapshot tables `nacl_subnets`, `nacl_entries`, `route_subnets`, `route_entries`,
+  `kms_targets`, `kms_sims`, `scp_checks`; a crawl reuses the cached KMS / SCP results, and
+  *Retry skipped* copies all of them.
+- New read-only calls (all `Describe` / `List` / `Get`, covered by the guard's prefixes):
+  `kms:DescribeKey`, `kms:GetKeyPolicy`, `ecr:DescribeRepositories`,
+  `organizations:DescribeOrganization`, `organizations:ListParents`,
+  `organizations:ListPoliciesForTarget`, `organizations:DescribePolicy`.
+
+## 1.6.0 – 2026-10-29
+
+### Added
+
+- **Effective access** on the Visual page (IP, Logical and Extended view): only connections that
+  are really allowed are drawn. Network check (from the snapshot's security group rules, no new
+  AWS call): the source's groups must allow the egress and the target's groups the ingress, by
+  security group reference or a CIDR covering the peer's IP, every group of an ENI evaluated as a
+  union, with at least one port both sides allow; VPC endpoint edges included (a resource whose
+  egress names an endpoint's group is a candidate, and the endpoint's ingress decides). IAM check:
+  the Extended crawl calls `iam:SimulatePrincipalPolicy` for each Lambda execution role / ECS task
+  role (task execution role for ECR image pulls) and the actions its connections need
+  (`sqs:SendMessage`, `sns:Publish`, `sqs:ReceiveMessage`, `ecr:GetAuthorizationToken`,
+  `ecr:BatchGetImage`), and evaluates SQS / SNS resource policies; the VPC endpoint policy is
+  evaluated when the page is built. A connection is drawn only if both checks allow it;
+  connections without data to check against (no crawl yet, rules not collected) are not blocked.
+- **Show blocked** toggle (URL `blocked=1`): blocked connections drawn dashed red; clicking a
+  connection lists why it is effective or blocked (the security group side and groups, or the IAM
+  role / resource / endpoint policy). Per-type counts show the blocked ones.
+- Multi-AZ badge (`3 AZ`) in the IP view too: an ENI of a resource spanning several AZs shows its
+  resource's AZ count, as in the Logical view.
+- The read-only guard allowlists `iam:SimulatePrincipalPolicy` by name (a simulation, it changes
+  nothing; it carries no `Describe` / `List` / `Get` prefix).
+
+### Changed
+
+- A Refresh also stores the security groups' egress CIDR rules (`sg_egress_cidr_rules`) and the
+  VPC endpoint policy. Snapshots from before 1.6.0 lack the egress CIDR rules: their egress side
+  is not checked.
+- Simulation results and principal roles are cached per snapshot (`iam_principals`, `iam_sims`;
+  only ids and decisions, never policy documents); a crawl reuses them, and *Retry skipped*
+  copies them (and the egress rules) into the new snapshot.
+
 ## 1.5.0 – 2026-10-29
 
 ### Added

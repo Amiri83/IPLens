@@ -679,10 +679,10 @@ ROUTE_EDGE = [
 
 
 def _click_edge(page, selector):
-    mid = page.evaluate(f"() => {CY}.edges('{selector}').renderedMidpoint()")
-    page.locator("#cy").scroll_into_view_if_needed()
-    box = page.locator("#cy").bounding_box()
-    page.mouse.click(box["x"] + mid["x"], box["y"] + mid["y"])
+    # Tap the edge itself (what a click or touch triggers): pixel clicks on its midpoint
+    # are unreliable on CI runners (other edges / labels, headless pointer timing).
+    page.wait_for_function(f"() => !{CY}.animated() && {CY}.edges('{selector}').visible()")
+    page.evaluate(f"() => {CY}.edges('{selector}').emit('onetap')")
     page.wait_for_selector("#cy-tip:not([hidden])")
     return page.text_content("#cy-tip")
 
@@ -769,5 +769,110 @@ def test_transit_gateway_note_lists_denied_calls(browser, fx_server):
         "ec2:DescribeTransitGatewayAttachments skipped (AccessDenied)",
     ]
     assert page.evaluate(VISIBLE, TGW_NODE)  # what was found is still drawn
+    assert errors == []
+    page.close()
+
+
+# -- Effective access ------------------------------------------------------------------------
+
+
+@pytest.fixture
+def access_server(home, snapshot_builder):
+    """fn-a (Lambda) and service-a (ECS) towards an ECR endpoint (2 AZ) that admits only
+    the ECS tasks (tests/test_access.py)."""
+    from tests.test_access import _endpoint_snapshot
+
+    port = _free_port()
+    app = create_app(home, testing=True, port=port)
+    _endpoint_snapshot(app.extensions["iplens"]["paths"].db_path, snapshot_builder)
+    srv = serving.make_server("127.0.0.1", port, app, threaded=True)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}"
+    srv.shutdown()
+    thread.join(timeout=10)
+
+
+REACH = f"""() => {CY}.edges('.edge-reach')
+  .map((e) => [e.source().id(), e.target().id(), e.hasClass('blocked')]).sort()"""
+
+
+def test_show_blocked_toggle(browser, access_server):
+    from tests.test_access import ECR_API, FN, TASK
+    from tests.test_access import VPC as AC_VPC
+
+    page, errors = _open(browser, f"{access_server}/visual?vpc={AC_VPC}")
+    # Default: effective connections only.
+    assert not page.is_checked("#show-blocked")
+    assert page.evaluate(REACH) == [[f"res:{TASK}", f"res:{ECR_API}", False]]
+    assert page.text_content("[data-edge-count='reach']") == "(1 · 1 blocked)"
+
+    page.check("#show-blocked")
+    assert page.evaluate(REACH) == [
+        [f"res:{FN}", f"res:{ECR_API}", True],
+        [f"res:{TASK}", f"res:{ECR_API}", False],
+    ]
+    assert "blocked=1" in page.url
+    style = page.evaluate(
+        f"() => {{ const e = {CY}.edges('.blocked'); "
+        "return [e.style('line-style'), e.style('line-color')]; }"
+    )
+    assert style == ["dashed", "rgb(198,40,40)"]
+    # A click on the blocked edge shows which rule blocked it.
+    # Tap the edge itself: its midpoint can lie on the effective edge to the same endpoint.
+    page.evaluate(f"() => {CY}.edges('.blocked').emit('onetap')")
+    page.wait_for_selector("#edge-detail:not([hidden])")
+    assert "blocked" in page.text_content("#edge-detail-title")
+    assert "blocked by ingress: no rule of sg-00ecrapi" in page.text_content("#edge-detail-lines")
+
+    page.uncheck("#show-blocked")
+    assert len(page.evaluate(REACH)) == 1 and "blocked=1" not in page.url
+    # The Multi-AZ badge in the IP view: the endpoint has an ENI in two AZs.
+    assert "\n2 AZ\n" in page.evaluate(LABEL, f"res:{ECR_API}")
+    assert "AZ" not in page.evaluate(LABEL, f"res:{FN}")
+    # The ECS edge is unverified (no Extended crawl: route and IAM not checked).
+    assert page.evaluate(f"() => {CY}.edges('.edge-reach.unverified').length") == 1
+    assert errors == []
+    page.close()
+
+    # The Logical view draws the same: one effective edge, the blocked one on request.
+    page, errors = _open(browser, f"{access_server}/visual?vpc={AC_VPC}&view=logical&blocked=1")
+    assert page.is_checked("#show-blocked")
+    assert page.evaluate(REACH) == [
+        ["res:ecs:cluster-a/service-a", "res:vpc_endpoint:vpce-0example0001", False],
+        ["res:lambda:fn-a", "res:vpc_endpoint:vpce-0example0001", True],
+    ]
+    assert page.evaluate(LABEL, "res:vpc_endpoint:vpce-0example0001").endswith("\n2 AZ")
+    assert errors == []
+    page.close()
+
+
+def test_unverified_edges_and_verified_only(browser, access_server):
+    from tests.test_access import ECR_API, TASK
+    from tests.test_access import VPC as AC_VPC
+
+    page, errors = _open(browser, f"{access_server}/visual?vpc={AC_VPC}")
+    # No Extended crawl: the banner, and the effective edge is drawn dashed grey.
+    assert "IAM not checked – run Extended crawl" in page.text_content("#iam-banner")
+    assert page.evaluate(REACH) == [[f"res:{TASK}", f"res:{ECR_API}", False]]
+    style = page.evaluate(
+        f"() => {{ const e = {CY}.edges('.unverified'); "
+        "return [e.length, e.style('line-style'), e.style('line-color')]; }"
+    )
+    assert style == [1, "dashed", "rgb(158,158,158)"]
+    # A tap lists the layers not checked.
+    page.evaluate(f"() => {{ {CY}.edges('.unverified').emit('onetap'); return true; }}")
+    page.wait_for_selector("#edge-detail:not([hidden])")
+    assert "unverified" in page.text_content("#edge-detail-title")
+    assert "Unverified: route not checked, IAM not checked" in page.text_content(
+        "#edge-detail-lines"
+    )
+
+    # Verified only: nothing here is fully verified.
+    page.check("#verified-only")
+    assert page.evaluate(REACH) == []
+    assert "verified=1" in page.url
+    page.uncheck("#verified-only")
+    assert len(page.evaluate(REACH)) == 1 and "verified=1" not in page.url
     assert errors == []
     page.close()

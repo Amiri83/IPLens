@@ -13,6 +13,17 @@ Edges are derived from the stored snapshot only:
 Resources with one ENI per AZ (load balancers, VPC endpoints) are one node per
 ENI. An edge picks the far-side ENI in the same AZ when there is one, so a two-AZ
 ALB with four targets yields four edges rather than eight.
+
+Effective access (:mod:`iplens.access`): every edge is checked against the security
+groups of both ends (the flow's egress and ingress side), the network ACLs of both
+subnets (request and return traffic) and the source subnet's route to the target and,
+for a Lambda / ECS ENI -> ECR endpoint, against the cached IAM simulation, the endpoint
+policy, KMS and SCPs. An edge a layer refuses is ``blocked`` (``blocked_by``: the
+layers); one with a layer not checked or conditional is ``unverified`` (``unverified``:
+which); ``state`` is allowed / unverified / blocked. ``access`` lists the reasons either
+way, a blocked / unverified edge's led by its layers. A
+resource whose egress security group rule names an endpoint's group is a ``reach``
+candidate too, so that an endpoint refusing it shows up as a blocked edge.
 """
 
 from __future__ import annotations
@@ -23,6 +34,23 @@ import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
+
+from .access import (
+    BLOCKED,
+    IAM,
+    UNVERIFIED,
+    VERIFIED,
+    IamIndex,
+    PathCheck,
+    Ports,
+    Verdict,
+    ecr_action,
+    headline,
+    not_checked,
+    parse_ports,
+    preferred,
+    unverified_headline,
+)
 
 EDGE_TYPES = ("targets", "ecs_lb", "reach", "sg")
 EDGE_TYPE_LABELS = {
@@ -110,6 +138,7 @@ class _Node:
     name: str
     ips: tuple[str, ...]
     owners: tuple[str, ...] = ()
+    subnet: str = ""
 
     @property
     def resource_key(self) -> tuple[str, str]:
@@ -124,8 +153,21 @@ def _nearest(candidates: list[_Node], az: str) -> _Node:
 class _EdgeSet:
     def __init__(self) -> None:
         self._edges: dict[tuple[str, str, str], dict[str, Any]] = {}
+        # The network flows each edge stands for: (from node, to node, ports).
+        self._flows: dict[tuple[str, str, str], list[tuple[_Node, _Node, Ports]]] = {}
 
-    def add(self, etype: str, source: _Node, target: _Node, label: str, title: str) -> None:
+    def add(
+        self,
+        etype: str,
+        source: _Node,
+        target: _Node,
+        label: str,
+        title: str,
+        flow: Ports | None = None,
+        reverse: bool = False,
+    ) -> None:
+        """``flow``: the traffic the edge needs, from ``source`` to ``target`` (``reverse``:
+        the other way round); None when it is not a flow between the two ENIs."""
         if source.eni_id == target.eni_id:
             return
         key = (etype, source.eni_id, target.eni_id)
@@ -141,9 +183,38 @@ class _EdgeSet:
             }
         elif title not in edge["title"].split("\n"):
             edge["title"] += "\n" + title
+        if flow is not None:
+            ends = (target, source) if reverse else (source, target)
+            self._flows.setdefault(key, []).append((*ends, flow))
 
-    def count(self, etype: str) -> int:
-        return sum(1 for k in self._edges if k[0] == etype)
+    def check(self, path: PathCheck) -> None:
+        """Network check of every edge (SG, NACL, route): allowed when one of its flows is
+        (a fully verified one first)."""
+        for key, edge in self._edges.items():
+            verdicts = [
+                path.check(a, a.subnet, b, b.subnet, flow)
+                for a, b, flow in self._flows.get(key, [])
+            ]
+            chosen = preferred(verdicts) or [
+                Verdict(
+                    True,
+                    ["Not a network flow between the two ENIs: no layer checked"],
+                    unverified=["no layer checked"],
+                )
+            ]
+            edge["blocked"] = not any(v.allowed for v in chosen)
+            edge["blocked_by"] = list(
+                dict.fromkeys(layer for v in chosen if not v.allowed for layer in v.layers)
+            )
+            edge["unverified"] = list(dict.fromkeys(x for v in chosen for x in v.unverified))
+            edge["access"] = list(dict.fromkeys(ln for v in chosen for ln in v.lines))
+
+    def count(self, etype: str, blocked: bool = False) -> int:
+        return sum(
+            1
+            for k, e in self._edges.items()
+            if k[0] == etype and e.get("blocked", False) == blocked
+        )
 
     def values(self) -> list[dict[str, Any]]:
         return list(self._edges.values())
@@ -154,7 +225,7 @@ def _load_nodes(
 ) -> dict[str, _Node]:
     nodes = {}
     for r in conn.execute(
-        "SELECT eni_id, az, instance_id, security_groups FROM enis "
+        "SELECT eni_id, subnet_id, az, instance_id, security_groups FROM enis "
         "WHERE snapshot_id=? AND vpc_id=? ORDER BY eni_id",
         (snap_id, vpc_id),
     ):
@@ -171,6 +242,7 @@ def _load_nodes(
             name=res["name"],
             ips=tuple(res["ips"]),
             owners=tuple(res.get("owners") or ()),
+            subnet=r["subnet_id"] or "",
         )
     return nodes
 
@@ -213,6 +285,8 @@ def _lb_edges(
         else:
             targets = []
         port = f":{r['port']}" if r["port"] else ""
+        # A Lambda target is invoked through the Lambda service, not over its ENI.
+        flow = None if ttype == "lambda" else _tcp(r["port"])
         for t in targets:
             edges.add(
                 "targets",
@@ -220,7 +294,12 @@ def _lb_edges(
                 t,
                 f"{r['target_group']}{port}",
                 f"{r['lb_name']} → {t.name} (target group {r['target_group']}{port})",
+                flow,
             )
+
+
+def _tcp(port: int | None) -> Ports:
+    return Ports("tcp", port, port) if port else Ports("tcp")
 
 
 def _ecs_edges(
@@ -238,6 +317,15 @@ def _ecs_edges(
     ):
         if r["eni_id"] in nodes:
             tasks.setdefault((r["cluster"], r["service"]), []).append(nodes[r["eni_id"]])
+    # The load balancer forwards to a task's IP on its target group port.
+    ports = {
+        (r["target_group"], r["target_id"]): r["port"]
+        for r in conn.execute(
+            "SELECT target_group, target_id, port FROM lb_targets "
+            "WHERE snapshot_id=? AND target_type='ip'",
+            (snap_id,),
+        )
+    }
 
     for r in conn.execute(
         "SELECT cluster, service, lb_name, target_group FROM ecs_service_lbs "
@@ -249,12 +337,22 @@ def _ecs_edges(
             continue
         via = f" via {r['target_group']}" if r["target_group"] else ""
         for s in tasks.get((r["cluster"], r["service"]), []):
+            port = next(
+                (
+                    ports[(r["target_group"], ip)]
+                    for ip in s.ips
+                    if (r["target_group"], ip) in ports
+                ),
+                0,
+            )
             edges.add(
                 "ecs_lb",
                 s,
                 _nearest(targets, s.az),
                 f"ecs→lb {r['service']}",
                 f"ECS service {r['cluster']}/{r['service']} → {r['lb_name']}{via}",
+                _tcp(port),
+                reverse=True,
             )
 
 
@@ -286,6 +384,7 @@ def _sg_edges(
                 if edges.count("sg") >= MAX_SG_EDGES:
                     return True
                 b = _nearest(candidates, a.az)
+                flow = parse_ports(r["ports"])
                 if r["direction"] == "ingress":
                     edges.add(
                         "sg",
@@ -293,6 +392,7 @@ def _sg_edges(
                         a,
                         f"from {ref} of {b.name}",
                         f"{group} on {a.name} allows {r['ports']} from {ref} on {b.name}",
+                        flow,
                     )
                 else:
                     to = (
@@ -306,6 +406,7 @@ def _sg_edges(
                         b,
                         f"to {to}",
                         f"{group} on {a.name} allows {r['ports']} to {ref} on {b.name}",
+                        flow,
                     )
     return False
 
@@ -365,15 +466,18 @@ def _reach_edges(
     if not endpoints:
         return False
 
-    # Ingress rules admitting tcp/443, keyed by the security group that holds them.
+    # Ingress rules admitting tcp/443, keyed by the security group that holds them, and
+    # egress rules sending tcp/443 to a named group.
     from_sg: dict[str, list[tuple[str, str]]] = {}  # group -> [(source group, ports)]
+    to_sg: dict[str, list[tuple[str, str]]] = {}  # group -> [(target group, ports)]
     for r in conn.execute(
-        "SELECT group_id, ref_group_id, ports FROM sg_refs "
-        "WHERE snapshot_id=? AND direction='ingress' ORDER BY group_id, ref_group_id, ports",
+        "SELECT group_id, direction, ref_group_id, ports FROM sg_refs "
+        "WHERE snapshot_id=? ORDER BY group_id, direction, ref_group_id, ports",
         (snap_id,),
     ):
         if _ports_allow_endpoint(r["ports"]):
-            from_sg.setdefault(r["group_id"], []).append((r["ref_group_id"], r["ports"]))
+            rules = from_sg if r["direction"] == "ingress" else to_sg
+            rules.setdefault(r["group_id"], []).append((r["ref_group_id"], r["ports"]))
     from_cidr: dict[str, list[tuple[Any, str]]] = {}  # group -> [(network, ports)]
     for r in conn.execute(
         "SELECT group_id, cidr, ip_protocol, from_port, to_port FROM sg_cidr_rules "
@@ -389,6 +493,13 @@ def _reach_edges(
         ports = _rule_ports(r["ip_protocol"], r["from_port"], r["to_port"])
         from_cidr.setdefault(r["group_id"], []).append((net, ports))
 
+    # Groups whose rules are in the snapshot.
+    known = {
+        r[0]
+        for r in conn.execute(
+            "SELECT group_id FROM security_groups WHERE snapshot_id=?", (snap_id,)
+        )
+    }
     sources = [n for n in nodes.values() if n.owner_type != "vpc_endpoint"]
     addrs = {n.eni_id: [ipaddress.ip_address(ip) for ip in n.ips] for n in sources}
     added = 0
@@ -396,8 +507,9 @@ def _reach_edges(
         ep_sgs = sorted({sg for e in enis for sg in e.sgs})
         sg_rules = [(sg, src, ports) for sg in ep_sgs for src, ports in from_sg.get(sg, [])]
         cidr_rules = [(sg, net, ports) for sg in ep_sgs for net, ports in from_cidr.get(sg, [])]
-        if not sg_rules and not cidr_rules:
-            continue
+        # An egress rule naming the endpoint's group is a (blocked) candidate only when
+        # the endpoint's ingress rules are known to refuse it.
+        egress_candidates = bool(ep_sgs) and set(ep_sgs) <= known
         for a in sources:
             reasons = [
                 (sg, f"{sg} allows {ports} from {src} on {a.name}")
@@ -410,6 +522,14 @@ def _reach_edges(
                 for ip in addrs[a.eni_id]
                 if ip in net
             ]
+            if not reasons and egress_candidates:
+                # Only the resource's egress names the endpoint: its ingress refuses it.
+                reasons = [
+                    (dst, f"{sg} on {a.name} allows {ports} to {dst}")
+                    for sg in a.sgs
+                    for dst, ports in to_sg.get(sg, [])
+                    if dst in ep_sgs
+                ]
             if not reasons:
                 continue
             if added >= MAX_REACH_EDGES:
@@ -418,9 +538,47 @@ def _reach_edges(
             groups = dict.fromkeys(sg for sg, _ in reasons)
             label = ", ".join(sg_label(sg, sg_names) for sg in groups)
             for _sg, reason in reasons:
-                edges.add("reach", a, b, label, f"{a.name} can reach {b.name}: {reason}")
+                edges.add(
+                    "reach",
+                    a,
+                    b,
+                    label,
+                    f"{a.name} can reach {b.name}: {reason}",
+                    Ports("tcp", ENDPOINT_PORT, ENDPOINT_PORT),
+                )
             added += 1
     return False
+
+
+def _holders(node: _Node) -> list[str]:
+    """The IAM principals (``iam_principals.holder``) of a Lambda / ECS task ENI."""
+    if node.owner_type == "lambda":
+        return [
+            f"lambda:{fn}" for fn in node.owners or ((node.owner_ref,) if node.owner_ref else ())
+        ]
+    if node.owner_type == "ecs" and node.owner_ref.count("/") >= 2:
+        return [f"ecs:{node.owner_ref.rsplit('/', 1)[0]}"]  # cluster/service/task
+    return []
+
+
+def _iam_check(edges: _EdgeSet, nodes: dict[str, _Node], iam: IamIndex) -> None:
+    """Lambda / ECS ENI -> ECR endpoint: the image pull's IAM action and endpoint policy."""
+    for e in edges.values():
+        if e["type"] != "reach":
+            continue
+        endpoint = nodes[e["target"]].owner_ref
+        action = ecr_action(iam.endpoints.get(endpoint, ("", None))[0])
+        holders = _holders(nodes[e["source"]])
+        if not action or not holders:
+            continue
+        verdict = iam.check_any(holders, action, "*", endpoint) or not_checked(
+            IAM, f"IAM: {action} not checked (run the Extended crawl)"
+        )
+        e["access"] += verdict.lines
+        e["blocked"] = e["blocked"] or not verdict.allowed
+        e["unverified"] = list(dict.fromkeys([*e["unverified"], *verdict.unverified]))
+        if not verdict.allowed:
+            e["blocked_by"] = list(dict.fromkeys([*e["blocked_by"], *verdict.layers]))
 
 
 def visual_edges(
@@ -436,9 +594,10 @@ def visual_edges(
 
     ``resources`` maps ENI id -> resource node (as built for the Visual page),
     ``by_ip`` maps private IP -> ENI id and ``sg_names`` security group id -> name
-    (reach edge labels). Returns ``edges`` (only ``edge_types``),
-    per-type ``edge_types`` metadata with unfiltered counts and a ``truncated`` flag,
-    and ``edges_truncated`` (true if any type was truncated).
+    (reach edge labels). Returns ``edges`` (only ``edge_types``; each with ``blocked``
+    and the ``access`` reasons, see :mod:`iplens.access`), per-type ``edge_types``
+    metadata with unfiltered counts (``count``: effective, ``blocked``) and a
+    ``truncated`` flag, and ``edges_truncated`` (true if any type was truncated).
     """
     nodes = _load_nodes(conn, snap_id, vpc_id, resources)
     lb_enis: dict[str, list[_Node]] = {}
@@ -453,6 +612,14 @@ def visual_edges(
         "reach": _reach_edges(conn, snap_id, nodes, edges, sg_names),
         "sg": _sg_edges(conn, snap_id, nodes, edges),
     }
+    edges.check(PathCheck(conn, snap_id, sg_names))
+    _iam_check(edges, nodes, IamIndex(conn, snap_id))
+    for e in edges.values():
+        e["state"] = BLOCKED if e["blocked"] else UNVERIFIED if e["unverified"] else VERIFIED
+        if e["blocked"]:
+            e["access"].insert(0, headline(e["blocked_by"]))
+        elif e["unverified"]:
+            e["access"].insert(0, unverified_headline(e["unverified"]))
 
     selected = set(edge_types)
     return {
@@ -462,6 +629,7 @@ def visual_edges(
                 "type": t,
                 "label": EDGE_TYPE_LABELS[t],
                 "count": edges.count(t),
+                "blocked": edges.count(t, blocked=True),
                 "selected": t in selected,
                 "truncated": truncated.get(t, False),
             }

@@ -240,11 +240,12 @@ class SnapshotBuilder:
         subnet_ids,
         eni_ids,
         endpoint_type: str = "Interface",
+        policy: str | None = None,
     ) -> SnapshotBuilder:
         with closing(self.db_path) as conn:
             conn.execute(
                 "INSERT INTO endpoints(snapshot_id, endpoint_id, vpc_id, service_name, "
-                "endpoint_type, subnet_ids, eni_ids) VALUES(?,?,?,?,?,?,?)",
+                "endpoint_type, subnet_ids, eni_ids, policy) VALUES(?,?,?,?,?,?,?,?)",
                 (
                     self.id,
                     endpoint_id,
@@ -253,6 +254,7 @@ class SnapshotBuilder:
                     endpoint_type,
                     json.dumps(list(subnet_ids)),
                     json.dumps(list(eni_ids)),
+                    policy,
                 ),
             )
         return self
@@ -332,13 +334,144 @@ class SnapshotBuilder:
         return self
 
     def security_group(
-        self, group_id: str, name: str = "", group_name: str = "", vpc_id: str | None = None
+        self,
+        group_id: str,
+        name: str = "",
+        group_name: str = "",
+        vpc_id: str | None = None,
+        egress_collected: bool = False,
     ) -> SnapshotBuilder:
         with closing(self.db_path) as conn:
             conn.execute(
-                "INSERT INTO security_groups(snapshot_id, group_id, name, group_name, vpc_id) "
-                "VALUES(?,?,?,?,?)",
-                (self.id, group_id, name, group_name, vpc_id),
+                "INSERT INTO security_groups(snapshot_id, group_id, name, group_name, vpc_id, "
+                "egress_collected) VALUES(?,?,?,?,?,?)",
+                (self.id, group_id, name, group_name, vpc_id, int(egress_collected)),
+            )
+        return self
+
+    def sg_egress_cidr(
+        self,
+        group_id: str,
+        cidr: str,
+        ip_protocol: str = "-1",
+        from_port: int | None = None,
+        to_port: int | None = None,
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO sg_egress_cidr_rules(snapshot_id, group_id, cidr, ip_protocol, "
+                "from_port, to_port) VALUES(?,?,?,?,?,?)",
+                (
+                    self.id,
+                    group_id,
+                    cidr,
+                    ip_protocol,
+                    from_port,
+                    from_port if to_port is None else to_port,
+                ),
+            )
+        return self
+
+    def iam_principal(self, holder: str, purpose: str, role_arn: str) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO iam_principals(snapshot_id, holder, purpose, role_arn) "
+                "VALUES(?,?,?,?)",
+                (self.id, holder, purpose, role_arn),
+            )
+        return self
+
+    def iam_sim(
+        self,
+        role_arn: str,
+        action: str,
+        resource: str,
+        decision: str,
+        detail: str = "",
+        resource_decision: str = "",
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO iam_sims(snapshot_id, role_arn, action, resource, decision, "
+                "detail, resource_decision) VALUES(?,?,?,?,?,?,?)",
+                (self.id, role_arn, action, resource, decision, detail, resource_decision),
+            )
+        return self
+
+    def nacl(self, nacl_id: str, subnet_ids, entries) -> SnapshotBuilder:
+        """``entries``: ``(egress, rule number, protocol, cidr, from, to, action)``."""
+        with closing(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO nacl_subnets(snapshot_id, subnet_id, nacl_id) VALUES(?,?,?)",
+                [(self.id, s, nacl_id) for s in subnet_ids],
+            )
+            conn.executemany(
+                "INSERT INTO nacl_entries(snapshot_id, nacl_id, egress, rule_number, protocol, "
+                "cidr, from_port, to_port, action) VALUES(?,?,?,?,?,?,?,?,?)",
+                [(self.id, nacl_id, int(e[0]), *e[1:]) for e in entries],
+            )
+        return self
+
+    def route_table(
+        self, rtb: str, vpc_id: str, subnet_ids=(), routes=(), main: bool = False
+    ) -> SnapshotBuilder:
+        """``routes``: ``(destination, target)`` or ``(destination, target, state)``."""
+        with closing(self.db_path) as conn:
+            conn.executemany(
+                "INSERT INTO route_subnets(snapshot_id, route_table_id, vpc_id, subnet_id) "
+                "VALUES(?,?,?,?)",
+                [(self.id, rtb, vpc_id, s) for s in [*subnet_ids, *([""] if main else [])]],
+            )
+            conn.executemany(
+                "INSERT INTO route_entries(snapshot_id, route_table_id, destination, target, "
+                "state) VALUES(?,?,?,?,?)",
+                [(self.id, rtb, *r, *(() if len(r) > 2 else ("active",))) for r in routes],
+            )
+        return self
+
+    def kms_target(self, resource: str, key_arn: str, holder: str = "") -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO kms_targets(snapshot_id, resource, holder, key_arn) VALUES(?,?,?,?)",
+                (self.id, resource, holder, key_arn),
+            )
+        return self
+
+    def kms_sim(
+        self,
+        role_arn: str,
+        key_arn: str,
+        action: str,
+        decision: str,
+        detail: str = "",
+        policy_decision: str = "",
+        policy_detail: str = "",
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO kms_sims(snapshot_id, role_arn, key_arn, action, decision, detail, "
+                "policy_decision, policy_detail) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    self.id,
+                    role_arn,
+                    key_arn,
+                    action,
+                    decision,
+                    detail,
+                    policy_decision,
+                    policy_detail,
+                ),
+            )
+        return self
+
+    def scp_check(
+        self, account: str, action: str, resource: str, decision: str, detail: str = ""
+    ) -> SnapshotBuilder:
+        with closing(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO scp_checks(snapshot_id, account, action, resource, decision, "
+                "detail) VALUES(?,?,?,?,?,?)",
+                (self.id, account, action, resource, decision, detail),
             )
         return self
 

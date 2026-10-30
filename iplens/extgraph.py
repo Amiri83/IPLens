@@ -27,7 +27,7 @@ import sqlite3
 from collections.abc import Iterator, Sequence
 from typing import Any
 
-from . import environment
+from . import access, environment
 from .extended import (
     EVIDENCE_HELP,
     EVIDENCE_LABELS,
@@ -265,14 +265,52 @@ def _iter_resources(data: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 
 def annotate_base_edges(edges: list[dict[str, Any]]) -> None:
-    """Give the IP view's edges an evidence level and evidence lines (in place)."""
+    """Give the IP view's edges an evidence level and evidence lines (in place); the
+    lines of a blocked / unverified edge carry its access reasons and every line its
+    ``state``."""
     for e in edges:
         level = BASE_EVIDENCE.get(e["type"], "configured")
         e["evidence"] = level
+        blocked = bool(e.get("blocked"))
+        state = e.get("state") or (access.BLOCKED if blocked else access.VERIFIED)
+        why = " · " + "; ".join(e.get("access") or []) if state != access.VERIFIED else ""
         e["lines"] = [
-            {"evidence": level, "label": e["label"], "text": line}
+            {
+                "evidence": level,
+                "label": e["label"],
+                "text": line + why,
+                "blocked": blocked,
+                "state": state,
+            }
             for line in (e.get("title") or e["label"]).split("\n")
         ]
+
+
+def _ext_access(
+    iam: access.IamIndex,
+    path: access.PathCheck,
+    arns: dict[str, str],
+    source: str,
+    target: str,
+    drawn_source: str,
+) -> access.Verdict | None:
+    """The verdict of a crawled connection (e.g. a function sending to a queue): IAM, KMS
+    and SCPs and, when the sender is drawn as one of its VPC ENIs, the route (and the
+    NACLs to the VPC endpoint) to the service. An event source mapping (queue ->
+    function) is polled by the Lambda service, not over the function's ENI."""
+    req = access.ext_request(source, target)
+    if req is None or not arns.get(req[2]):
+        return None
+    holder, action, resource = req
+    identity = iam.check(holder, action, arns[resource]) or access.not_checked(
+        access.IAM, f"IAM: {action} not checked (run the Extended crawl)"
+    )
+    network = None
+    if holder == source and not drawn_source.startswith(EXT_PREFIX):
+        network = path.to_service(drawn_source, resource.partition(":")[0]) or (
+            access.not_checked(access.ROUTE, "route not checked (run the Extended crawl)")
+        )
+    return access.combine([identity, network])
 
 
 class _Resolver:
@@ -361,6 +399,12 @@ def extended_data(
     run = latest_run(conn, snap_id, vpc_id)
     rows += list(_flow_lines(conn, snap_id, vpc_id, run))
 
+    iam = access.IamIndex(conn, snap_id)
+    path = access.PathCheck(conn, snap_id, None)
+    arns = {
+        r["node_id"]: r["arn"]
+        for r in conn.execute("SELECT node_id, arn FROM ext_nodes WHERE snapshot_id=?", (snap_id,))
+    }
     merged: dict[tuple[str, str], dict[str, Any]] = {}
     used: set[str] = set()
     for source, target, evidence, label, detail in rows:
@@ -371,7 +415,15 @@ def extended_data(
             (s, t),
             {"id": f"ext:{len(merged)}", "type": "ext", "source": s, "target": t, "lines": []},
         )
-        edge["lines"].append({"evidence": evidence, "label": label, "text": detail})
+        verdict = _ext_access(iam, path, arns, source, target, s)
+        # A line without a verdict (not an access-checked connection) has no state.
+        line = {"evidence": evidence, "label": label, "text": detail, "blocked": False}
+        if verdict is not None:
+            line["blocked"] = not verdict.allowed
+            line["blocked_by"] = verdict.layers
+            line["state"] = access.state(verdict)
+            line["text"] += " · " + "; ".join(access.reasons(verdict))
+        edge["lines"].append(line)
         used.update(x[len(EXT_PREFIX) :] for x in (s, t) if x.startswith(EXT_PREFIX))
     edges = []
     for edge in merged.values():
@@ -379,6 +431,12 @@ def extended_data(
         best = edge["lines"][0]
         edge["evidence"] = best["evidence"]
         edge["label"] = best["label"]
+        edge["blocked"] = all(ln["blocked"] for ln in edge["lines"])
+        edge["blocked_by"] = list(
+            dict.fromkeys(
+                x for ln in edge["lines"] if edge["blocked"] for x in ln.get("blocked_by") or []
+            )
+        )
         edge["title"] = "\n".join(f"[{ln['evidence']}] {ln['text']}" for ln in edge["lines"])
         edges.append(edge)
 
