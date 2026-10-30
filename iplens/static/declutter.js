@@ -54,6 +54,7 @@
           drawn_target: t,
           shown: shownLevels.has(ln.evidence),
           blocked: !!ln.blocked,
+          state: ln.state || "",
         });
       });
     });

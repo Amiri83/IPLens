@@ -95,6 +95,7 @@ def merge_edges(
                     "drawn_target": t,
                     "shown": ln["evidence"] in shown_levels,
                     "blocked": bool(ln.get("blocked")),
+                    "state": ln.get("state") or "",
                 }
             )
     out = []

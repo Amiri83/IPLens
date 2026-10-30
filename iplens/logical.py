@@ -141,7 +141,8 @@ def logical_nodes(vpc: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, 
 
 def logical_edges(edges: Iterable[dict[str, Any]], of_eni: dict[str, str]) -> list[dict[str, Any]]:
     """IP view edges between logical nodes: one edge per type and node pair (and one
-    more for its blocked ENI edges), ``label`` the distinct labels, ``title`` / ``access``
+    more for its blocked ENI edges; ``state`` unverified unless one of them is verified),
+    ``label`` the distinct labels, ``title`` / ``access``
     the distinct lines, ``merged`` the ENI edges it stands for. Edges inside one logical
     resource are dropped."""
     merged: dict[tuple[str, str, str, bool], dict[str, Any]] = {}
@@ -150,6 +151,7 @@ def logical_edges(edges: Iterable[dict[str, Any]], of_eni: dict[str, str]) -> li
         if s is None or t is None or s == t:
             continue
         blocked = bool(e.get("blocked"))
+        state = e.get("state") or ("blocked" if blocked else "allowed")
         m = merged.setdefault(
             (e["type"], s, t, blocked),
             {
@@ -158,7 +160,9 @@ def logical_edges(edges: Iterable[dict[str, Any]], of_eni: dict[str, str]) -> li
                 "source": s,
                 "target": t,
                 "blocked": blocked,
+                "state": state,
                 "blocked_by": [],
+                "unverified": [],
                 "access": [],
                 "labels": [],
                 "titles": [],
@@ -166,11 +170,14 @@ def logical_edges(edges: Iterable[dict[str, Any]], of_eni: dict[str, str]) -> li
             },
         )
         m["merged"] += 1
+        if state == "allowed":  # verified when one of its ENI edges is
+            m["state"] = state
         if e["label"] not in m["labels"]:
             m["labels"].append(e["label"])
         m["titles"].extend(ln for ln in e["title"].split("\n") if ln not in m["titles"])
         m["access"].extend(ln for ln in e.get("access") or [] if ln not in m["access"])
         m["blocked_by"].extend(x for x in e.get("blocked_by") or [] if x not in m["blocked_by"])
+        m["unverified"].extend(x for x in e.get("unverified") or [] if x not in m["unverified"])
     out = []
     for m in merged.values():
         labels, titles = m.pop("labels"), m.pop("titles")

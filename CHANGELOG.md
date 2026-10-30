@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.6.2 – 2026-10-29
+
+### Added
+
+- **Condition evaluation** in endpoint, resource (SQS / SNS) and KMS key policies and SCPs:
+  `aws:SourceVpce`, `aws:SourceVpc`, `aws:PrincipalArn`, `aws:PrincipalAccount`,
+  `aws:PrincipalOrgID` with `StringEquals` / `StringLike` / `ArnEquals` / `ArnLike`, the `Not`
+  variants and `IfExists` (an absent key: only a `Not` operator or `IfExists` holds).
+  `iam:SimulatePrincipalPolicy` gets the same keys as `ContextEntries`. An unknown key or operator
+  (or a key whose value is not known) makes the outcome **conditional**, never allowed.
+- **Edge states**: `allowed` (fully verified: every layer checked and passing), `unverified` (a
+  layer not checked, or conditional) and `blocked`. Unverified connections are drawn dashed grey;
+  the click reason starts with `Unverified: ` and lists the layers not checked / conditional.
+  Edges carry `state` and `unverified`.
+- **Verified only** toggle (Connections): draws only fully verified connections (`verified=1`).
+- Banner "IAM not checked – run Extended crawl" on a snapshot without an Extended crawl.
+
+### Changed
+
+- A conditional statement no longer counts as an Allow (it was taken as allowing), and a
+  conditional Deny no longer passes silently: both now make the connection unverified. An
+  unreadable resource / endpoint policy, a missing KMS key policy and "SCP not evaluated" are
+  unverified too.
+- New per-snapshot table `iam_context` (the organization id, for `aws:PrincipalOrgID`), copied by
+  *Retry skipped*; `DescribeOrganization` is read once per crawl.
+
 ## 1.6.1 – 2026-10-29
 
 ### Added

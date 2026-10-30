@@ -266,14 +266,22 @@ def _iter_resources(data: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 def annotate_base_edges(edges: list[dict[str, Any]]) -> None:
     """Give the IP view's edges an evidence level and evidence lines (in place); the
-    lines of a blocked edge are ``blocked`` and carry its access reasons."""
+    lines of a blocked / unverified edge carry its access reasons and every line its
+    ``state``."""
     for e in edges:
         level = BASE_EVIDENCE.get(e["type"], "configured")
         e["evidence"] = level
         blocked = bool(e.get("blocked"))
-        why = " · " + "; ".join(e.get("access") or []) if blocked else ""
+        state = e.get("state") or (access.BLOCKED if blocked else access.VERIFIED)
+        why = " · " + "; ".join(e.get("access") or []) if state != access.VERIFIED else ""
         e["lines"] = [
-            {"evidence": level, "label": e["label"], "text": line + why, "blocked": blocked}
+            {
+                "evidence": level,
+                "label": e["label"],
+                "text": line + why,
+                "blocked": blocked,
+                "state": state,
+            }
             for line in (e.get("title") or e["label"]).split("\n")
         ]
 
@@ -294,11 +302,15 @@ def _ext_access(
     if req is None or not arns.get(req[2]):
         return None
     holder, action, resource = req
-    identity = iam.check(holder, action, arns[resource])
+    identity = iam.check(holder, action, arns[resource]) or access.not_checked(
+        access.IAM, f"IAM: {action} not checked (run the Extended crawl)"
+    )
     network = None
     if holder == source and not drawn_source.startswith(EXT_PREFIX):
-        network = path.to_service(drawn_source, resource.partition(":")[0])
-    return None if identity is None and network is None else access.combine([identity, network])
+        network = path.to_service(drawn_source, resource.partition(":")[0]) or (
+            access.not_checked(access.ROUTE, "route not checked (run the Extended crawl)")
+        )
+    return access.combine([identity, network])
 
 
 class _Resolver:
@@ -404,10 +416,12 @@ def extended_data(
             {"id": f"ext:{len(merged)}", "type": "ext", "source": s, "target": t, "lines": []},
         )
         verdict = _ext_access(iam, path, arns, source, target, s)
+        # A line without a verdict (not an access-checked connection) has no state.
         line = {"evidence": evidence, "label": label, "text": detail, "blocked": False}
         if verdict is not None:
             line["blocked"] = not verdict.allowed
             line["blocked_by"] = verdict.layers
+            line["state"] = access.state(verdict)
             line["text"] += " · " + "; ".join(access.reasons(verdict))
         edge["lines"].append(line)
         used.update(x[len(EXT_PREFIX) :] for x in (s, t) if x.startswith(EXT_PREFIX))

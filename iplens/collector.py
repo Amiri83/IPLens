@@ -183,6 +183,7 @@ _MERGED: tuple[tuple[frozenset[str], tuple[str, ...], tuple[str, ...]], ...] = (
             "kms_targets",
             "kms_sims",
             "scp_checks",
+            "iam_context",
         ),
         (),
     ),

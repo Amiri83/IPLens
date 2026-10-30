@@ -361,6 +361,13 @@ CREATE TABLE IF NOT EXISTS kms_sims (
     PRIMARY KEY (snapshot_id, role_arn, key_arn, action)
 );
 
+-- Condition context (1.6.2): the organization of the crawled account, for
+-- aws:PrincipalOrgID ('' = unknown: Organizations not readable).
+CREATE TABLE IF NOT EXISTS iam_context (
+    snapshot_id INTEGER PRIMARY KEY REFERENCES snapshots(id) ON DELETE CASCADE,
+    org_id      TEXT NOT NULL DEFAULT ''
+);
+
 -- No row for an account / action: SCPs not evaluated (no Organizations read access).
 CREATE TABLE IF NOT EXISTS scp_checks (
     snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,

@@ -31,6 +31,7 @@ from flask import (
 from markupsafe import Markup
 
 from . import (
+    access,
     alerts,
     cidrplan,
     diagram,
@@ -1351,8 +1352,11 @@ def _register(app: Flask) -> None:
             # The data endpoint still returns every type; the browser filters, so
             # ticking "SG refs" later needs no refetch.
             edges_on=_edge_types(DEFAULT_EDGE_TYPES),
-            # Effective access: blocked connections are drawn only on request.
+            # Effective access: blocked connections are drawn only on request; "Verified
+            # only" draws only the fully verified ones.
             show_blocked=request.args.get("blocked") == "1",
+            verified_only=request.args.get("verified") == "1",
+            iam_unchecked=bool(snap) and not access.iam_crawled(_db(), snap["id"]),
             prefs=prefs,
             short_name_max=SHORT_NAME_MAX,
             group_by_choices=GROUP_BY,

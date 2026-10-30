@@ -626,6 +626,18 @@ that blocked it (`Blocked at layer: SG`, `NACL`, `route`, `IAM`, `endpoint polic
 policy that blocked it. Resources spanning several Availability Zones carry an AZ count badge
 (`3 AZ`) in the IP view as in the Logical view.
 
+**Conditions and states** (1.6.2): endpoint, resource and key policies and SCPs evaluate
+`aws:SourceVpce`, `aws:SourceVpc`, `aws:PrincipalArn`, `aws:PrincipalAccount` and
+`aws:PrincipalOrgID` with `StringEquals` / `StringLike` / `ArnEquals` / `ArnLike`, their `Not`
+variants and `IfExists`; the simulation gets the same keys as `ContextEntries`. The network keys
+are known when every holder of a role is in one VPC (through its interface endpoint for the
+service, private DNS assumed) or in none; SCPs are evaluated per account, so `aws:PrincipalArn`
+is unknown there. Any other key or operator makes the outcome *conditional*. Every connection is
+**allowed** (every layer checked and passing), **unverified** (a layer not checked, or
+conditional – drawn dashed grey; click one for which) or **blocked**. **Verified only** draws only
+the allowed ones. A snapshot without an Extended crawl shows "IAM not checked – run Extended
+crawl".
+
 ## Terraform (optional)
 
 Terraform is **not required**: ownership is AWS-first, and the Terraform enrichment is off by

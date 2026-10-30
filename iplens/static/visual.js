@@ -65,6 +65,7 @@
   const groupTagSelect = document.getElementById("group-tag");
   const expandExportBox = document.getElementById("export-expand");
   const showBlockedBox = document.getElementById("show-blocked");
+  const verifiedOnlyBox = document.getElementById("verified-only");
   const envFilters = document.getElementById("env-filters");
   // Per-view state key (iplens.viewstate.VIEWS).
   const view = extended ? "extended" : logical ? "logical" : "ip";
@@ -797,17 +798,30 @@
     return !!(showBlockedBox && showBlockedBox.checked);
   }
 
+  // "Verified only": only fully verified connections (every layer checked and passing).
+  function verifiedOnly() {
+    return !!(verifiedOnlyBox && verifiedOnlyBox.checked);
+  }
+
+  // allowed | unverified | blocked (iplens.access.state).
+  function edgeState(e) {
+    return e.state || (e.blocked ? "blocked" : "allowed");
+  }
+
   /* IP view edges as drawn: endpoints mapped onto visible nodes, edges of one type
-     between the same two nodes merged (blocked ones apart). */
+     between the same two nodes merged (blocked / unverified ones apart). */
   function visibleEdges(cy, edges, types, expandAll) {
     const merged = new Map();
     const withBlocked = showBlocked();
+    const onlyVerified = verifiedOnly();
     edges.forEach((e) => {
+      const state = edgeState(e);
       if (!types.has(e.type) || (e.blocked && !withBlocked)) return;
+      if (onlyVerified && state !== "allowed") return;
       const s = endpointId(cy, e.source, expandAll);
       const t = endpointId(cy, e.target, expandAll);
       if (!s || !t || s === t) return;
-      const key = `${e.type}|${s}|${t}|${e.blocked ? 1 : 0}`;
+      const key = `${e.type}|${s}|${t}|${state}`;
       const access = e.access || [];
       const m = merged.get(key);
       if (m) {
@@ -817,7 +831,7 @@
       } else {
         merged.set(key, {
           type: e.type, source: s, target: t, label: e.label, titles: [e.title], n: 1,
-          blocked: !!e.blocked, access: access.slice(),
+          blocked: !!e.blocked, state: state, access: access.slice(),
         });
       }
     });
@@ -873,12 +887,16 @@
           source: m.source,
           target: m.target,
           label: (m.blocked ? "blocked: " : "") + edgeLabel(m),
-          title: (m.blocked ? "BLOCKED (click for the reason)\n" : "") + m.titles.join("\n") +
+          title: (m.blocked ? "BLOCKED (click for the reason)\n" : "") +
+            (m.state === "unverified" ? "UNVERIFIED (click for what is missing)\n" : "") +
+            m.titles.join("\n") +
             (m.n > m.titles.length ? `\n… +${m.n - m.titles.length} more` : ""),
           blocked: m.blocked,
+          state: m.state,
           access: m.access,
         },
-        classes: "edge-" + m.type + (m.blocked ? " blocked" : ""),
+        classes: "edge-" + m.type + (m.blocked ? " blocked" : "") +
+          (m.state === "unverified" ? " unverified" : ""),
       })));
       cy.add(visibleTgwEdges(cy, tgwEdges).map((e) => ({
         group: "edges",
@@ -1186,9 +1204,12 @@
   function drawnEdges(cy, edges) {
     const types = enabledEdgeTypes();
     const withBlocked = showBlocked();
+    const onlyVerified = verifiedOnly();
+    // A line's state: set on access-checked connections only (iplens.extgraph).
+    const keep = (ln) => (withBlocked || !ln.blocked) && (!onlyVerified || ln.state === "allowed");
     const input = edges
       .filter((e) => e.type === "ext" || types.has(e.type))
-      .map((e) => (withBlocked ? e : { ...e, lines: (e.lines || []).filter((ln) => !ln.blocked) }))
+      .map((e) => ({ ...e, lines: (e.lines || []).filter(keep) }))
       .filter((e) => (e.lines || []).length);
     return D.mergeEdges(input, Array.from(enabledEvidence()), (id) => extEndpoint(cy, id));
   }
@@ -1257,7 +1278,8 @@
           width: m.width, bidir: m.bidir, label: extEdgeLabel(m), title: extEdgeTitle(m),
         },
         classes: `edge-ext ev-${m.evidence}` + (m.count > 1 ? " agg" : "") + (m.bidir ? " bidir" : "") +
-          (m.lines.every((ln) => ln.blocked) ? " blocked" : ""),
+          (m.lines.every((ln) => ln.blocked) ? " blocked" : "") +
+          (m.lines.every((ln) => ln.state === "unverified") ? " unverified" : ""),
       })));
     });
     return drawn;
@@ -1501,6 +1523,8 @@
     edgeBoxes.filter((b) => b.checked).forEach((b) => params.append("edges", b.value));
     params.delete("blocked");
     if (showBlocked()) params.set("blocked", "1");
+    params.delete("verified");
+    if (verifiedOnly()) params.set("verified", "1");
     window.history.replaceState(null, "", `${window.location.pathname}?${params}`);
   }
 
@@ -2053,6 +2077,11 @@
       "line-color": "#c62828", "target-arrow-color": "#c62828", "source-arrow-color": "#c62828",
       "line-style": "dashed", "line-dash-pattern": [6, 4], "color": "#9b1c1c", "opacity": 1,
     } },
+    // An unverified connection: a layer not checked, or conditional.
+    { selector: "edge.unverified", style: {
+      "line-color": "#9e9e9e", "target-arrow-color": "#9e9e9e", "source-arrow-color": "#9e9e9e",
+      "line-style": "dashed", "line-dash-pattern": [6, 4], "color": "#616161",
+    } },
     { selector: "node.dim", style: { "opacity": 0.2 } },
     { selector: "edge.dim", style: { "opacity": 0.08, "text-opacity": 0 } },
     { selector: "node.focus", style: { "overlay-color": "#2457c5", "overlay-opacity": 0.12 } },
@@ -2291,7 +2320,8 @@
         const access = e.data("access") || [];
         showDetail(
           `${nodeName(cy, e.source().id())} → ${nodeName(cy, e.target().id())}: ` +
-            (e.data("blocked") ? "blocked" : "effective access"),
+            (e.data("blocked") ? "blocked"
+              : e.data("state") === "unverified" ? "unverified" : "effective access"),
           (access.length ? access : ["No security group or IAM data to check it against."])
             .map((text) => ({ text: text })),
         );
@@ -2414,12 +2444,12 @@
       if (ext) relayout(); else refreshEdges();
       rememberEdgeFilter();
     }));
-    if (showBlockedBox) {
-      showBlockedBox.addEventListener("change", () => {
+    [showBlockedBox, verifiedOnlyBox].filter(Boolean).forEach((box) => {
+      box.addEventListener("change", () => {
         if (ext) relayout(); else refreshEdges();
         rememberEdgeFilter();
       });
-    }
+    });
 
     (data.edge_types || []).forEach((t) => {
       const el = document.querySelector(`[data-edge-count="${t.type}"]`);
@@ -2428,6 +2458,11 @@
     const blockedCount = document.querySelector("[data-blocked-count]");
     if (blockedCount) {
       blockedCount.textContent = `(${edges.filter((e) => e.blocked).length})`;
+    }
+    const unverifiedCount = document.querySelector("[data-unverified-count]");
+    if (unverifiedCount) {
+      const n = edges.filter((e) => edgeState(e) === "unverified").length;
+      unverifiedCount.textContent = n ? `(${n} unverified)` : "";
     }
     function updateStatus() {
       const nRes = data.vpc.subnets.reduce((a, s) => a + s.resource_count, 0);

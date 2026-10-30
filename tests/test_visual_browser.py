@@ -832,6 +832,8 @@ def test_show_blocked_toggle(browser, access_server):
     # The Multi-AZ badge in the IP view: the endpoint has an ENI in two AZs.
     assert "\n2 AZ\n" in page.evaluate(LABEL, f"res:{ECR_API}")
     assert "AZ" not in page.evaluate(LABEL, f"res:{FN}")
+    # The ECS edge is unverified (no Extended crawl: route and IAM not checked).
+    assert page.evaluate(f"() => {CY}.edges('.edge-reach.unverified').length") == 1
     assert errors == []
     page.close()
 
@@ -843,5 +845,36 @@ def test_show_blocked_toggle(browser, access_server):
         ["res:lambda:fn-a", "res:vpc_endpoint:vpce-0example0001", True],
     ]
     assert page.evaluate(LABEL, "res:vpc_endpoint:vpce-0example0001").endswith("\n2 AZ")
+    assert errors == []
+    page.close()
+
+
+def test_unverified_edges_and_verified_only(browser, access_server):
+    from tests.test_access import ECR_API, TASK
+    from tests.test_access import VPC as AC_VPC
+
+    page, errors = _open(browser, f"{access_server}/visual?vpc={AC_VPC}")
+    # No Extended crawl: the banner, and the effective edge is drawn dashed grey.
+    assert "IAM not checked – run Extended crawl" in page.text_content("#iam-banner")
+    assert page.evaluate(REACH) == [[f"res:{TASK}", f"res:{ECR_API}", False]]
+    style = page.evaluate(
+        f"() => {{ const e = {CY}.edges('.unverified'); "
+        "return [e.length, e.style('line-style'), e.style('line-color')]; }"
+    )
+    assert style == [1, "dashed", "rgb(158,158,158)"]
+    # A tap lists the layers not checked.
+    page.evaluate(f"() => {{ {CY}.edges('.unverified').emit('onetap'); return true; }}")
+    page.wait_for_selector("#edge-detail:not([hidden])")
+    assert "unverified" in page.text_content("#edge-detail-title")
+    assert "Unverified: route not checked, IAM not checked" in page.text_content(
+        "#edge-detail-lines"
+    )
+
+    # Verified only: nothing here is fully verified.
+    page.check("#verified-only")
+    assert page.evaluate(REACH) == []
+    assert "verified=1" in page.url
+    page.uncheck("#verified-only")
+    assert len(page.evaluate(REACH)) == 1 and "verified=1" not in page.url
     assert errors == []
     page.close()

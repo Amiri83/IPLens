@@ -396,6 +396,13 @@ class ExtendedCrawler:
         self._scp_rows: dict[tuple[str, str, str], tuple[str, str]] = {}
         self._acl_rows: tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]] | None = None
         self._route_rows: tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]] | None = None
+        # Condition context: DescribeOrganization (the organization, or the error code),
+        # the organization id (also cached for the snapshot), each holder's VPC (None: not
+        # in a VPC) and the interface endpoints (VPC, service name, endpoint id).
+        self._org: dict[str, Any] | str | None = None
+        self._org_id = ""
+        self._holder_vpcs: dict[str, str | None] = {}
+        self._interface_eps: list[tuple[str, str, str]] = []
 
     # -- plumbing ---------------------------------------------------------------------
 
@@ -524,19 +531,33 @@ class ExtendedCrawler:
             for r in conn.execute("SELECT service_name FROM endpoints WHERE snapshot_id=?", (sid,))
         }
         self._ecr_actions = sorted({a for s in services if (a := access.ecr_action(s))})
-        self._vpc_holders = {
-            node_id("lambda", r[0])
+        self._holder_vpcs = {
+            node_id("lambda", r[0]): r[1]
+            for r in conn.execute("SELECT name, vpc_id FROM lambdas WHERE snapshot_id=?", (sid,))
+        }
+        ecs_vpcs: dict[str, set[str | None]] = {}
+        for r in conn.execute(
+            "SELECT DISTINCT t.cluster, t.service, e.vpc_id FROM ecs_task_enis t "
+            "LEFT JOIN enis e ON e.snapshot_id=t.snapshot_id AND e.eni_id=t.eni_id "
+            "WHERE t.snapshot_id=? AND t.service != ''",
+            (sid,),
+        ):
+            ecs_vpcs.setdefault(node_id("ecs", f"{r[0]}/{r[1]}"), set()).add(r[2])
+        # A service's tasks are in one VPC; otherwise its context is unknown (left out).
+        self._holder_vpcs.update(
+            {h: next(iter(v)) for h, v in ecs_vpcs.items() if len(v) == 1 and None not in v}
+        )
+        self._vpc_holders = {h for h, vpc in self._holder_vpcs.items() if vpc} | set(ecs_vpcs)
+        self._interface_eps = [
+            (r[0], r[1] or "", r[2])
             for r in conn.execute(
-                "SELECT name FROM lambdas WHERE snapshot_id=? AND vpc_id IS NOT NULL", (sid,)
-            )
-        } | {
-            node_id("ecs", f"{r[0]}/{r[1]}")
-            for r in conn.execute(
-                "SELECT DISTINCT cluster, service FROM ecs_task_enis "
-                "WHERE snapshot_id=? AND service != ''",
+                "SELECT vpc_id, service_name, endpoint_id FROM endpoints "
+                "WHERE snapshot_id=? AND endpoint_type='Interface' ORDER BY endpoint_id",
                 (sid,),
             )
-        }
+        ]
+        row = conn.execute("SELECT org_id FROM iam_context WHERE snapshot_id=?", (sid,)).fetchone()
+        self._org_id = row[0] if row else ""
 
     def _save(self) -> None:
         g, sid = self.graph, self.snapshot_id
@@ -620,6 +641,11 @@ class ExtendedCrawler:
                 "decision, detail) VALUES(?,?,?,?,?,?)",
                 [(sid, *key, *result) for key, result in sorted(self._scp_rows.items())],
             )
+            if self._org_id:
+                conn.execute(
+                    "INSERT OR REPLACE INTO iam_context(snapshot_id, org_id) VALUES(?,?)",
+                    (sid, self._org_id),
+                )
             conn.execute(
                 "INSERT INTO ext_crawls(snapshot_id, crawled_at, warnings, sources) "
                 "VALUES(?,?,?,?)",
@@ -1153,6 +1179,38 @@ class ExtendedCrawler:
             None,
         )
 
+    def _organization(self) -> dict[str, Any] | str:
+        """``DescribeOrganization``, once per crawl: the organization, or the error code."""
+        if self._org is None:
+            try:
+                self._org = self._client("organizations").describe_organization()["Organization"]
+                self._org_id = self._org.get("Id", "")
+            except ClientError as exc:
+                self._org = exc.response.get("Error", {}).get("Code", "") or "ClientError"
+        return self._org
+
+    def _context(self, req: access.SimRequest) -> dict[str, str | None]:
+        """The condition keys of ``req`` known here: the principal's and, when every holder
+        of the role sits in the same VPC (or none in a VPC), the network path: through
+        the VPC's interface endpoint for the service (private DNS assumed), else none."""
+        ctx = access.principal_context(req.role_arn, self._org_id)
+        holders = {h for (h, _), role in self._principals.items() if role == req.role_arn}
+        vpcs = {self._holder_vpcs.get(h, "?") for h in holders}
+        if len(vpcs) != 1 or "?" in vpcs:
+            return ctx
+        vpc = vpcs.pop()
+        suffix = access.endpoint_suffix(req.action)
+        ep = next(
+            (e for v, name, e in self._interface_eps if vpc and v == vpc and name.endswith(suffix)),
+            None,
+        )
+        return {**ctx, **access.network_context(ep, vpc)}
+
+    def _need_org(self, todo: Iterable[access.SimRequest], cached: set[access.SimRequest]) -> None:
+        """Read the organization id (aws:PrincipalOrgID) before simulating anything new."""
+        if not self._org_id and any(r not in cached for r in todo):
+            self._organization()
+
     def _resource_policy(self, nid: str) -> str | None:
         """An SQS queue's policy (read with its attributes) or an SNS topic's (read here)."""
         if nid not in self._policies and nid.startswith("sns:"):
@@ -1188,14 +1246,15 @@ class ExtendedCrawler:
                     requests[access.SimRequest(role, action, "*")] = ""
         wanted = self._cap("IAM simulations", sorted(requests), MAX_PER_SOURCE)
         self._requests = {req: requests[req] for req in wanted}
+        self._need_org(wanted, self._cached_sims)
         for req in wanted:
             policy = self._resource_policy(requests[req]) if requests[req] else None
             if policy:
                 self._resource_checks[req] = access.policy_decision(
-                    policy, req.role_arn, req.action, req.resource
+                    policy, req.role_arn, req.action, req.resource, context=self._context(req)
                 )
         for req, decision, detail in access.simulate(
-            self._client("iam"), wanted, self._cached_sims
+            self._client("iam"), wanted, self._cached_sims, self._context
         ):
             self._sims[req] = (decision, detail)
         return len(wanted)
@@ -1250,16 +1309,24 @@ class ExtendedCrawler:
                 arn, policy = keys[ref]
                 wanted[access.SimRequest(role, action, arn)] = policy
         self._kms_requests = sorted(wanted)
+        self._need_org(wanted, self._cached_kms)
+
+        # KMS is called by the queue / topic / ECR on the role's behalf: principal keys only.
+        def context(req: access.SimRequest) -> dict[str, str | None]:
+            return access.principal_context(req.role_arn, self._org_id)
+
         policies = {
             req: (
-                access.key_policy_decision(policy, req.role_arn, req.action, req.resource)
+                access.key_policy_decision(
+                    policy, req.role_arn, req.action, req.resource, context(req)
+                )
                 if policy
                 else ("", "")
             )
             for req, policy in wanted.items()
         }
         for req, decision, detail in access.simulate(
-            self._client("iam"), sorted(wanted), self._cached_kms
+            self._client("iam"), sorted(wanted), self._cached_kms, context
         ):
             self._kms_sims[req] = (decision, detail, *policies[req])
         return len(wanted)
@@ -1279,12 +1346,11 @@ class ExtendedCrawler:
         if not todo:
             return 0
         org = self._client("organizations")
-        try:
-            master = org.describe_organization()["Organization"].get("MasterAccountId", "")
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "") or "ClientError"
-            self._warn(f"SCP not evaluated: Organizations not readable ({code})")
+        found = self._organization()
+        if isinstance(found, str):
+            self._warn(f"SCP not evaluated: Organizations not readable ({found})")
             return 0
+        master = found.get("MasterAccountId", "")
         levels: dict[str, list[tuple[str, list[tuple[str, Any]]]]] = {}
         contents: dict[str, Any] = {}
         for account, action, resource in todo:
@@ -1296,8 +1362,12 @@ class ExtendedCrawler:
                 continue
             if account not in levels:
                 levels[account] = self._scp_levels(org, account, contents)
+            # SCP rows are per account: the principal ARN stays unknown.
+            context = {"aws:principalaccount": account}
+            if self._org_id:
+                context["aws:principalorgid"] = self._org_id
             self._scp_rows[(account, action, resource)] = access.scp_decision(
-                levels[account], action, resource
+                levels[account], action, resource, context
             )
         return len(todo)
 

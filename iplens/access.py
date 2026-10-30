@@ -45,6 +45,14 @@ Full path (1.6.1), from data the Extended crawl caches per snapshot:
 
 A blocked connection's reasons start with the layer(s) that blocked it
 (:func:`reasons`): SG, NACL, route, IAM, endpoint policy, resource policy, KMS or SCP.
+
+Conditions (1.6.2): endpoint, resource, key policies and SCPs evaluate ``aws:SourceVpce``,
+``aws:SourceVpc``, ``aws:PrincipalArn``, ``aws:PrincipalAccount`` and ``aws:PrincipalOrgID``
+with String / Arn Equals / Like, their Not variants and IfExists (:func:`condition_result`);
+the simulation gets them as ``ContextEntries``. Any other key or operator makes the
+decision :data:`CONDITIONAL`. A connection has one of three :func:`state` values:
+``allowed`` (every layer checked and passing), ``unverified`` (a layer not checked, or
+conditional: ``Verdict.unverified`` names them) or ``blocked``.
 """
 
 from __future__ import annotations
@@ -53,7 +61,7 @@ import ipaddress
 import json
 import re
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -64,6 +72,8 @@ _PROTOCOLS = {"-1": ALL, "6": "tcp", "17": "udp", "1": "icmp"}
 ALLOWED = "allowed"
 EXPLICIT_DENY = "explicitDeny"
 IMPLICIT_DENY = "implicitDeny"
+# A policy whose outcome depends on a condition key or operator not evaluated locally.
+CONDITIONAL = "conditional"
 
 # Interface endpoint service name suffix -> the action pulling an image through it needs.
 ECR_ACTIONS = {".ecr.api": "ecr:GetAuthorizationToken", ".ecr.dkr": "ecr:BatchGetImage"}
@@ -90,6 +100,32 @@ DELEGATED = "delegated"
 SG, NACL, ROUTE, IAM = "SG", "NACL", "route", "IAM"
 ENDPOINT_POLICY, RESOURCE_POLICY, KMS, SCP = "endpoint policy", "resource policy", "KMS", "SCP"
 BLOCKED_AT = "Blocked at layer: "
+UNVERIFIED_AT = "Unverified: "
+# The state of a connection (edge["state"]).
+VERIFIED, UNVERIFIED, BLOCKED = "allowed", "unverified", "blocked"
+
+# Condition keys evaluated locally, as the request context names them.
+CONTEXT_KEYS = (
+    "aws:SourceVpce",
+    "aws:SourceVpc",
+    "aws:PrincipalArn",
+    "aws:PrincipalAccount",
+    "aws:PrincipalOrgID",
+)
+# Condition operators evaluated locally (lower case, without IfExists): (match, negated).
+_OPERATORS = {
+    "stringequals": ("string", False),
+    "stringnotequals": ("string", True),
+    "stringlike": ("like", False),
+    "stringnotlike": ("like", True),
+    "arnequals": ("arn", False),
+    "arnnotequals": ("arn", True),
+    "arnlike": ("arn", False),
+    "arnnotlike": ("arn", True),
+}
+# A request context: condition key (lower case) -> value, None when the key is known to be
+# absent from the request; a key not in the mapping is unknown.
+Context = Mapping[str, str | None]
 
 
 # -- ports --------------------------------------------------------------------------------
@@ -181,12 +217,19 @@ def _in(ip: str, net: Any) -> bool:
 @dataclass
 class Verdict:
     """``allowed`` False: blocked (by ``layers``). ``checked`` False: nothing to check it
-    against."""
+    against. ``unverified``: the layers not checked or conditional ("NACL not checked",
+    "endpoint policy conditional")."""
 
     allowed: bool
     lines: list[str] = field(default_factory=list)
     checked: bool = True
     layers: list[str] = field(default_factory=list)
+    unverified: list[str] = field(default_factory=list)
+
+
+def not_checked(layer: str, line: str) -> Verdict:
+    """A layer without data to check it against: not blocking, but unverified."""
+    return Verdict(True, [line], checked=False, unverified=[f"{layer} not checked"])
 
 
 def combine(verdicts: Iterable[Verdict | None]) -> Verdict:
@@ -198,18 +241,39 @@ def combine(verdicts: Iterable[Verdict | None]) -> Verdict:
         [ln for v in found for ln in v.lines],
         checked=any(v.checked for v in found),
         layers=list(dict.fromkeys(layers)),
+        unverified=list(dict.fromkeys(x for v in found for x in v.unverified)),
     )
+
+
+def preferred(verdicts: list[Verdict]) -> list[Verdict]:
+    """Of alternative verdicts (flows, principals): the fully verified allowed ones, else the
+    allowed ones, else all of them."""
+    allowed = [v for v in verdicts if v.allowed]
+    return [v for v in allowed if not v.unverified] or allowed or verdicts
+
+
+def state(verdict: Verdict) -> str:
+    if not verdict.allowed:
+        return BLOCKED
+    return UNVERIFIED if verdict.unverified else VERIFIED
 
 
 def headline(layers: Iterable[str]) -> str:
     return BLOCKED_AT + ", ".join(dict.fromkeys(layers))
 
 
+def unverified_headline(items: Iterable[str]) -> str:
+    return UNVERIFIED_AT + ", ".join(dict.fromkeys(items))
+
+
 def reasons(verdict: Verdict) -> list[str]:
-    """The lines of a verdict, led by the blocking layer(s) when it is blocked."""
-    if verdict.allowed:
-        return list(verdict.lines)
-    return [headline(verdict.layers), *verdict.lines]
+    """The lines of a verdict, led by the blocking layer(s) when it is blocked, by the
+    layers not checked / conditional when it is unverified."""
+    if not verdict.allowed:
+        return [headline(verdict.layers), *verdict.lines]
+    if verdict.unverified:
+        return [unverified_headline(verdict.unverified), *verdict.lines]
+    return list(verdict.lines)
 
 
 class SgRules:
@@ -265,7 +329,7 @@ class SgRules:
         the allowed port ranges (None: not filtered or not checked) and why."""
         word = "to" if direction == "egress" else "from"
         if not holder.sgs:
-            return None, [f"{direction} of {holder.name}: no security groups (not filtered)"]
+            return [flow], [f"{direction} of {holder.name}: no security groups (not filtered)"]
         found: list[tuple[_Rule, Ports]] = []
         for group in holder.sgs:
             for rule in self.rules.get((direction, group), []):
@@ -319,7 +383,12 @@ class SgRules:
                 ],
                 layers=[SG],
             )
-        return Verdict(True, [*out_why, *in_why], checked=out is not None or into is not None)
+        return Verdict(
+            True,
+            [*out_why, *in_why],
+            checked=out is not None or into is not None,
+            unverified=[f"{SG} not checked"] if out is None or into is None else [],
+        )
 
 
 # -- network ACLs -------------------------------------------------------------------------
@@ -653,6 +722,7 @@ class PathCheck:
         missing = [what for what, v in ((NACL, nacl), (ROUTE, route)) if v is None]
         if missing:
             verdict.lines.append(f"{' and '.join(missing)} not checked (run the Extended crawl)")
+            verdict.unverified += [f"{what} not checked" for what in missing]
         return verdict
 
     def eni(self, eni_id: str) -> _Eni | None:
@@ -693,8 +763,9 @@ class PathCheck:
             if (dst := self.eni(e)) is not None
             and (v := self.nacls.check(src, src.subnet, dst, dst.subnet, https)) is not None
         ]
-        allowed = [v for v in nacls if v.allowed]
-        return combine([route, *(allowed[:1] or nacls[:1])])
+        if not nacls:
+            return combine([route, not_checked(NACL, f"NACL to {ep[0]} not checked")])
+        return combine([route, preferred(nacls)[0]])
 
 
 # -- resource / endpoint policies (evaluated locally, never stored) -------------------------
@@ -714,6 +785,72 @@ def account_of(arn: str) -> str:
     return arn.split(":")[4] if arn.count(":") >= 5 else ""
 
 
+def _arn_match(pattern: str, arn: str) -> bool:
+    """ArnEquals / ArnLike: each of the six colon-separated parts matched on its own, with
+    ``*`` / ``?`` wildcards."""
+    want, have = pattern.split(":", 5), arn.split(":", 5)
+    return len(want) == len(have) == 6 and all(
+        _pattern(w, False).match(h) for w, h in zip(want, have, strict=True)
+    )
+
+
+def _value_match(kind: str, pattern: Any, value: str) -> bool:
+    if not isinstance(pattern, str):
+        return False
+    if kind == "string":
+        return pattern == value
+    if kind == "like":
+        return bool(_pattern(pattern, False).match(value))
+    return _arn_match(pattern, value)
+
+
+def principal_context(role: str, org_id: str = "") -> dict[str, str | None]:
+    """The principal keys of a request made by ``role`` (its organization when known)."""
+    ctx: dict[str, str | None] = {
+        "aws:principalarn": role,
+        "aws:principalaccount": account_of(role),
+    }
+    if org_id:
+        ctx["aws:principalorgid"] = org_id
+    return ctx
+
+
+def network_context(endpoint: str | None, vpc: str | None) -> dict[str, str | None]:
+    """The network keys of a request whose path is known: through VPC endpoint ``endpoint``
+    of ``vpc``, or (``endpoint`` None) not through an endpoint: both keys absent."""
+    return {"aws:sourcevpce": endpoint, "aws:sourcevpc": vpc if endpoint else None}
+
+
+def condition_result(block: Any, context: Context) -> tuple[bool | None, list[str]]:
+    """A statement's ``Condition`` (every operator and key must hold): True / False, or
+    None with the operators / keys not evaluated locally (an unknown operator or key, or a
+    key whose value the context does not know)."""
+    if not isinstance(block, dict):
+        return None, ["Condition"]
+    unknown: list[str] = []
+    for operator, tests in block.items():
+        name = str(operator).lower()
+        if_exists = name.endswith("ifexists")
+        kind, negated = _OPERATORS.get(name.removesuffix("ifexists"), ("", False))
+        if not kind or not isinstance(tests, dict):
+            unknown.append(str(operator))
+            continue
+        for key, patterns in tests.items():
+            if str(key).lower() not in context:
+                unknown.append(str(key))
+                continue
+            value = context[str(key).lower()]
+            if value is None:  # absent: only a negated operator or IfExists holds
+                holds = if_exists or negated
+            else:
+                values = patterns if isinstance(patterns, list) else [patterns]
+                found = any(_value_match(kind, p, value) for p in values)
+                holds = not found if negated else found
+            if not holds:
+                return False, []
+    return (None, unknown) if unknown else (True, [])
+
+
 def _principal_matches(principal: Any, arn: str, account_root: bool = True) -> bool:
     if principal is None or principal == "*":
         return True
@@ -730,22 +867,27 @@ def _principal_matches(principal: Any, arn: str, account_root: bool = True) -> b
 
 
 def policy_decision(
-    doc: Any, principal: str, action: str, resource: str, account_root: bool = True
+    doc: Any,
+    principal: str,
+    action: str,
+    resource: str,
+    account_root: bool = True,
+    context: Context | None = None,
 ) -> tuple[str, str]:
     """``(decision, statement)`` of a resource or VPC endpoint policy for ``principal``
     doing ``action`` on ``resource``: an explicit Deny wins, else an Allow is needed.
-    Conditions are not evaluated: a conditional Allow counts, a conditional Deny does not
-    block (noted in ``statement``). ``account_root`` False: a statement naming the
-    principal's account does not match it."""
+    Conditions are evaluated against ``context`` (:func:`condition_result`); one that
+    cannot be makes the decision :data:`CONDITIONAL` when its statement could change it.
+    ``account_root`` False: a statement naming the principal's account does not match it."""
     if isinstance(doc, str):
         try:
             doc = json.loads(doc)
         except ValueError:
-            return ALLOWED, "policy not readable (not checked)"
+            return CONDITIONAL, "policy not readable (not checked)"
     statements = doc.get("Statement") if isinstance(doc, dict) else None
     if isinstance(statements, dict):
         statements = [statements]
-    allow = ""
+    allow, maybe_allow, maybe_deny = "", "", ""
     for i, st in enumerate(statements or []):
         if not isinstance(st, dict):
             continue
@@ -762,44 +904,72 @@ def policy_decision(
             continue
         if "NotResource" in st and _any_match(st["NotResource"], resource):
             continue
-        conditional = " (conditions not evaluated)" if st.get("Condition") else ""
+        holds, unknown = (
+            condition_result(st["Condition"], context or {}) if "Condition" in st else (True, [])
+        )
+        if holds is False:
+            continue
+        what = sid if holds else f"{sid}: condition {', '.join(unknown)} not evaluated"
         if st.get("Effect") == "Deny":
-            if not conditional:
+            if holds:
                 return EXPLICIT_DENY, sid
-        elif st.get("Effect") == "Allow" and not allow:
-            allow = sid + conditional
-    return (ALLOWED, allow) if allow else (IMPLICIT_DENY, "no statement allows it")
+            maybe_deny = maybe_deny or what
+        elif st.get("Effect") == "Allow":
+            if holds:
+                allow = allow or (sid + " (condition met)" if "Condition" in st else sid)
+            else:
+                maybe_allow = maybe_allow or what
+    if not allow and not maybe_allow:
+        return IMPLICIT_DENY, "no statement allows it"
+    if maybe_deny or not allow:
+        return CONDITIONAL, maybe_deny or maybe_allow
+    return ALLOWED, allow
 
 
-def key_policy_decision(doc: Any, role: str, action: str, key: str) -> tuple[str, str]:
+def key_policy_decision(
+    doc: Any, role: str, action: str, key: str, context: Context | None = None
+) -> tuple[str, str]:
     """A KMS key policy for ``role`` doing ``action``: an explicit Deny wins; a statement
     naming the role (or ``*``) allows it, one naming only the account root is
     :data:`DELEGATED` (the role's IAM policies must allow it too)."""
-    decision, statement = policy_decision(doc, role, action, key)
+    decision, statement = policy_decision(doc, role, action, key, context=context)
     if decision != ALLOWED:
         return decision, statement
-    direct, direct_statement = policy_decision(doc, role, action, key, account_root=False)
+    direct, direct_statement = policy_decision(
+        doc, role, action, key, account_root=False, context=context
+    )
     return (ALLOWED, direct_statement) if direct == ALLOWED else (DELEGATED, statement)
 
 
 def scp_decision(
-    levels: Iterable[tuple[str, Iterable[tuple[str, Any]]]], action: str, resource: str
+    levels: Iterable[tuple[str, Iterable[tuple[str, Any]]]],
+    action: str,
+    resource: str,
+    context: Context | None = None,
 ) -> tuple[str, str]:
     """``(decision, detail)`` of the SCPs on the way from the organization root down to an
     account (``levels``: ``(target id, [(policy name, document), ...])``): every level
-    needs an SCP allowing ``action``, and no SCP may deny it."""
-    allowed_by = []
+    needs an SCP allowing ``action``, and no SCP may deny it. An SCP whose conditions are
+    not evaluated makes it :data:`CONDITIONAL` (unless another one denies it)."""
+    allowed_by: list[str] = []
+    conditional = ""
     for target, policies in levels:
-        allow = ""
+        allow, maybe = "", ""
         for name, doc in policies:
-            decision, statement = policy_decision(doc, "", action, resource)
+            decision, statement = policy_decision(doc, "", action, resource, context=context)
             if decision == EXPLICIT_DENY:
                 return EXPLICIT_DENY, f"SCP {name} ({statement}) attached to {target} denies it"
             if decision == ALLOWED and not allow:
                 allow = name
-        if not allow:
+            if decision == CONDITIONAL and not maybe:
+                maybe = f"SCP {name} ({statement}) attached to {target}"
+        if not allow and not maybe:
             return IMPLICIT_DENY, f"no SCP attached to {target} allows it"
-        allowed_by.append(f"{allow} on {target}")
+        conditional = conditional or maybe
+        if allow:
+            allowed_by.append(f"{allow} on {target}")
+    if conditional:
+        return CONDITIONAL, f"conditional: {conditional}"[:400]
     return ALLOWED, ("allowed by " + ", ".join(allowed_by))[:400]
 
 
@@ -812,6 +982,13 @@ def ecr_action(service_name: str | None) -> str | None:
         if (service_name or "").endswith(suffix):
             return action
     return None
+
+
+def endpoint_suffix(action: str) -> str:
+    """The interface endpoint service name suffix a request for ``action`` goes through:
+    ".sqs", ".kms", ".ecr.api" / ".ecr.dkr" for an image pull."""
+    ecr = next((s for s, a in ECR_ACTIONS.items() if a == action), None)
+    return ecr or "." + action.partition(":")[0]
 
 
 def ext_request(source: str, target: str) -> tuple[str, str, str] | None:
@@ -856,13 +1033,18 @@ class IamIndex:
             (r["role_arn"], r["action"], r["resource"]): r
             for r in conn.execute("SELECT * FROM iam_sims WHERE snapshot_id=?", (snap_id,))
         }
-        self.endpoints = {
-            r["endpoint_id"]: (r["service_name"] or "", r["policy"])
-            for r in conn.execute(
-                "SELECT endpoint_id, service_name, policy FROM endpoints WHERE snapshot_id=?",
-                (snap_id,),
-            )
-        }
+        self.endpoints: dict[str, tuple[str, str | None]] = {}
+        self.endpoint_vpcs: dict[str, str] = {}
+        for r in conn.execute(
+            "SELECT endpoint_id, vpc_id, service_name, policy FROM endpoints WHERE snapshot_id=?",
+            (snap_id,),
+        ):
+            self.endpoints[r["endpoint_id"]] = (r["service_name"] or "", r["policy"])
+            self.endpoint_vpcs[r["endpoint_id"]] = r["vpc_id"]
+        row = conn.execute(
+            "SELECT org_id FROM iam_context WHERE snapshot_id=?", (snap_id,)
+        ).fetchone()
+        self.org_id = row["org_id"] if row else ""
         # Encrypted targets: resource ARN -> keys; ECS service -> (ECR repository, key).
         self.keys: dict[str, list[str]] = {}
         self.pulled: dict[str, list[tuple[str, str]]] = {}
@@ -921,6 +1103,7 @@ class IamIndex:
                 ],
                 layers=[RESOURCE_POLICY],
             )
+        decisions = (sim["decision"], sim["resource_decision"])
         if sim["decision"] == ALLOWED:
             lines = [f"IAM: {who} allows {what} ({sim['detail']})"]
         elif sim["resource_decision"] == ALLOWED:
@@ -928,26 +1111,46 @@ class IamIndex:
                 f"IAM: the resource policy of {_short(resource)} allows {who} {action} "
                 f"({sim['resource_detail']})"
             ]
-        else:
+        elif CONDITIONAL not in decisions:
             return Verdict(
                 False, [f"IAM: blocked: no policy of {who} allows {what}"], layers=[iam_layer]
             )
+        else:
+            lines = []
+        pending = []
+        if sim["decision"] == CONDITIONAL:
+            lines.append(f"IAM: {who}: {what} conditional ({sim['detail']})")
+            pending.append(f"{iam_layer} conditional")
+        if sim["resource_decision"] == CONDITIONAL:
+            lines.append(
+                f"IAM: the resource policy of {_short(resource)} is conditional for {who} "
+                f"{action} ({sim['resource_detail']})"
+            )
+            pending.append(f"{RESOURCE_POLICY} conditional")
         _service, policy = self.endpoints.get(endpoint, ("", None))
         if policy:
-            decision, statement = policy_decision(policy, role, action, resource)
-            if decision != ALLOWED:
+            context = {
+                **principal_context(role, self.org_id),
+                **network_context(endpoint, self.endpoint_vpcs.get(endpoint)),
+            }
+            decision, statement = policy_decision(policy, role, action, resource, context=context)
+            if decision == CONDITIONAL:
+                lines.append(f"IAM: the endpoint policy of {endpoint} is conditional ({statement})")
+                pending.append(f"{ENDPOINT_POLICY} conditional")
+            elif decision != ALLOWED:
                 return Verdict(
                     False,
                     [*lines, f"IAM: blocked by the endpoint policy of {endpoint} ({statement})"],
                     layers=[ENDPOINT_POLICY],
                 )
-            lines.append(f"IAM: the endpoint policy of {endpoint} allows it ({statement})")
+            else:
+                lines.append(f"IAM: the endpoint policy of {endpoint} allows it ({statement})")
         keys = self._keys(holder, action, resource)
         kms = [self._kms(role, key, a) for key in keys for a in KMS_ACTIONS.get(action, ())]
         actions = [(action, resource)] + [
             (a, key) for key in keys for a in KMS_ACTIONS.get(action, ())
         ]
-        return combine([Verdict(True, lines), *kms, self._scp(role, actions)])
+        return combine([Verdict(True, lines, unverified=pending), *kms, self._scp(role, actions)])
 
     def _keys(self, holder: str, action: str, resource: str) -> list[str]:
         """The KMS keys of the encrypted target(s) of a connection."""
@@ -960,7 +1163,7 @@ class IamIndex:
         row = self.kms.get((role, key, action))
         who, short = f"role {role_name(role)}", _short(key)
         if row is None:
-            return Verdict(True, [f"KMS: {action} on key {short} not checked"], checked=False)
+            return not_checked(KMS, f"KMS: {action} on key {short} not checked")
         if row["decision"] == EXPLICIT_DENY:
             line = (
                 f"KMS: blocked: {who}: {action} on key {short} explicitly denied by {row['detail']}"
@@ -975,19 +1178,31 @@ class IamIndex:
                 f"KMS: blocked: the key policy of {short} allows {action} to neither {who} "
                 "nor its account"
             )
+        elif CONDITIONAL in (row["decision"], row["policy_decision"]):
+            return Verdict(
+                True,
+                [
+                    f"KMS: {action} on key {short} for {who} is conditional ({row['detail']}; "
+                    f"key policy: {row['policy_detail'] or 'not readable'})"
+                ],
+                unverified=[f"{KMS} conditional"],
+            )
         elif row["policy_decision"] == ALLOWED:
             return Verdict(
                 True,
                 [f"KMS: the key policy of {short} allows {who} {action} ({row['policy_detail']})"],
             )
         elif row["decision"] == ALLOWED:
+            delegated = row["policy_decision"] == DELEGATED
             policy = (
                 f"the key policy delegates to IAM ({row['policy_detail']})"
-                if row["policy_decision"] == DELEGATED
+                if delegated
                 else "key policy not readable"
             )
             return Verdict(
-                True, [f"KMS: {who} allows {action} on key {short} ({row['detail']}; {policy})"]
+                True,
+                [f"KMS: {who} allows {action} on key {short} ({row['detail']}; {policy})"],
+                unverified=[] if delegated else [f"{KMS} key policy not checked"],
             )
         else:
             line = f"KMS: blocked: no policy of {who} allows {action} on key {short}"
@@ -1001,7 +1216,7 @@ class IamIndex:
         denied = [
             (a, row)
             for (a, _), row in zip(actions, rows, strict=True)
-            if row is not None and row["decision"] != ALLOWED
+            if row is not None and row["decision"] not in (ALLOWED, CONDITIONAL)
         ]
         if denied:
             action, row = denied[0]
@@ -1011,10 +1226,20 @@ class IamIndex:
                 layers=[SCP],
             )
         if not rows or any(row is None for row in rows):
+            return not_checked(
+                SCP, "SCP not evaluated (no Organizations read access in the Extended crawl)"
+            )
+        maybe = [
+            (a, row)
+            for (a, _), row in zip(actions, rows, strict=True)
+            if row["decision"] == CONDITIONAL
+        ]
+        if maybe:
+            action, row = maybe[0]
             return Verdict(
                 True,
-                ["SCP not evaluated (no Organizations read access in the Extended crawl)"],
-                checked=False,
+                [f"SCP: {action} for account {account}: {row['detail']}"],
+                unverified=[f"{SCP} conditional"],
             )
         return Verdict(True, [f"SCP: account {account}: {rows[0]['detail']}"])
 
@@ -1025,8 +1250,18 @@ class IamIndex:
         verdicts = [v for h in holders if (v := self.check(h, action, resource, endpoint))]
         if not verdicts:
             return None
-        allowed = [v for v in verdicts if v.allowed]
-        return combine(allowed or verdicts)
+        return combine(preferred(verdicts))
+
+
+def iam_crawled(conn: sqlite3.Connection, snap_id: int) -> bool:
+    """Has the snapshot been through an Extended crawl (or kept its IAM data in a Retry)?"""
+    return any(
+        conn.execute(
+            f"SELECT 1 FROM {table} WHERE snapshot_id=? LIMIT 1",  # noqa: S608 - constants
+            (snap_id,),
+        ).fetchone()
+        for table in ("ext_crawls", "iam_principals")
+    )
 
 
 # -- simulation (Extended crawl) ----------------------------------------------------------
@@ -1053,27 +1288,59 @@ def _sim_detail(result: dict[str, Any]) -> str:
     return detail[:400]
 
 
+def context_entries(context: Context) -> list[dict[str, Any]]:
+    """``ContextEntries`` of ``iam:SimulatePrincipalPolicy`` for the known keys of
+    ``context`` (an absent key is simply not passed)."""
+    names = {k.lower(): k for k in CONTEXT_KEYS}
+    return [
+        {"ContextKeyName": names.get(k, k), "ContextKeyValues": [v], "ContextKeyType": "string"}
+        for k, v in sorted(context.items())
+        if v is not None
+    ]
+
+
+def _missing_keys(result: dict[str, Any]) -> set[str]:
+    found = set(result.get("MissingContextValues") or [])
+    for r in result.get("ResourceSpecificResults") or []:
+        found.update(r.get("MissingContextValues") or [])
+    return found
+
+
 def simulate(
-    iam: Any, requests: Iterable[SimRequest], cached: set[SimRequest]
+    iam: Any,
+    requests: Iterable[SimRequest],
+    cached: set[SimRequest],
+    contexts: Callable[[SimRequest], Context] | None = None,
 ) -> Iterator[tuple[SimRequest, str, str]]:
     """``(request, decision, detail)`` from ``iam:SimulatePrincipalPolicy``, one call per
-    role and resource (its actions batched); ``cached`` requests are skipped."""
-    todo: dict[tuple[str, str], list[str]] = {}
+    role, resource and request context (its actions batched); ``cached`` requests are
+    skipped. A decision depending on a context key the simulation was not given (and not
+    known to be absent) is :data:`CONDITIONAL`, unless an explicit deny."""
+    todo: dict[tuple[str, str, tuple[tuple[str, str | None], ...]], list[str]] = {}
     for req in requests:
         if req not in cached:
-            actions = todo.setdefault((req.role_arn, req.resource), [])
+            ctx = tuple(sorted((contexts(req) if contexts else {}).items()))
+            actions = todo.setdefault((req.role_arn, req.resource, ctx), [])
             if req.action not in actions:
                 actions.append(req.action)
-    for (role, resource), actions in sorted(todo.items()):
+    order = sorted(todo, key=lambda k: (k[0], k[1], str(k[2])))
+    for (role, resource, ctx), actions in ((k, todo[k]) for k in order):
+        entries = context_entries(dict(ctx))
         pages = iam.get_paginator("simulate_principal_policy").paginate(
-            PolicySourceArn=role, ActionNames=actions, ResourceArns=[resource]
+            PolicySourceArn=role,
+            ActionNames=actions,
+            ResourceArns=[resource],
+            **({"ContextEntries": entries} if entries else {}),
         )
+        known = {k for k, _ in ctx}
         for page in pages:
             for result in page.get("EvaluationResults", []):
                 action = result.get("EvalActionName", "")
-                if action in actions:
-                    yield (
-                        SimRequest(role, action, resource),
-                        result.get("EvalDecision", IMPLICIT_DENY),
-                        _sim_detail(result),
-                    )
+                if action not in actions:
+                    continue
+                decision, detail = result.get("EvalDecision", IMPLICIT_DENY), _sim_detail(result)
+                unknown = sorted(k for k in _missing_keys(result) if k.lower() not in known)
+                if unknown and decision != EXPLICIT_DENY:
+                    decision = CONDITIONAL
+                    detail = f"{detail}; condition {', '.join(unknown)} not evaluated"[:400]
+                yield SimRequest(role, action, resource), decision, detail
