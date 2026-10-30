@@ -679,12 +679,10 @@ ROUTE_EDGE = [
 
 
 def _click_edge(page, selector):
-    # Scroll first, then let the graph settle: a midpoint read before can be stale.
-    page.locator("#cy").scroll_into_view_if_needed()
+    # Tap the edge itself (what a click or touch triggers): pixel clicks on its midpoint
+    # are unreliable on CI runners (other edges / labels, headless pointer timing).
     page.wait_for_function(f"() => !{CY}.animated() && {CY}.edges('{selector}').visible()")
-    mid = page.evaluate(f"() => {CY}.edges('{selector}').renderedMidpoint()")
-    box = page.locator("#cy").bounding_box()
-    page.mouse.click(box["x"] + mid["x"], box["y"] + mid["y"])
+    page.evaluate(f"() => {CY}.edges('{selector}').emit('onetap')")
     page.wait_for_selector("#cy-tip:not([hidden])")
     return page.text_content("#cy-tip")
 
