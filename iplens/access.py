@@ -866,6 +866,34 @@ def _principal_matches(principal: Any, arn: str, account_root: bool = True) -> b
     )
 
 
+def _role_name(arn: str) -> str:
+    """The role name of a role ARN (``arn:aws:iam::A:role/path/name``) or an sts
+    assumed-role ARN (``arn:aws:sts::A:assumed-role/name/session``), else ``""``."""
+    resource = arn.split(":", 5)[5] if arn.count(":") >= 5 else ""
+    if resource.startswith("role/"):
+        return resource.rsplit("/", 1)[1]
+    if resource.startswith("assumed-role/"):
+        return resource.split("/")[1]
+    return ""
+
+
+def _not_principal_matches(principal: Any, arn: str) -> bool:
+    """Whether ``arn`` is one of a ``NotPrincipal``'s values (so the statement does not apply
+    to it): ``*``, its account (or account root), or its role, in either the role or the
+    sts assumed-role form."""
+    if _principal_matches(principal, arn):
+        return True
+    name = _role_name(arn)
+    if not name or not isinstance(principal, dict):
+        return False
+    aws = principal.get("AWS")
+    values = aws if isinstance(aws, list) else [aws]
+    return any(
+        isinstance(v, str) and account_of(v) == account_of(arn) and _role_name(v) == name
+        for v in values
+    )
+
+
 def policy_decision(
     doc: Any,
     principal: str,
@@ -878,7 +906,9 @@ def policy_decision(
     doing ``action`` on ``resource``: an explicit Deny wins, else an Allow is needed.
     Conditions are evaluated against ``context`` (:func:`condition_result`); one that
     cannot be makes the decision :data:`CONDITIONAL` when its statement could change it.
-    ``account_root`` False: a statement naming the principal's account does not match it."""
+    ``account_root`` False: a statement naming the principal's account does not match it.
+    A ``NotPrincipal`` statement applies to every principal it does not name
+    (:func:`_not_principal_matches`)."""
     if isinstance(doc, str):
         try:
             doc = json.loads(doc)
@@ -892,9 +922,10 @@ def policy_decision(
         if not isinstance(st, dict):
             continue
         sid = st.get("Sid") or f"statement {i + 1}"
-        if "NotPrincipal" in st or not _principal_matches(
-            st.get("Principal"), principal, account_root
-        ):
+        if "NotPrincipal" in st:
+            if _not_principal_matches(st["NotPrincipal"], principal):
+                continue
+        elif not _principal_matches(st.get("Principal"), principal, account_root):
             continue
         if "Action" in st and not _any_match(st["Action"], action, ignore_case=True):
             continue

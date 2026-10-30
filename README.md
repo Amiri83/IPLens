@@ -632,7 +632,9 @@ policy that blocked it. Resources spanning several Availability Zones carry an A
 variants and `IfExists`; the simulation gets the same keys as `ContextEntries`. The network keys
 are known when every holder of a role is in one VPC (through its interface endpoint for the
 service, private DNS assumed) or in none; SCPs are evaluated per account, so `aws:PrincipalArn`
-is unknown there. Any other key or operator makes the outcome *conditional*. Every connection is
+is unknown there. Any other key or operator makes the outcome *conditional*. A `NotPrincipal`
+statement applies to every principal it does not name (by role ARN, sts `assumed-role` ARN,
+account id or account root; 1.6.3). Every connection is
 **allowed** (every layer checked and passing), **unverified** (a layer not checked, or
 conditional – drawn dashed grey; click one for which) or **blocked**. **Verified only** draws only
 the allowed ones. A snapshot without an Extended crawl shows "IAM not checked – run Extended

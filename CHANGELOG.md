@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.6.3 – 2026-10-29
+
+### Added
+
+- **`NotPrincipal`** in endpoint, resource (SQS / SNS) and KMS key policies is evaluated (such
+  statements were skipped): the statement applies to every principal it does not name. A value
+  names a role by its role ARN, its sts `assumed-role` ARN, its account id or its account root;
+  so a `Deny` with `NotPrincipal` naming another role is an explicit deny.
+
 ## 1.6.2 – 2026-10-29
 
 ### Added

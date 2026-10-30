@@ -154,6 +154,44 @@ def test_source_vpce_deny_blocks_a_sender_outside_the_vpc():
     assert out == ("allowed", "allow-all")
 
 
+ROLE_ECS = f"arn:aws:iam::{ACCOUNT}:role/ecs-task-role"
+ROLE_LAMBDA = f"arn:aws:iam::{ACCOUNT}:role/lambda-a"
+ASSUMED_ECS = f"arn:aws:sts::{ACCOUNT}:assumed-role/ecs-task-role/i-0abc1234"
+
+
+def _not_principal_deny(*names: str) -> str:
+    deny = {"Sid": "only-ecs", "Effect": "Deny", "NotPrincipal": {"AWS": list(names)}}
+    return _doc(ALLOW_ALL, deny | {"Action": "*", "Resource": "*"})
+
+
+@pytest.mark.parametrize(
+    ("not_principal", "principal", "expected"),
+    [
+        # A queue policy denying everyone but the ECS task role.
+        (ROLE_ECS, ROLE_LAMBDA, EXPLICIT_DENY),
+        (ROLE_ECS, ROLE_ECS, "allowed"),
+        # An assumed-role principal matches the role form, and the reverse.
+        (ROLE_ECS, ASSUMED_ECS, "allowed"),
+        (ROLE_ECS, f"arn:aws:sts::{ACCOUNT}:assumed-role/lambda-a/fn-a", EXPLICIT_DENY),
+        (ASSUMED_ECS, ROLE_ECS, "allowed"),
+        (ASSUMED_ECS, ROLE_LAMBDA, EXPLICIT_DENY),
+        # The account (id or root) names every role in it.
+        (f"arn:aws:iam::{ACCOUNT}:root", ROLE_LAMBDA, "allowed"),
+        (ACCOUNT, ROLE_LAMBDA, "allowed"),
+        ("arn:aws:iam::000000000000:root", ROLE_LAMBDA, EXPLICIT_DENY),
+        # Same role name in another account is another role.
+        ("arn:aws:iam::000000000000:role/lambda-a", ROLE_LAMBDA, EXPLICIT_DENY),
+    ],
+)
+def test_not_principal_deny_applies_to_every_principal_it_does_not_name(
+    not_principal, principal, expected
+):
+    doc = _not_principal_deny(not_principal)
+    out = access.policy_decision(doc, principal, "sqs:SendMessage", QUEUE, context=NOT_IN_VPC)
+    assert out[0] == expected
+    assert out[1] == ("only-ecs" if expected == EXPLICIT_DENY else "allow-all")
+
+
 def test_scp_with_an_unevaluated_condition_is_conditional():
     deny = _doc(ALLOW_ALL, _st("Deny", {"ArnNotLike": {"aws:PrincipalArn": "arn:*:role/x"}}))
     levels = [("r-a", [("scp-full", _doc(ALLOW_ALL)), ("scp-guard", deny)])]
@@ -302,6 +340,18 @@ def test_source_vpce_deny_in_an_endpoint_policy_blocks(db_path, snapshot_builder
         _st("Deny", {"StringNotEquals": {"aws:SourceVpce": ENDPOINT, "aws:SourceVpc": VPC}}),
     )
     c = _endpoint_snapshot(db_path, snapshot_builder, policy)
+    _verified_path(c)
+    assert _task_edge(db_path, c.id)["state"] == "allowed"
+
+
+def test_not_principal_deny_in_an_endpoint_policy(db_path, snapshot_builder):
+    # Deny everyone but the lambda role: the ECS task's role is denied.
+    b = _endpoint_snapshot(db_path, snapshot_builder, _not_principal_deny(ROLE_LAMBDA))
+    _verified_path(b)
+    edge = _task_edge(db_path, b.id)
+    assert edge["state"] == "blocked" and edge["blocked_by"] == ["endpoint policy"]
+    # Deny everyone but the ECS task's role: it passes.
+    c = _endpoint_snapshot(db_path, snapshot_builder, _not_principal_deny(ROLE_TASK))
     _verified_path(c)
     assert _task_edge(db_path, c.id)["state"] == "allowed"
 

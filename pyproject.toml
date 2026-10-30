@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "aws-iplens"
 # Single source of truth for the version; iplens.__version__ reads the installed metadata.
-version = "1.6.2"
+version = "1.6.3"
 description = "Local web app for private IPv4 usage visibility & optimization across AWS accounts"
 readme = "README.md"
 authors = [{ name = "Amir Amiri" }]
