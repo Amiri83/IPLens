@@ -90,7 +90,7 @@
   const GROUP_LABEL_MEMBERS = 3;  // mirrors iplens.queries.GROUP_LABEL_MEMBERS
   const CTX_PAD = 12;             // "Group by" box padding around its resources
   const CTX_LABEL_H = 16;
-  // "Group by" box / outline colours (dark enough for text on white).
+  // "Group by" box / outline colours (also used in the light SVG / draw.io exports).
   const PALETTE = ["#2457c5", "#c2410c", "#2f8f4e", "#9333ea", "#b0469b", "#0e7490",
     "#a16207", "#be123c", "#4d7c0f", "#475569"];
   const UNMANAGED_COLOR = "#8a94a3";
@@ -1947,23 +1947,41 @@
 
   // -- style --------------------------------------------------------------------------
 
+  // On-page colours come from the CSS tokens (the shared DadsOps theme + style.css), so the
+  // diagram stays dark with the rest of the page. The SVG / draw.io exports keep their own
+  // light document colours (iplens/diagram.py).
+  const cssTokens = getComputedStyle(document.documentElement);
+  const tok = (name, fallback) => (cssTokens.getPropertyValue(name) || "").trim() || fallback;
+  const C = {
+    text: tok("--fg", "#f0f4f8"), muted: tok("--fg-muted", "#cdd5dd"), labelBg: tok("--bg", "#0d1117"),
+    vpc: tok("--dia-vpc", "#a371ff"), vpcFill: tok("--dia-vpc-fill", "#1d1630"),
+    subnet: tok("--dia-subnet", "#8fbf2a"), subnetFill: tok("--dia-subnet-fill", "#161b22"),
+    tile: tok("--dia-tile", "#262c36"), area: tok("--dia-area", "#8b949e"), areaFill: tok("--dia-area-fill", "#1c2129"),
+    idle: tok("--idle", "#e3a33a"), group: tok("--edge-targets", "#5ca6ff"),
+    targets: tok("--edge-targets", "#5ca6ff"), ecs: tok("--edge-ecs", "#56d364"),
+    reach: tok("--edge-reach", "#e27ad0"), sg: tok("--edge-sg", "#8b949e"),
+    observed: tok("--ev-observed", "#56d364"), configured: tok("--ev-configured", "#5ca6ff"),
+    permitted: tok("--ev-permitted", "#f0883e"), referenced: tok("--ev-referenced", "#9ca3af"),
+    blocked: tok("--edge-blocked", "#ff7b72"), unverified: tok("--edge-unverified", "#9e9e9e"),
+  };
+
   const style = [
     { selector: "node", style: {
       // Labels arrive pre-wrapped by wrapLine; the slack absorbs measuring differences.
       "label": "data(label)", "font-size": RES_FONT, "text-wrap": "wrap", "text-max-width": TEXT_W.res + 4,
-      "color": "#1f2933", "font-family": "system-ui, sans-serif",
+      "color": C.text, "font-family": "system-ui, sans-serif",
     } },
     { selector: ".vpc", style: {
-      "shape": "rectangle", "background-color": "#f7f3ff", "background-opacity": 1,
-      "border-width": 2, "border-color": "#8c4fff", "padding": 50,
+      "shape": "rectangle", "background-color": C.vpcFill, "background-opacity": 1,
+      "border-width": 2, "border-color": C.vpc, "padding": 50,
       "text-valign": "top", "text-halign": "center", "font-size": 14, "font-weight": "bold",
       "text-margin-y": -6, "text-max-width": TEXT_W.vpc + 4,
       "background-image": "data(icon)", "background-width": 32, "background-height": 32,
       "background-position-x": 0, "background-position-y": 0, "background-clip": "none",
     } },
     { selector: ".subnet", style: {
-      "shape": "rectangle", "background-color": "#ffffff", "border-width": 1.5,
-      "border-color": "#7aa116", "border-style": "solid", "padding": SUBNET_PAD,
+      "shape": "rectangle", "background-color": C.subnetFill, "border-width": 1.5,
+      "border-color": C.subnet, "border-style": "solid", "padding": SUBNET_PAD,
       "text-valign": "top", "text-halign": "center", "font-size": 11, "text-margin-y": -4,
       "text-max-width": TEXT_W.subnet + 4, "min-width": SUBNET_MIN_W,
     } },
@@ -1975,13 +1993,13 @@
     { selector: ".subnet.noborder", style: { "border-width": 0, "background-opacity": 0 } },
     { selector: ".res, .group", style: {
       "shape": "round-rectangle", "width": ICON, "height": ICON,
-      "background-color": "#ffffff", "background-image": "data(icon)",
+      "background-color": C.tile, "background-image": "data(icon)",
       "background-fit": "contain", "border-width": 0,
       "text-valign": "bottom", "text-halign": "center", "text-margin-y": 5,
     } },
-    { selector: ".res.idle", style: { "border-width": 3, "border-color": "#e8a33a" } },
+    { selector: ".res.idle", style: { "border-width": 3, "border-color": C.idle } },
     { selector: ".group", style: {
-      "border-width": 3, "border-color": "#2457c5", "border-style": "double",
+      "border-width": 3, "border-color": C.group, "border-style": "double",
       "font-weight": "bold",
     } },
     { selector: ".res.tinted, .group.tinted", style: {
@@ -1992,99 +2010,99 @@
       "shape": "round-rectangle", "width": "data(w)", "height": "data(h)",
       "background-color": "data(color)", "background-opacity": 0.05,
       "border-width": 1.5, "border-style": "dashed", "border-color": "data(color)",
-      "label": "data(label)", "color": "data(color)", "font-size": 10, "font-weight": "bold",
+      "label": "data(label)", "color": C.text, "font-size": 10, "font-weight": "bold",
       "text-valign": "top", "text-halign": "center", "text-margin-y": CTX_LABEL_H,
       "events": "no",
     } },
     // Extended view: expanded service groups, swimlanes, service / gateway nodes,
     // evidence styles.
     { selector: ".svcbox", style: {
-      "shape": "rectangle", "background-color": "#f6f7f9", "border-width": 2,
-      "border-style": "dashed", "border-color": "#5b6573", "padding": 24,
+      "shape": "rectangle", "background-color": C.areaFill, "border-width": 2,
+      "border-style": "dashed", "border-color": C.area, "padding": 24,
       "text-valign": "top", "text-halign": "center", "font-size": 12, "font-weight": "bold",
       "text-margin-y": -6, "text-max-width": TEXT_W.vpc,
     } },
     { selector: ".lane", style: {
       "shape": "rectangle", "background-color": "data(color)", "background-opacity": 0.04,
       "border-width": 1.5, "border-color": "data(color)", "padding": 24,
-      "label": "data(label)", "color": "data(color)", "font-size": 13, "font-weight": "bold",
+      "label": "data(label)", "color": C.text, "font-size": 13, "font-weight": "bold",
       "text-valign": "top", "text-halign": "center", "text-margin-y": -6,
       "text-max-width": TEXT_W.vpc,
     } },
     { selector: ".pin", style: { "width": 1, "height": 1, "opacity": 0, "events": "no", "label": "" } },
     { selector: ".vpcleaf", style: {
-      "shape": "round-rectangle", "width": ICON, "height": ICON, "background-color": "#f7f3ff",
+      "shape": "round-rectangle", "width": ICON, "height": ICON, "background-color": C.vpcFill,
       "background-image": "data(icon)", "background-fit": "contain", "border-width": 2,
-      "border-color": "#8c4fff", "text-valign": "bottom", "text-halign": "center",
+      "border-color": C.vpc, "text-valign": "bottom", "text-halign": "center",
       "text-margin-y": 5, "font-weight": "bold",
     } },
     { selector: ".ext", style: {
       "shape": "round-rectangle", "width": ICON, "height": ICON,
-      "background-color": "#ffffff", "background-image": "data(icon)",
+      "background-color": C.tile, "background-image": "data(icon)",
       "background-fit": "contain", "border-width": 0,
       "text-valign": "bottom", "text-halign": "center", "text-margin-y": 5,
     } },
-    { selector: ".ext.broad", style: { "border-width": 3, "border-color": "#c2410c", "border-style": "dashed" } },
+    { selector: ".ext.broad", style: { "border-width": 3, "border-color": C.permitted, "border-style": "dashed" } },
     // Crawled but not linked to this VPC (drawn from the "Not linked" panel).
     { selector: ".ext.unlinked", style: {
-      "border-width": 2, "border-color": "#8a94a3", "border-style": "dotted", "background-image-opacity": 0.75,
+      "border-width": 2, "border-color": C.sg, "border-style": "dotted", "background-image-opacity": 0.75,
     } },
     { selector: ".hidden, .filtered, .unfocused", style: { "display": "none" } },
     { selector: "node.res:active, node.group:active", style: { "overlay-opacity": 0.15 } },
     { selector: "edge", style: {
       "curve-style": "bezier", "width": 2, "target-arrow-shape": "triangle", "arrow-scale": 0.9,
-      "label": "data(label)", "font-size": 9, "color": "#1f2933", "min-zoomed-font-size": 7,
-      "text-rotation": "autorotate", "text-background-color": "#ffffff",
+      "label": "data(label)", "font-size": 9, "color": C.text, "min-zoomed-font-size": 7,
+      "text-rotation": "autorotate", "text-background-color": C.labelBg,
       "text-background-opacity": 0.85, "text-background-padding": 2,
     } },
-    { selector: "edge.edge-targets", style: { "line-color": "#2457c5", "target-arrow-color": "#2457c5" } },
+    { selector: "edge.edge-targets", style: { "line-color": C.targets, "target-arrow-color": C.targets } },
     // IP view: VPC -> Transit Gateway, styled like configured evidence (ev-configured).
-    { selector: "edge.edge-tgw", style: { "line-color": "#2457c5", "target-arrow-color": "#2457c5" } },
-    { selector: "edge.edge-ecs_lb", style: { "line-color": "#2f8f4e", "target-arrow-color": "#2f8f4e" } },
+    { selector: "edge.edge-tgw", style: { "line-color": C.configured, "target-arrow-color": C.configured } },
+    { selector: "edge.edge-ecs_lb", style: { "line-color": C.ecs, "target-arrow-color": C.ecs } },
     { selector: "edge.edge-sg", style: {
-      "line-style": "dashed", "line-dash-pattern": [6, 4], "width": 1.2, "line-color": "#8a94a3",
-      "target-arrow-color": "#8a94a3", "target-arrow-shape": "vee", "opacity": 0.85,
-      "color": "#535e6b",
+      "line-style": "dashed", "line-dash-pattern": [6, 4], "width": 1.2, "line-color": C.sg,
+      "target-arrow-color": C.sg, "target-arrow-shape": "vee", "opacity": 0.85,
+      "color": C.muted,
     } },
     { selector: "edge.edge-reach", style: {
-      "line-style": "dashed", "line-dash-pattern": [3, 3], "width": 1.6, "line-color": "#b0469b",
-      "target-arrow-color": "#b0469b", "target-arrow-shape": "vee", "color": "#7a2f6b",
+      "line-style": "dashed", "line-dash-pattern": [3, 3], "width": 1.6, "line-color": C.reach,
+      "target-arrow-color": C.reach, "target-arrow-shape": "vee", "color": C.reach,
     } },
-    // Mirrors EDGE_STYLES["ev_*"] in iplens/diagram.py and the ev-* swatches in style.css.
+    // Mirrors EDGE_STYLES["ev_*"] in iplens/diagram.py (on-page colours: the --ev-* tokens in style.css).
     { selector: "edge.ev-observed", style: {
-      "line-color": "#1a7f37", "target-arrow-color": "#1a7f37", "source-arrow-color": "#1a7f37",
-      "width": 3, "line-style": "solid", "target-arrow-shape": "triangle", "color": "#14532d",
+      "line-color": C.observed, "target-arrow-color": C.observed, "source-arrow-color": C.observed,
+      "width": 3, "line-style": "solid", "target-arrow-shape": "triangle", "color": C.observed,
     } },
     { selector: "edge.ev-configured", style: {
-      "line-color": "#2457c5", "target-arrow-color": "#2457c5", "source-arrow-color": "#2457c5",
+      "line-color": C.configured, "target-arrow-color": C.configured, "source-arrow-color": C.configured,
       "width": 2, "line-style": "solid", "target-arrow-shape": "triangle",
     } },
     { selector: "edge.ev-permitted", style: {
-      "line-color": "#c2410c", "target-arrow-color": "#c2410c", "source-arrow-color": "#c2410c",
+      "line-color": C.permitted, "target-arrow-color": C.permitted, "source-arrow-color": C.permitted,
       "width": 1.8, "line-style": "dashed", "line-dash-pattern": [7, 4], "target-arrow-shape": "vee",
-      "color": "#7c2d12", "opacity": 1,
+      "color": C.permitted, "opacity": 1,
     } },
     { selector: "edge.ev-referenced", style: {
-      "line-color": "#6b7280", "target-arrow-color": "#6b7280", "source-arrow-color": "#6b7280",
+      "line-color": C.referenced, "target-arrow-color": C.referenced, "source-arrow-color": C.referenced,
       "width": 1.5, "line-style": "dashed", "line-dash-pattern": [2, 3], "target-arrow-shape": "vee",
-      "color": "#374151", "opacity": 1,
+      "color": C.referenced, "opacity": 1,
     } },
     // Evidence in both directions: an arrow at each end.
     { selector: "edge.bidir.ev-observed, edge.bidir.ev-configured", style: { "source-arrow-shape": "triangle" } },
     { selector: "edge.bidir.ev-permitted, edge.bidir.ev-referenced", style: { "source-arrow-shape": "vee" } },
     // Effective access: a blocked connection ("Show blocked"), whatever its type / evidence.
     { selector: "edge.blocked", style: {
-      "line-color": "#c62828", "target-arrow-color": "#c62828", "source-arrow-color": "#c62828",
-      "line-style": "dashed", "line-dash-pattern": [6, 4], "color": "#9b1c1c", "opacity": 1,
+      "line-color": C.blocked, "target-arrow-color": C.blocked, "source-arrow-color": C.blocked,
+      "line-style": "dashed", "line-dash-pattern": [6, 4], "color": C.blocked, "opacity": 1,
     } },
     // An unverified connection: a layer not checked, or conditional.
     { selector: "edge.unverified", style: {
-      "line-color": "#9e9e9e", "target-arrow-color": "#9e9e9e", "source-arrow-color": "#9e9e9e",
-      "line-style": "dashed", "line-dash-pattern": [6, 4], "color": "#616161",
+      "line-color": C.unverified, "target-arrow-color": C.unverified, "source-arrow-color": C.unverified,
+      "line-style": "dashed", "line-dash-pattern": [6, 4], "color": C.unverified,
     } },
     { selector: "node.dim", style: { "opacity": 0.2 } },
     { selector: "edge.dim", style: { "opacity": 0.08, "text-opacity": 0 } },
-    { selector: "node.focus", style: { "overlay-color": "#2457c5", "overlay-opacity": 0.12 } },
+    { selector: "node.focus", style: { "overlay-color": C.configured, "overlay-opacity": 0.12 } },
     { selector: "edge:selected, edge.hover, edge.focus", style: {
       "width": 3, "opacity": 1, "z-index": 10,
     } },

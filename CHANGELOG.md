@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Shared DadsOps theme**: every page links `static/theme/dadsops-theme.css` (copied unchanged)
+  before `style.css`, and uses its dark look and top menu (`header.shell-header`; same items,
+  order, highlighting and account / region context). `style.css` keeps only IPLens-specific
+  rules, expressed through the theme's tokens. The on-page Visual diagram is dark too (its
+  colours come from CSS tokens); the SVG / draw.io exports and the HTML report keep their light
+  document colours.
+
+### Added
+
+- `AWS_PROFILE` / `AWS_REGION` pre-fill the **Add account** form (marked "from AWS_PROFILE" /
+  "from AWS_REGION"); `DADSOPS_LOG_DIR` is the default log directory. Saved values win and
+  environment values are never stored.
+
 ## 1.6.3 – 2026-10-29
 
 ### Added

@@ -14,7 +14,7 @@
   <div class="muted">Shown in the header as <i>name (account id)</i>; overrides the IAM account
     alias. Leave blank to use the alias, or just the account id if there is none.</div>
 
-  <label for="region">Region</label>
+  <label for="region">Region{% if env_sources.region %} <span class="env-hint">from {{ env_sources.region }}</span>{% endif %}</label>
   <div class="row">
     <div><select id="region" name="region">
       {% for r in regions %}<option value="{{ r }}" {{ 'selected' if r == a.region }}>{{ r }}</option>{% endfor %}
@@ -36,7 +36,7 @@
   </fieldset>
 
   <fieldset data-mode="profile">
-    <label for="profile">Named profile</label>
+    <label for="profile">Named profile{% if env_sources.profile %} <span class="env-hint">from {{ env_sources.profile }}</span>{% endif %}</label>
     <select id="profile" name="profile">
       <option value="">— choose a profile —</option>
       {% for p in profiles %}

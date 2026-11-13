@@ -817,7 +817,7 @@ def test_show_blocked_toggle(browser, access_server):
         f"() => {{ const e = {CY}.edges('.blocked'); "
         "return [e.style('line-style'), e.style('line-color')]; }"
     )
-    assert style == ["dashed", "rgb(198,40,40)"]
+    assert style == ["dashed", "rgb(255,123,114)"]  # the theme's --danger (#ff7b72)
     # A click on the blocked edge shows which rule blocked it.
     # Tap the edge itself: its midpoint can lie on the effective edge to the same endpoint.
     page.evaluate(f"() => {CY}.edges('.blocked').emit('onetap')")

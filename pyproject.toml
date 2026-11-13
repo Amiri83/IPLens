@@ -65,6 +65,7 @@ include = ["iplens*"]
 iplens = [
     "templates/*.html",
     "static/*.css",
+    "static/theme/*.css",
     "static/*.js",
     "static/*.svg",
     "static/vendor/*",

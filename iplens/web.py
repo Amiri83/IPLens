@@ -35,6 +35,7 @@ from . import (
     alerts,
     cidrplan,
     diagram,
+    envdefaults,
     environment,
     extgraph,
     fitcheck,
@@ -1924,6 +1925,8 @@ def _register(app: Flask) -> None:
             levels=LEVELS,
             log_dir=log_dir,
             log_path=path,
+            # The default directory came from DADSOPS_LOG_DIR (not saved in Settings).
+            log_dir_from_env=not _store().load().log_dir and _paths().log_dir_from_env,
             source=source,
             sources=LOG_SOURCES,
         )
@@ -1966,6 +1969,8 @@ def _register(app: Flask) -> None:
             default_resource_timeout=DEFAULT_RESOURCE_TIMEOUT,
             required_timeout=REQUIRED_RESOURCE_TIMEOUT,
             default_log_dir=_paths().default_log_dir,
+            log_dir_from_env=_paths().log_dir_from_env,
+            aws_profile_set=bool(envdefaults.env_profile()),
             tf_roots=terraform.list_roots(_db()),
             tf_types=sorted(terraform.MANAGED_TYPES),
             tf_repos=tfrepo.list_repos(_db()),
@@ -2503,7 +2508,7 @@ def _register(app: Flask) -> None:
         log.info("active account set to %s", acct.id)
         return redirect(_safe_next(request.form.get("next")))
 
-    def _account_form(acct: Account, status: int = 200):
+    def _account_form(acct: Account, status: int = 200, env_sources: dict[str, str] | None = None):
         profiles = discover_profiles()
         return render_template(
             "account_form.html",
@@ -2514,6 +2519,8 @@ def _register(app: Flask) -> None:
             profiles=profiles,
             profile_known=acct.profile in {p.name for p in profiles},
             max_name=MAX_DISPLAY_NAME,
+            # Fields pre-filled from AWS_PROFILE / AWS_REGION (new accounts only).
+            env_sources=env_sources or {},
         ), status
 
     def _save_account(account_id: int | None):
@@ -2558,7 +2565,8 @@ def _register(app: Flask) -> None:
     @app.route("/accounts/new", methods=["GET", "POST"])
     def account_new():
         if request.method == "GET":
-            return _account_form(Account())
+            defaults = envdefaults.new_account()
+            return _account_form(defaults.account, env_sources=defaults.sources)
         return _save_account(None)
 
     @app.route("/accounts/<int:account_id>/edit", methods=["GET", "POST"])

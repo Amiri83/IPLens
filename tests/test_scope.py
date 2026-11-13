@@ -147,7 +147,7 @@ def test_scope_page_applies_everywhere_and_clears(app, client, snapshot_builder)
     _snapshot(snapshot_builder, _db(app))
     page = client.get("/scope").data.decode()
     assert f'<option value="{VPC_A}" >' in page and SUB_B1 in page
-    assert "scope:" not in page.split("<main>", 1)[0]
+    assert "scope:" not in page.split('<main class="page">', 1)[0]
 
     resp = _post(
         client,
@@ -173,7 +173,7 @@ def test_scope_page_applies_everywhere_and_clears(app, client, snapshot_builder)
     assert resp.headers["Location"] == "/ips"
     pages = _pages(client)
     assert "10.0.129.10" in pages["ips"] and "10.0.2.10" in pages["xlsx"]
-    assert "scope:" not in pages["ips"].split("<main>", 1)[0]
+    assert "scope:" not in pages["ips"].split('<main class="page">', 1)[0]
 
 
 def test_scope_is_per_account(app, client, snapshot_builder):
@@ -189,7 +189,7 @@ def test_scope_is_per_account(app, client, snapshot_builder):
     assert "scope: 1 filter" in client.get("/").data.decode()
     _post(client, "/accounts/active", {"account_id": "2", "next": "/"})
     page = client.get("/ips").data.decode()
-    assert "scope:" not in page.split("<main>", 1)[0] and "10.0.129.10" in page
+    assert "scope:" not in page.split('<main class="page">', 1)[0] and "10.0.129.10" in page
     with closing(_db(app)) as conn:
         stored = {
             r["account_ref"]: json.loads(r["config"]) for r in conn.execute("SELECT * FROM scopes")
@@ -201,6 +201,6 @@ def test_invalid_scope_is_rejected(app, client, snapshot_builder):
     _snapshot(snapshot_builder, _db(app))
     page = _post(client, "/scope", {"cidrs": "10.0.0.0/99"}, follow_redirects=True).data.decode()
     assert "Scope not saved: invalid CIDR" in page
-    assert "scope:" not in page.split("<main>", 1)[0]
+    assert "scope:" not in page.split('<main class="page">', 1)[0]
     assert _post(client, "/scope", {"cidrs": "10.0.0.0/16"}).status_code == 302
     assert _post(client, "/scope/clear", {"next": "//evil.example/"}).headers["Location"] == "/"

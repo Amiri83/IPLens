@@ -11,6 +11,9 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+# Shared by the DadsOps tools: the directory they write their logs to.
+LOG_DIR_VAR = "DADSOPS_LOG_DIR"
+
 
 @dataclass(frozen=True)
 class AppPaths:
@@ -30,7 +33,16 @@ class AppPaths:
 
     @property
     def default_log_dir(self) -> Path:
-        return self.home / "logs"
+        """``DADSOPS_LOG_DIR`` (shared by the DadsOps tools) when set, else ``<home>/logs``.
+
+        A log directory saved in Settings still wins over both (``web.log_dir_for``).
+        """
+        shared = os.environ.get(LOG_DIR_VAR, "").strip()
+        return Path(shared).expanduser() if shared else self.home / "logs"
+
+    @property
+    def log_dir_from_env(self) -> bool:
+        return bool(os.environ.get(LOG_DIR_VAR, "").strip())
 
     @property
     def tf_cache_dir(self) -> Path:
