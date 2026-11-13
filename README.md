@@ -83,6 +83,20 @@ mode `0700`). Delete it to reset IPLens completely.
 | `logs/` | application log (the log directory can be changed in Settings) |
 | `tf-cache/` | Terraform working data of repo syncs (only when Terraform sync is used) |
 
+### Shared DadsOps environment variables
+
+Optional defaults shared with the other DadsOps tools. A value saved in IPLens always wins, and
+nothing read from them is stored.
+
+| variable | effect |
+|---|---|
+| `AWS_PROFILE` | the **Add account** form starts on *Named profile* with this profile chosen |
+| `AWS_REGION` | the **Add account** form starts on this region |
+| `DADSOPS_LOG_DIR` | default log directory instead of `logs/` above (a directory saved in Settings still wins) |
+
+The pages use the shared DadsOps dark theme (`iplens/static/theme/dadsops-theme.css`, copied
+unchanged from DadsOps); IPLens's own rules live in `iplens/static/style.css`.
+
 ## Security
 
 - **Local only.** The server binds to `127.0.0.1` by default and rejects requests whose `Host`

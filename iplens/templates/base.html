@@ -4,13 +4,15 @@
   <meta charset="utf-8">
   <title>{% block title %}IPLens{% endblock %} · IPLens</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+  {# The shared DadsOps theme first, then IPLens's own rules on top of it. #}
+  <link rel="stylesheet" href="{{ url_for('static', filename='theme/dadsops-theme.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <script src="{{ url_for('static', filename='localtime.js') }}" defer></script>
 </head>
 <body>
-<header>
+<header class="shell-header">
   <span class="brand">IPLens</span>
-  <nav class="tabs" aria-label="Main">
+  <nav aria-label="Main">
     {% set ep = request.endpoint or '' %}
     {% macro nav_link(endpoint, label, active) -%}
       <a href="{{ url_for(endpoint) }}"{% if active %} class="active" aria-current="page"{% endif %}>{{ label }}</a>
@@ -76,7 +78,7 @@
   <a class="ctx-warn" href="{{ url_for('account_new') }}">add an AWS account</a>
   {% endif %}
 </header>
-<main>
+<main class="page">
   {% for category, message in get_flashed_messages(with_categories=true) %}
     <div class="flash {{ category }}">{{ message }}</div>
   {% endfor %}

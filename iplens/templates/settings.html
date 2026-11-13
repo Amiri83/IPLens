@@ -23,7 +23,7 @@
       <td class="mono">{{ a.region }}</td>
       <td>{{ a.mode_label }}{% if a.auth_mode == 'profile' %} <span class="mono">{{ a.profile }}</span>{% endif %}</td>
       <td>
-        {% if a.auth_mode == 'env' %}<span class="muted">process environment</span>
+        {% if a.auth_mode == 'env' %}<span class="muted">process environment</span>{% if aws_profile_set %} <span class="env-hint">(from AWS_PROFILE)</span>{% endif %}
         {% elif a.auth_mode == 'profile' %}<span class="muted">~/.aws profile</span>
         {% else %}
           {% if a.access_key_id %}<span class="mono">{{ a.access_key_id }}</span>{% endif %}
@@ -71,6 +71,7 @@
   <h2 style="margin-top: 0">Logging</h2>
   <label for="log_dir">Log directory</label>
   <input id="log_dir" name="log_dir" value="{{ s.log_dir }}" size="60" class="mono" placeholder="{{ default_log_dir }}">
+  {% if log_dir_from_env %}<div class="env-hint" id="log-dir-env">Default from <span class="mono">DADSOPS_LOG_DIR</span>{% if s.log_dir %} (the directory saved here wins){% endif %}.</div>{% endif %}
   <h2 id="retention">Snapshot retention</h2>
   <div class="row">
     <div><label for="retention_days">Keep snapshots for (days)</label>

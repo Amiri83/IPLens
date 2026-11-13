@@ -52,6 +52,9 @@ def _hermetic_aws(monkeypatch, tmp_path):
     monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "no-aws-config"))
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "no-aws-credentials"))
     monkeypatch.delenv("AWS_PROFILE", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    # Shared DadsOps log directory: tests opt in with monkeypatch.setenv.
+    monkeypatch.delenv("DADSOPS_LOG_DIR", raising=False)
     # An endpoint override (e.g. a local emulator) makes boto3 bypass moto's interception.
     for var in list(os.environ):
         if var.startswith("AWS_ENDPOINT_URL") or var == "AWS_S3_ENDPOINT":

@@ -16,7 +16,7 @@
   <div><label for="limit">Max entries</label><input id="limit" name="limit" type="number" value="{{ limit }}" min="1" max="5000"></div>
   <div><button type="submit">Filter</button></div>
 </form>
-<p class="muted">Log file: <span class="mono">{{ log_path }}</span> (change the directory in Settings).
+<p class="muted">Log file: <span class="mono">{{ log_path }}</span>{% if log_dir_from_env and source != 'mcp' %} <span class="env-hint">(from DADSOPS_LOG_DIR)</span>{% endif %} (change the directory in Settings).
   {% if source == 'mcp' %}The MCP server's own output (see <a href="{{ url_for('settings_page') }}#mcp">Settings → MCP server</a>).{% endif %}
   Newest first.</p>
 <table>
