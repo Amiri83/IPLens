@@ -72,16 +72,24 @@ p.note { margin: .4rem 0; }
 /* One row from 1200px: brand, menu, then context / MCP / scope / account switch pushed to the
    end. Brand, menu and scope indicator keep their size. When space runs short the context
    shrinks to an ellipsis first (the account picker still shows account · region), then the
-   MCP badge (state colour and title stay), then the picker.
-   Below 1200px the header still wraps (rule above). */
+   MCP badge (state colour and title stay) and the picker. None of the shrinking pieces has a
+   fixed minimum, so the row never gets wider than the window (overflow = a horizontal scroll
+   on every page). Below 1200px the header still wraps (rule above). */
 @media (min-width: 1200px) {
   .shell-header { flex-wrap: nowrap; gap: var(--sp-3); }
   .shell-header > .brand, .shell-header > nav, .shell-header .scope-indicator,
   .shell-header > .ctx-warn { flex: none; }
-  .shell-header .ctx { flex: 0 8 auto; min-width: 0; }
-  .shell-header .mcp-badge { flex: 0 2 auto; min-width: 4.5rem; overflow: hidden; text-overflow: ellipsis; }
-  .shell-header .account-switch { flex: 0 1 auto; min-width: 6rem; }
+  /* The big shrink factor makes the context give way before anything else does. */
+  .shell-header .ctx { flex: 0 1000 auto; min-width: 0; }
+  .shell-header .mcp-badge { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .shell-header .account-switch { flex: 0 1 auto; min-width: 0; }
   .shell-header .account-switch select { width: 100%; max-width: 220px; min-width: 0; }
+}
+/* 1200–1439px: tighter gaps and side padding between the header's pieces (the menu links
+   themselves stay the theme's). With a wide fallback font such as DejaVu Sans (Linux / CI)
+   the fullest header was ~1255px wide. From 1440px the rules above apply unchanged. */
+@media (min-width: 1200px) and (max-width: 1439.98px) {
+  .shell-header { gap: var(--sp-2); padding: 0 var(--sp-4); }
 }
 
 /* -- tables ---------------------------------------------------------------------------- */
