@@ -39,6 +39,59 @@ p.note { margin: .4rem 0; }
 .shell-header .scope-indicator button { padding: .1rem .45rem; font-size: 12px; }
 .shell-header .mcp-badge { align-self: center; text-decoration: none; }
 
+/* "More" dropdown (a <details> in the menu): the summary looks like a theme menu link, the
+   open list hangs under it. Same tokens and states as the theme's menu link rules. */
+.nav-more { position: relative; display: flex; }
+.nav-more > summary {
+  display: flex; align-items: center; gap: var(--sp-1); padding: 0 .9rem; cursor: pointer;
+  list-style: none; color: var(--header-muted); white-space: nowrap; font-weight: 500;
+  border-top: 3px solid transparent; border-bottom: 3px solid transparent;
+}
+.nav-more > summary::-webkit-details-marker { display: none; }
+.nav-more > summary::after { content: "▾"; font-size: var(--fs-xs); }
+.nav-more[open] > summary::after { content: "▴"; }
+.nav-more > summary:hover, .nav-more > summary:focus-visible, .nav-more[open] > summary {
+  color: var(--header-fg); background: var(--bg-hover);
+}
+.nav-more > summary.active {
+  color: var(--header-fg); font-weight: 700; border-bottom-color: var(--accent); background: var(--bg-hover);
+}
+.nav-more-list {
+  position: absolute; top: 100%; left: 0; z-index: 30; min-width: 100%; display: flex;
+  flex-direction: column; padding: var(--sp-1) 0; background: var(--header-bg);
+  border: 1px solid var(--header-border); border-radius: 0 0 var(--radius-sm) var(--radius-sm);
+  box-shadow: var(--shadow);
+}
+/* Inside the list the theme's menu link keeps its colours and states; the underline turns
+   into a left bar so the open page stands out in a vertical list. */
+.nav-more .nav-more-list a {
+  padding: var(--sp-2) var(--sp-4); border-top: 0; border-bottom: 0; border-left: 3px solid transparent;
+}
+.nav-more .nav-more-list a.active { border-left-color: var(--accent); }
+
+/* One row from 1200px: brand, menu, then context / MCP / scope / account switch pushed to the
+   end. Brand, menu and scope indicator keep their size. When space runs short the context
+   shrinks to an ellipsis first (the account picker still shows account · region), then the
+   MCP badge (state colour and title stay) and the picker. None of the shrinking pieces has a
+   fixed minimum, so the row never gets wider than the window (overflow = a horizontal scroll
+   on every page). Below 1200px the header still wraps (rule above). */
+@media (min-width: 1200px) {
+  .shell-header { flex-wrap: nowrap; gap: var(--sp-3); }
+  .shell-header > .brand, .shell-header > nav, .shell-header .scope-indicator,
+  .shell-header > .ctx-warn { flex: none; }
+  /* The big shrink factor makes the context give way before anything else does. */
+  .shell-header .ctx { flex: 0 1000 auto; min-width: 0; }
+  .shell-header .mcp-badge { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .shell-header .account-switch { flex: 0 1 auto; min-width: 0; }
+  .shell-header .account-switch select { width: 100%; max-width: 220px; min-width: 0; }
+}
+/* 1200–1439px: tighter gaps and side padding between the header's pieces (the menu links
+   themselves stay the theme's). With a wide fallback font such as DejaVu Sans (Linux / CI)
+   the fullest header was ~1255px wide. From 1440px the rules above apply unchanged. */
+@media (min-width: 1200px) and (max-width: 1439.98px) {
+  .shell-header { gap: var(--sp-2); padding: 0 var(--sp-4); }
+}
+
 /* -- tables ---------------------------------------------------------------------------- */
 tr.blocked td, tr.blocked td .muted { color: var(--fg-faint); background: var(--bg-subtle); }
 tr.blocked td a { color: var(--accent); }
