@@ -20,14 +20,29 @@
     {{ nav_link('overview', 'Discovery', ep in ('overview', 'subnet', 'eni')) }}
     {{ nav_link('ips', 'IP List', ep.startswith('ips')) }}
     {{ nav_link('visual', 'Visual', ep.startswith('visual')) }}
-    {{ nav_link('trends_page', 'Trends', ep == 'trends_page') }}
-    {{ nav_link('diff_page', 'Diff', ep == 'diff_page') }}
     {{ nav_link('headroom_page', 'Headroom', ep == 'headroom_page') }}
-    {{ nav_link('cidr_planner', 'CIDR Planner', ep == 'cidr_planner') }}
-    {{ nav_link('scope_page', 'Scope', ep.startswith('scope')) }}
     {{ nav_link('rules_list', 'Rules', ep.startswith('rule')) }}
     {{ nav_link('suggestions', 'Suggestions', ep == 'suggestions') }}
-    {{ nav_link('ownership_page', 'Ownership', ep == 'ownership_page') }}
+    {# The less-used pages: a <details> menu, so it opens by keyboard and without JS
+       (nav.js adds Escape / outside click). The summary names the open grouped page. #}
+    {% set more = [
+      ('trends_page', 'Trends', ep == 'trends_page'),
+      ('diff_page', 'Diff', ep == 'diff_page'),
+      ('cidr_planner', 'CIDR Planner', ep == 'cidr_planner'),
+      ('scope_page', 'Scope', ep.startswith('scope')),
+      ('ownership_page', 'Ownership', ep == 'ownership_page'),
+    ] %}
+    {% set more_current = more | selectattr('2') | map(attribute='1') | first %}
+    <details class="nav-more">
+      <summary{% if more_current %} class="active"{% endif %}>
+        {%- if more_current %}<span class="sr-only">More: </span>{{ more_current }}{% else %}More{% endif -%}
+      </summary>
+      <div class="nav-more-list">
+        {% for endpoint, label, active in more %}
+        {{ nav_link(endpoint, label, active) }}
+        {% endfor %}
+      </div>
+    </details>
     {{ nav_link('settings_page', 'Settings', ep.startswith('settings')) }}
     {{ nav_link('logs', 'Logs', ep == 'logs') }}
   </nav>
@@ -127,6 +142,7 @@
   </div>
 </div>
 <button type="button" id="job-badge" class="job-badge" hidden></button>
+<script src="{{ url_for('static', filename='nav.js') }}" defer></script>
 <script src="{{ url_for('static', filename='jobs.js') }}" defer></script>
 <script src="{{ url_for('static', filename='mcp.js') }}" defer></script>
 </body>

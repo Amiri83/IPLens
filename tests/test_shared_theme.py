@@ -6,6 +6,7 @@ served and packaged. Environment: ``AWS_PROFILE`` / ``AWS_REGION`` pre-fill a ne
 from the environment is stored.
 """
 
+import hashlib
 import re
 import sqlite3
 import tomllib
@@ -23,23 +24,33 @@ ROOT = Path(__file__).parent.parent
 THEME_URL = "/static/theme/dadsops-theme.css"
 APP_CSS_URL = "/static/style.css"
 THEME_HEADER = "/* DadsOps shared theme v1 — master copy, tools copy this file unchanged */"
+# SHA-256 of the DadsOps master copy (theme v1) as it was copied into IPLens. Tools never
+# edit their copy: a new theme comes as a new master copy, and then this hash changes with it.
+THEME_SHA256 = "2b8d0c06b16fdcd32deb8c115d759e28cd05a2ec9ae5d62fc9034790150181d3"
 
-# The top menu, in order: (endpoint, label).
-MENU = [
+# The top menu bar, in order: (endpoint, label).
+BAR = [
     ("overview", "Discovery"),
     ("ips", "IP List"),
     ("visual", "Visual"),
-    ("trends_page", "Trends"),
-    ("diff_page", "Diff"),
     ("headroom_page", "Headroom"),
-    ("cidr_planner", "CIDR Planner"),
-    ("scope_page", "Scope"),
     ("rules_list", "Rules"),
     ("suggestions", "Suggestions"),
-    ("ownership_page", "Ownership"),
     ("settings_page", "Settings"),
     ("logs", "Logs"),
 ]
+# The "More" dropdown (between Suggestions and Settings), in order.
+MORE = [
+    ("trends_page", "Trends"),
+    ("diff_page", "Diff"),
+    ("cidr_planner", "CIDR Planner"),
+    ("scope_page", "Scope"),
+    ("ownership_page", "Ownership"),
+]
+# Every page the header reaches.
+MENU = BAR + MORE
+
+LINK = re.compile(r'<a href="([^"]+)"( class="active" aria-current="page")?>([^<]+)</a>')
 
 
 @pytest.fixture
@@ -108,20 +119,80 @@ def test_theme_file_is_packaged():
     assert shipped.read_text().splitlines()[0] == THEME_HEADER
 
 
+def test_theme_file_is_the_unedited_master_copy():
+    shipped = ROOT / "iplens" / "static" / "theme" / "dadsops-theme.css"
+    assert hashlib.sha256(shipped.read_bytes()).hexdigest() == THEME_SHA256
+
+
+def _menu(page: str) -> tuple[list[tuple], str, list[tuple]]:
+    """(bar links, "More" summary tag + text, dropdown links) of a page's one header."""
+    assert page.count('<header class="shell-header">') == 1
+    header = page.split("</header>", 1)[0]
+    nav = re.search(r'<nav aria-label="Main">(.*?)</nav>', header, re.S).group(1)
+    assert nav.count('<details class="nav-more">') == 1
+    before, rest = nav.split('<details class="nav-more">')
+    more, after = rest.split("</details>")
+    summary = re.search(r"<summary[^>]*>.*?</summary>", more, re.S).group(0)
+    dropdown = more.split("</summary>", 1)[1]
+    bar = LINK.findall(before) + [("<more>", "", "")] + LINK.findall(after)
+    return bar, summary, LINK.findall(dropdown)
+
+
 def test_one_top_menu_with_the_same_links_order_and_highlighting(app, client):
     urls = _urls(app)
-    for active_ep, _ in MENU:
+    for active_ep, active_label in MENU:
         page = client.get(urls[active_ep]).data.decode()
-        assert page.count('<header class="shell-header">') == 1
-        header = page.split("</header>", 1)[0]
-        nav = re.search(r'<nav aria-label="Main">(.*?)</nav>', header, re.S).group(1)
-        links = re.findall(
-            r'<a href="([^"]+)"( class="active" aria-current="page")?>([^<]+)</a>', nav
+        bar, summary, dropdown = _menu(page)
+        # The eight bar links, the dropdown sitting between Suggestions and Settings ...
+        assert [(href, label) for href, _, label in bar] == (
+            [(urls[ep], lb) for ep, lb in BAR[:6]]
+            + [("<more>", "")]
+            + [(urls[ep], lb) for ep, lb in BAR[6:]]
         )
-        assert [(href, label) for href, _, label in links] == [(urls[ep], lb) for ep, lb in MENU]
-        active = [label for _, flag, label in links if flag]
-        assert active == [dict(MENU)[active_ep]], active_ep
-        assert '<span class="ctx"' in header  # account / region context next to the menu
+        # ... and the five pages inside it: all thirteen reachable from the header.
+        assert [(href, label) for href, _, label in dropdown] == [(urls[ep], lb) for ep, lb in MORE]
+        # Exactly one link is the current page, wherever it sits.
+        active = [label for _, flag, label in bar + dropdown if flag]
+        assert active == [active_label], active_ep
+        # The closed dropdown shows a grouped page as current: highlighted, named.
+        grouped = active_ep in dict(MORE)
+        assert ('class="active"' in summary) == grouped, active_ep
+        text = re.sub(r"<[^>]+>", "", summary).strip()
+        assert text == (f"More: {active_label}" if grouped else "More"), active_ep
+        assert '<span class="ctx"' in page.split("</header>", 1)[0]  # context next to the menu
+
+
+def test_menu_marks_nothing_on_a_page_outside_it(client):
+    bar, summary, dropdown = _menu(client.get("/accounts/new").data.decode())
+    assert not any(flag for _, flag, _ in bar + dropdown)
+    assert 'class="active"' not in summary
+
+
+def test_grouped_pages_keep_their_active_rule(app):
+    """The dropdown keeps each link's own match: Scope covers every scope_* endpoint."""
+    from flask import render_template_string
+
+    cases = {"scope_save": "Scope", "scope_page": "Scope", "trends_page": "Trends", "subnet": ""}
+    for endpoint, expected in cases.items():
+        with app.test_request_context("/"):
+            from flask import request
+
+            request.url_rule = type("Rule", (), {"endpoint": endpoint})()
+            page = render_template_string('{% extends "base.html" %}')
+        bar, summary, dropdown = _menu(page)
+        current = [label for _, flag, label in dropdown if flag]
+        assert current == ([expected] if expected else []), endpoint
+        assert ('class="active"' in summary) == bool(expected), endpoint
+
+
+def test_more_dropdown_needs_no_script_to_open(client):
+    page = client.get("/").data.decode()
+    # A native <details>/<summary>: focusable, opens on Enter / Space and on click; nav.js
+    # only adds Escape and outside-click closing.
+    assert '<details class="nav-more">' in page and "<summary" in page
+    assert '<script src="/static/nav.js" defer></script>' in page
+    js = (ROOT / "iplens" / "static" / "nav.js").read_text()
+    assert "Escape" in js and "click" in js
 
 
 def test_header_context_shows_the_viewed_account_region(client):
